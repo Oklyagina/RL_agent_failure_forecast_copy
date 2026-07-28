@@ -1,298 +1,152 @@
-# Forecast RL Agent Failure
+# ENN Uncertainty-Quantification Module
 
-This repository implements a framework to **quantify and predict the reliability of
-pre-trained Reinforcement Learning (RL) agents** used for real-time congestion management in
-power grids.
+Epistemic-uncertainty KPI for RL grid-operation recommendations, based on an
+Evidential Neural Network (ENN) trained by behavior cloning on the agent's
+own decisions. For each recommendation it returns two percentiles (0–100):
 
-Assessing the reliability of AI-assisted decision support systems under unseen operating
-conditions is critical. This project anticipates unreliable AI recommendations and provides
-early warnings to human operators.
+- `epistemic_uncertainty_total_pctile` — total epistemic uncertainty of the
+  situation (the ENN vacuity `u = K/S`); high when the grid state is
+  out-of-distribution for the agent.
+- `epistemic_uncertainty_action_pctile` — epistemic uncertainty of the action
+  the agent selected (variance of that action's predicted probability);
+  `None` for a do-nothing action (not in the curated set).
 
-The pipeline integrates **Uncertainty Quantification (UQ)** to support risk-aware
-decision-making by separating uncertainty into two components:
+Percentiles are reported (rather than raw values) because the raw measures
+sit in narrow bands; a percentile spreads them onto a readable 0–100 scale
+relative to a pre-computed reference distribution. **No calibration step is
+needed on the consumer side** — the reference is shipped
+(`enn_pctile_calib.npz`).
 
-- **Aleatoric uncertainty** — the predictive variance of the forecasts. It captures the
-  inherent stochastic variability and forecast errors of load and generation, estimated by
-  modelling the residuals of the primary forecaster (Histogram Gradient Boosting, HGB).
-- **Epistemic uncertainty** — the uncertainty associated with the RL agent's decisions when
-  facing out-of-distribution or unseen grid states, computed with an **Evidential Neural
-  Network (ENN)**.
+## Environment
 
-These indicators are fed into a **failure prediction model** that estimates the probability
-of RL agent failure under future contingencies (line disconnections).
-
-Finally, a **dual-LLM architecture** distils the black-box failure predictor into compact,
-human-readable symbolic `if/else` rules (`best_rule.py`), one per contingency. This turns
-opaque uncertainty metrics into interpretable operational guidelines, making the AI
-assistant's boundaries transparent and auditable.
-
----
-
-## Supported environment
-
-- **Network 36** (`l2rpn_icaps_2021_small`) — IEEE 118-bus system, 36 substations, 59 lines,
-  22 generators, 37 loads.
-
----
-
-## Project structure
-
-```text
-grid_security_project/
-│
-├── agents/
-│   └── network36/                       # Pre-trained Grid2Op agent (CurriculumAgent)
-│
-├── forecasts/
-│   └── HBGB_36.pkl                      # Load / generation forecaster
-│
-├── models/
-│   ├── enn_36.pth                       # Evidential Neural Network (epistemic uncertainty)
-│   └── HBGB_36_aleatoric.pkl            # Aleatoric uncertainty model
-│
-├── results/                             # Dual-LLM output (generated rules + metrics)
-│   └── seed_<value>/
-│       └── line_<line_id>/
-│           └── best_rule.py             # The final interpretable Python rule
-│
-├── prompts/                             # Exact LLM prompts (see llm_prompts.md)
-│   ├── generator_prompt.md
-│   ├── critic_prompt.md
-│   └── repair_prompt.md
-│
-├── src/
-│   ├── collect_data.py                  # Simulation and dataset generation
-│   ├── config.py                        # Central configuration (environment, modes, paths)
-│   ├── enn_models.py                    # ENN architectures
-│   ├── rule_predictor.py                # Rule inference and natural-language translation
-│   ├── test_rule_predictor.py           # Live rule inference over an episode
-│   ├── train_classifier.py              # Failure classifier training and inference
-│   ├── train_forecast.py                # Forecaster training
-│   ├── training_enn.py                  # ENN training pipeline
-│   └── utils.py                         # Feature extraction and grid statistics
-│
-├── dual_llm.py                          # Dual-LLM interpretable rule extraction
-├── compute_shap_rankings.py            # Per-line SHAP feature ranking (run before dual_llm.py)
-├── llm_prompts.md                       # Documentation of the three LLM prompts
-├── run_pipeline.py                      # Main entry point for the UQ / forecasting pipeline
-└── requirements.txt                     # Python dependencies
-```
-
----
-
-## Installation
-
-### 1. Python version
-
-This project requires **Python 3.10.13**.
+**Python 3.9 or 3.10 is required.** `tensorflow==2.12.1`, `ray==2.5.1` and
+`torch==2.1.2` publish no wheels for Python ≥ 3.11 (use a `python:3.10-slim`
+base image for containers — see `Dockerfile`). **Grid2Op is pinned to
+1.9.8**, the same version used by the InteractiveAI simulator, so the action
+format stays consistent.
 
 ```bash
-python --version   # Python 3.10.13
-```
-
-### 2. Clone the repository
-
-```bash
-git clone <repository_url>
-```
-
-### 3. Install dependencies
-
-A Python 3.10 virtual environment is strongly recommended.
-
-```bash
+conda create -n enn_uq python=3.10 -y
+conda activate enn_uq
 pip install -r requirements.txt
 ```
 
-### 4. Agent setup
+## Quick start — full reproduction
 
-Place your pre-trained agent (CurriculumAgent) in the `agents/` folder. The agent is
-available from the repository's GitHub Releases (`v1.0-agents`). The path is configurable in
-`src/config.py`.
+The scaler used by the module is **created at ENN training time**, so the
+complete reproduction of the experiment is: collect rollouts → train (the
+training exports the scaler, the metadata and the percentile calibration
+automatically) → run the example. For the CurriculumAgent nothing needs to
+be edited:
 
-### 5. Pre-trained models
+```bash
+python training/collect_rollouts.py --agent curriculum --episodes 50 --out-dir data_curriculum
+python training/train_enn.py --data-dir data_curriculum --out-dir models_curriculum --agent-name curriculum
+python run_example.py
+```
 
-The forecaster and uncertainty models are too large for the repository and are hosted as
-binary attachments in GitHub Releases (`v1.0-models`). Download and place them as follows:
+`run_example.py` is self-configuring: it locates the trained artifacts
+(newest `scaler_params.json` + `enn_meta.json` + calibration `.npz`, wherever
+the training wrote them), the curated action set, the ENN architecture module
+and the agent binaries, printing every resolved path (anything can be
+overridden in its CONFIG block). It then creates the
+`l2rpn_icaps_2021_small` environment (LightSim backend), loads the
+CurriculumAgent from `curriculumagent/`, rebuilds the training scaler from
+the exported JSON (no pickled scaler, so it reloads under any scikit-learn
+version), loads the calibration, and calls `assess_recommendation` on live
+observations, printing the two percentiles per step and the recommendations
+list in the InteractiveAI format. If no trained artifacts exist yet, it
+prints the exact training commands to run first.
 
-- `HBGB_36.pkl` → `forecasts/`
-- `HBGB_36_aleatoric.pkl` → `models/`
-- `enn_36.pth` → `models/`
+### Artifacts
 
-### 6. LLM endpoint
+| File | What it is |
+|---|---|
+| `recommendation_uncertainty.py` | the module: `load_calibration`, `assess_recommendation` |
+| `src/enn_models.py` | ENN architecture (`EvidentialNetwork`) |
+| `data_<agent>/actions.npy` (produced by collection) | curated action set — rows are `action.to_vect()`, deduplicated from the rollouts |
+| `models_<agent>/` (produced by training) | `enn_<agent>.pth`, `scaler_params.json` (scaler mean/std as JSON — the scaler is created at training time), `enn_meta.json`, `enn_pctile_calib.npz` |
+| `curriculumagent/` | agent binaries (L2RPN submission layout) |
 
-The dual-LLM step queries an OpenAI-compatible chat endpoint. Create
-`llm_config_inesctec.json` next to `dual_llm.py`:
+## Usage in three lines
+
+```python
+from recommendation_uncertainty import load_calibration, assess_recommendation
+
+calibration = load_calibration("models_curriculum/enn_pctile_calib.npz",
+                               scaler=scaler,
+                               action_set="data_curriculum/actions.npy",
+                               class_mapping="models_curriculum/enn_meta.json")
+info = assess_recommendation(obs, agent, enn, calibration)
+# {"chosen_action_id": ..., "epistemic_uncertainty_total_pctile": ...,
+#  "epistemic_uncertainty_action_pctile": ...}
+```
+
+The agent returns a Grid2Op **action object** (not an index): the module
+locates it in the curated action set to obtain its index, then maps it to the
+ENN label via `class_mapping`. A do-nothing action is not in the set, so its
+per-action value is `None` (the situation-level value is still produced).
+
+## InteractiveAI output format
+
+Each recommendation is a dictionary in the recommendations list; the two
+percentiles go into the `kpis` field alongside `efficiency_of_the_reco`:
 
 ```json
 {
-  "api_url": "https://<your-endpoint>/v1/chat/completions",
-  "api_key": "<your-key>",
-  "model": "gemma4-31b",
-  "max_tokens": 4000,
-  "verify_ssl": true,
-  "timeout": 180
+  "title": "Topological recommendation (CurriculumAgent)",
+  "description": "...",
+  "use_case": "PowerGrid",
+  "agent_type": 2,
+  "actions": [ { "...": "grid2op serializable action dict" } ],
+  "kpis": {
+    "efficiency_of_the_reco": null,
+    "epistemic_uncertainty_total_pctile": 47.8,
+    "epistemic_uncertainty_action_pctile": 3.1
+  }
 }
 ```
 
-> Do **not** commit this file: add it to `.gitignore`. The base model used in the paper is the
-> open-source `gemma4-31b`.
+See `to_interactiveai()` in `run_example.py` for the exact mapping.
 
----
-
-## Usage
-
-### A. UQ / forecasting pipeline
-
-All settings are controlled via `src/config.py`; you do not need to edit the logic scripts.
-Switch behaviour with the mode flags and run:
+## Tests (no trained weights needed)
 
 ```bash
-python run_pipeline.py
+python tests/validate_module.py
 ```
 
-- **Training** (`TRAIN_MODE = True`): trains the forecasters, collects simulation data, and
-  trains the failure classifier; models are saved in `models/`.
-- **Single-episode simulation** (`TEST_SINGLE_EPISODE = True`, `EPISODE_ID_TO_TEST = <seed>`):
-  simulates one episode and records how the uncertainty metrics evolve over time.
-- **Single-observation inference** (`PREDICT_PROBA_MODE = True`): computes the failure
-  probability for one grid state, without running a physical simulation.
+Validates the module end-to-end with a synthetic ENN exposing the same
+forward interface: action location in the curated set, do-nothing handling,
+percentile-mapping monotonicity and bounds, and InteractiveAI serialisation.
+Useful to confirm an environment is correctly set up before touching the
+real binaries.
 
-### B. Interpretable rule extraction (dual-LLM)
+## Training the ENN for a new agent
 
-Run the two steps in order:
+The module is agent-agnostic — any object exposing
+`agent.act(obs, reward, done) -> grid2op action` can be wrapped. The same
+two scripts used above handle any agent: `--agent expert` in
+`training/collect_rollouts.py` (after plugging in the ExpertAgent
+constructor) collects rollouts and curates the action set automatically by
+deduplication; `training/train_enn.py` then trains, exports the scaler and
+metadata, and calibrates. Full step-by-step guide: **[TRAINING.md](TRAINING.md)**.
+
+## Docker
 
 ```bash
-python compute_shap_rankings.py     # once -> shap_rankings.json
-python dual_llm.py                  # runs all seeds -> results/ and results/summary.json
+docker build -t enn-uq .
+docker run --rm enn-uq            # runs run_example.py as a reproducibility check
 ```
 
-`dual_llm.py` distils the HGB failure predictor into one `if/else` rule per contingency. For
-each line it ranks features by SHAP on the HGB, builds data-driven seed rules (single-feature,
-AND and OR), and refines them through a Generator–Critic–Repair loop ranked by F2-score. Rules
-are selected on the training partition and reported on the held-out test partition; the whole
-procedure is repeated over 10 seeds, and `summary.json` reports the mean ± std of the pooled
-test metrics (Table III in the paper).
+## Maintainers
 
-### C. Natural-language explanations
+`export_artifacts.py` regenerates the JSON artifacts from an existing fitted
+scaler (`.pkl`) and checkpoint, for the case where a training was done
+outside `training/train_enn.py`. It is fully self-configuring (it infers
+`input_dim`/`num_classes` from the checkpoint's state_dict and cross-checks
+everything). With the standard training flow it is not needed —
+`train_enn.py` already exports everything.
 
-`src/rule_predictor.py` translates each `best_rule.py` into a plain-English sentence and can
-evaluate the rules live against an episode:
+## License
 
-```bash
-python src/test_rule_predictor.py            # normal episode
-python src/test_rule_predictor.py --attack   # adversarial HeavyAttack_1 line attacks
-```
-
-For each monitored line and step, it prints the binary prediction (`OK` /
-`FAILURE PREDICTED`) and the explanation sentence, and at the end reports whether any rule
-warned within the 12 steps (one hour) before the actual failure.
-
----
-
-## Methodology
-
-The framework combines **grid-state forecasting**, **uncertainty quantification**, and
-**risk classification** to anticipate failures caused by line disconnections, and then
-distils the predictor into interpretable rules. It is structured in the following stages.
-
-### 1. Uncertainty decomposition
-
-**Aleatoric uncertainty (data uncertainty).** A multi-output HGB forecaster predicts active
-and reactive power injections one hour ahead (12 steps). The squared residuals of its mean
-forecasts approximate the local variance, and a second HGB model is trained on these residuals
-(Poisson loss) to estimate the forecast variance, used as a proxy for aleatoric uncertainty.
-
-**Epistemic uncertainty (model uncertainty).** An ENN is trained by **behavior cloning of the
-CurriculumAgent Tutor**, mapping each grid state to the Tutor's selected topology action.
-Instead of softmax probabilities, the ENN outputs the parameters of a Dirichlet distribution
-over the `K = 250` curated topology actions. Model ignorance (vacuity) is computed as
-
-```
-u = K / sum(alpha_i)
-```
-
-where `alpha_i` are the Dirichlet parameters. Since the ENN only ever observes the states the
-agent actually visited, high `u` flags out-of-distribution grid conditions where the agent's
-recommendations are least reliable. The ENN does not replace the policy: the agent issues the
-control action, while the ENN runs in parallel as a familiarity signal.
-
-### 2. Forecasting future grid states
-
-Load and generation forecasts are injected into the grid model and a power-flow solver
-produces the forecasted state one hour ahead. These future states are combined with the
-aleatoric uncertainty estimates.
-
-### 3. Contingency analysis
-
-For each candidate critical line, a what-if `N − 1` disconnection is simulated on the
-forecasted grid state, and whether the grid reaches a failure condition one hour after the
-contingency defines the label. This produces labelled data linking grid conditions,
-uncertainties, and line disconnections to observed failures.
-
-### 4. Risk classification
-
-A binary HGB classifier predicts failures before action execution. Inputs: current and
-forecasted grid-state indicators (load–generation balance, thermal stress), epistemic and
-aleatoric uncertainty, and the disconnected-line identifier. Output: `0` (stable expected) or
-`1` (failure predicted — alarm).
-
-### 5. LLM-guided symbolic rule generation (dual-LLM)
-
-To turn the black-box classifier into interpretable guidelines, a dual-LLM procedure distils
-it into a compact `if/else` rule per line. The three roles (Generator, Critic, Repair) are
-instances of the **same base model** (`gemma4-31b`) queried with role-specific prompts (see
-`llm_prompts.md`). The method works as follows:
-
-- **SHAP feature selection.** For each line, the input features are ranked by applying SHAP on
-  the HGB, and only the top `k` (`k ∈ {3, …, 8}`, selected per line) are retained
-  (`compute_shap_rankings.py`).
-- **Data-driven seed rules.** From class-separated statistics, single-feature, conjunctive
-  (AND) and disjunctive (OR) candidate rules are built over the selected features; the best by
-  F2 bootstraps the loop. OR rules raise recall, the main lever for F2.
-- **Generator–Critic–Repair loop.** The Generator proposes an improved rule, the Repair LLM
-  fixes any structural violation, and the Critic returns targeted feedback for the next
-  iteration.
-- **F2-based ranking and honest evaluation.** Candidates are ranked directly by their
-  F2-score, with a guard discarding degenerate rules that flag all inputs (FA ≥ 0.90). Rules
-  are selected on the training set and the retained rule is evaluated on the held-out test
-  set, so the metrics are comparable to the decision-tree and HGB baselines. The procedure is
-  repeated over 10 seeds and the mean ± std of the pooled test metrics is reported.
-
-### 6. Rule translation (natural-language explanations)
-
-`src/rule_predictor.py` parses each `best_rule.py` as an Abstract Syntax Tree and maps every
-condition to a human-readable description of the corresponding grid feature. Each distinct
-failure path becomes an "or if" clause, and AND conditions within a path are joined with
-"while … and". For example:
-
-```python
-def rule(x):
-    if x["load_gen_ratio"] <= 0.986:
-        if x["aleatoric_load_q_mean"] >= 0.185:
-            return 1
-        else:
-            if x["epistemic_after"] >= 0.803:
-                return 1
-            else:
-                return 0
-    else:
-        return 0
-```
-
-is translated to:
-
-> *Following a contingency on line 34_35_110, the RL agent is predicted to fail when the
-> load-to-generation ratio at t is ≤ 0.986 and either the mean aleatoric reactive-load
-> uncertainty is ≥ 0.185 or the epistemic uncertainty at t+12 is ≥ 0.803.*
-
-In live rule-inference mode, the system also computes the t+12 features from the current
-observation, applies the rule, and reports the prediction alongside the explanation.
-
----
-
-## Final objective
-
-The goal of this framework is to provide **real-time confidence levels** that allow validation
-of autonomous agent decisions and prevention of unsafe operations in critical power-grid
-environments, through transparent, human-readable guidelines.
+Mozilla Public License 2.0 — see [LICENSE](LICENSE).
