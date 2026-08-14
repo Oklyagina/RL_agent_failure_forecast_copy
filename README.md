@@ -131,12 +131,29 @@ constructor) collects rollouts and curates the action set automatically by
 deduplication; `training/train_enn.py` then trains, exports the scaler and
 metadata, and calibrates. Full step-by-step guide: **[TRAINING.md](TRAINING.md)**.
 
-## Docker
+## Agent API (InteractiveAI integration)
+
+`app/main.py` exposes the CurriculumAgent as an InteractiveAI agent API
+(FastAPI, `POST /api/v1/recommendation`), built to the AI4REALNET AI-agent
+template. Each recommendation is returned in the InteractiveAI dictionary
+format, with the two ENN epistemic-uncertainty percentiles added into the
+`kpis` field alongside `efficiency_of_the_reco`. The container built from the
+`Dockerfile` runs this API (uvicorn on port 8000).
 
 ```bash
-docker build -t enn-uq .
-docker run --rm enn-uq            # runs run_example.py as a reproducibility check
+docker build -t curriculum-agent-api .
+docker run -p 8000:8000 curriculum-agent-api
 ```
+
+The `Dockerfile` mirrors the AI4REALNET ExpertAgent reference (it sets up the
+`ai4realnet_small` scenario from `grid2op-scenario`, the same the simulator
+uses) on `python:3.10-slim`. Full endpoint contract, the `curl` test and the
+two deployment caveats (the `get_parade_info` helper from ExpertOp4Grid and the
+environment/Grid2Op alignment) are in **[API.md](API.md)**. `python tests/test_api.py` validates the API with a
+synthetic ENN, no environment needed.
+
+For a pure reproducibility check (no API), run `python run_example.py`
+directly, inside or outside the container.
 
 ## Maintainers
 
