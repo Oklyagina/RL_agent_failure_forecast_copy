@@ -1,9 +1,9 @@
 # InteractiveAI agent API container: CurriculumAgent + ENN uncertainty.
 # Mirrors the AI4REALNET ExpertAgent Dockerfile, adapted for the CurriculumAgent.
 #
-# python:3.10-slim (the ExpertAgent uses 3.12): tensorflow 2.12.1, ray 2.5.1 and
-# torch 2.1.2 have no wheels for Python >= 3.11. Each agent has its own
-# container, so the Python version is free (confirmed with IRT-SystemX).
+# python:3.10-slim (the ExpertAgent uses 3.12): the bundled CurriculumAgent
+# SavedModel was exported with Keras 2.12, and each agent has its own container,
+# so this stack can keep its Python/TensorFlow compatibility target.
 FROM python:3.10-slim
 
 WORKDIR /app
