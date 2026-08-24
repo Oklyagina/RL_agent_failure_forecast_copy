@@ -19,11 +19,11 @@ needed on the consumer side** — the reference is shipped
 
 ## Environment
 
-**Python 3.9 or 3.10 is required.** `tensorflow==2.12.1`, `ray==2.5.1` and
-`torch==2.1.2` publish no wheels for Python ≥ 3.11 (use a `python:3.10-slim`
-base image for containers — see `Dockerfile`). **Grid2Op is pinned to
-1.9.8**, the same version used by the InteractiveAI simulator, so the action
-format stays consistent.
+**Python 3.9 or 3.10 is required.** The bundled CurriculumAgent SavedModel was
+exported with Keras 2.12, so keep `tensorflow==2.12.1` and use a
+`python:3.10-slim` base image for containers (see `Dockerfile`). **Grid2Op is
+pinned to 1.9.8**, the same version used by the InteractiveAI simulator, so the
+action format stays consistent.
 
 ```bash
 conda create -n enn_uq python=3.10 -y
@@ -44,6 +44,12 @@ python training/collect_rollouts.py --agent curriculum --episodes 50 --out-dir d
 python training/train_enn.py --data-dir data_curriculum --out-dir models_curriculum --agent-name curriculum
 python run_example.py
 ```
+
+On Windows, the first Grid2Op dataset download/cache setup may require running
+PowerShell as Administrator. If Grid2Op reports missing files such as
+`config.py` or `grid_layout.json` under
+`C:\Users\olga.klyagina\data_grid2op\l2rpn_icaps_2021_small`, fix or remove
+that partial cache and rerun the rollout command from an Administrator shell.
 
 `run_example.py` is self-configuring: it locates the trained artifacts
 (newest `scaler_params.json` + `enn_meta.json` + calibration `.npz`, wherever

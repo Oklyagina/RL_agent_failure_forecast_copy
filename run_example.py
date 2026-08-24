@@ -28,10 +28,10 @@ ROOT = Path(__file__).resolve().parent
 # CONFIG -- everything is auto-discovered; set a value only to override.
 # ----------------------------------------------------------------------------
 ENV_NAME = "l2rpn_icaps_2021_small"
-ENN_WEIGHTS = None          # e.g. Path("src/models/enn_36.pth")
-ACTIONS_NPY = None          # e.g. Path("src/models/actions.npy")
+ENN_WEIGHTS = Path("assets/enn_36.pth")          # e.g. Path("src/models/enn_36.pth")
+ACTIONS_NPY = Path("assets/network36/actions/actions.npy")  # e.g. Path("src/models/network36/actions/actions.npy")
 CALIBRATION_NPZ = None      # e.g. Path("models_curriculum/enn_pctile_calib.npz")
-SCALER_JSON = None          # e.g. Path("models_curriculum/scaler_params.json")
+SCALER_JSON = None         # e.g. Path("models_curriculum/scaler_params.json")
 ENN_META_JSON = None        # e.g. Path("models_curriculum/enn_meta.json")
 AGENT_DIR = None            # dir containing model/ and actions/ subfolders
 N_STEPS = 5
@@ -159,13 +159,38 @@ def find_agent_dir() -> Path:
     to contain model/ and actions/ subfolders."""
     if AGENT_DIR:
         return Path(AGENT_DIR)
+    preferred = [
+        ROOT / "assets" / "network36",
+        ROOT / "src" / "models" / "network36",
+    ]
     base = ROOT / "curriculumagent"
-    for d in [base, *sorted(p for p in base.rglob("*") if p.is_dir())]:
+    invalid = []
+    for d in [*preferred, base, *sorted(p for p in base.rglob("*") if p.is_dir())]:
         if (d / "model").is_dir() and (d / "actions").is_dir():
+            if not has_valid_saved_model(d):
+                invalid.append(d)
+                continue
             print(f"       auto: agent dir   -> {d.relative_to(ROOT)}")
             return d
-    sys.exit("[error] no folder with model/ and actions/ subfolders found "
-             "under curriculumagent/. Set AGENT_DIR in the CONFIG block.")
+    hint = ""
+    if invalid:
+        bad = ", ".join(str(d.relative_to(ROOT)) for d in invalid)
+        hint = f"\n        Skipped invalid SavedModel artifact(s): {bad}."
+    sys.exit("[error] no valid folder with model/ and actions/ subfolders "
+             "found. Expected a non-empty TensorFlow SavedModel under "
+             "assets/network36/ or src/models/network36/. Set AGENT_DIR in "
+             f"the CONFIG block to override.{hint}")
+
+
+def has_valid_saved_model(agent_dir: Path) -> bool:
+    model_dir = agent_dir / "model"
+    variables_dir = model_dir / "variables"
+    required_files = [
+        model_dir / "saved_model.pb",
+        variables_dir / "variables.index",
+        variables_dir / "variables.data-00000-of-00001",
+    ]
+    return all(p.is_file() and p.stat().st_size > 0 for p in required_files)
 
 
 def scaler_from_json(path: Path):

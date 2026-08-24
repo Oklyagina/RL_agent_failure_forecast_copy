@@ -21,7 +21,12 @@ Then point training/train_enn.py at out_dir.
 """
 
 import argparse
+import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import grid2op
@@ -30,7 +35,25 @@ from lightsim2grid import LightSimBackend
 ENV_NAME = "l2rpn_icaps_2021_small"
 
 
-ROOT = Path(__file__).resolve().parents[1]
+def _has_valid_saved_model(agent_dir: Path) -> bool:
+    model_dir = agent_dir / "model"
+    variables_dir = model_dir / "variables"
+    required_files = [
+        model_dir / "saved_model.pb",
+        variables_dir / "variables.index",
+        variables_dir / "variables.data-00000-of-00001",
+    ]
+    return all(p.is_file() and p.stat().st_size > 0 for p in required_files)
+
+
+def _candidate_agent_dirs() -> list[Path]:
+    preferred = [
+        ROOT / "assets" / "network36",
+        ROOT / "src" / "models" / "network36",
+    ]
+    base = ROOT / "curriculumagent"
+    discovered = [base, *sorted(x for x in base.rglob("*") if x.is_dir())]
+    return preferred + discovered
 
 
 def make_curriculum_agent(env):
@@ -38,13 +61,22 @@ def make_curriculum_agent(env):
     curriculumagent/ (official entrypoint; the folder must contain model/
     and actions/ subfolders -- auto-located)."""
     from curriculumagent.submission.my_agent import make_agent
-    base = ROOT / "curriculumagent"
-    for d in [base, *sorted(x for x in base.rglob("*") if x.is_dir())]:
+    invalid = []
+    for d in _candidate_agent_dirs():
         if (d / "model").is_dir() and (d / "actions").is_dir():
+            if not _has_valid_saved_model(d):
+                invalid.append(d)
+                continue
             print(f"agent dir: {d.relative_to(ROOT)}")
             return make_agent(env, str(d))
-    raise FileNotFoundError("no folder with model/ and actions/ under "
-                            "curriculumagent/")
+    hint = ""
+    if invalid:
+        bad = ", ".join(str(d.relative_to(ROOT)) for d in invalid)
+        hint = f" Skipped invalid SavedModel artifact(s): {bad}."
+    raise FileNotFoundError(
+        "no valid folder with model/ and actions/ found. Expected a "
+        "non-empty TensorFlow SavedModel under assets/network36/ or "
+        f"src/models/network36/.{hint}")
 
 
 def make_expert_agent(env):
