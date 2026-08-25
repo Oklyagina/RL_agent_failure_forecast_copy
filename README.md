@@ -47,9 +47,7 @@ python run_example.py
 
 On Windows, the first Grid2Op dataset download/cache setup may require running
 PowerShell as Administrator. If Grid2Op reports missing files such as
-`config.py` or `grid_layout.json` under
-`C:\Users\olga.klyagina\data_grid2op\l2rpn_icaps_2021_small`, fix or remove
-that partial cache and rerun the rollout command from an Administrator shell.
+`config.py` or `grid_layout.json`, rerun the rollout command from an Administrator shell.
 
 `run_example.py` is self-configuring: it locates the trained artifacts
 (newest `scaler_params.json` + `enn_meta.json` + calibration `.npz`, wherever
