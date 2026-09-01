@@ -17,6 +17,13 @@ relative to a pre-computed reference distribution. **No calibration step is
 needed on the consumer side** — the reference is shipped
 (`enn_pctile_calib.npz`).
 
+## Configuration
+
+Copy `.env.example` to `.env` before running the pipeline, then adjust the
+values for your machine. The main settings are `ENV_NAME`, `ENV_LOCATION`,
+`AGENT_NAME`, `ASSETS_DIR`, and `ARTIFACTS_DIR`; all training and example
+scripts read these through `project_config.py`.
+
 ## Environment
 
 **Python 3.9 or 3.10 is required.** The bundled CurriculumAgent SavedModel was
@@ -40,7 +47,7 @@ automatically) → run the example. For the CurriculumAgent nothing needs to
 be edited:
 
 ```bash
-python training/curriculumagent.py
+python training/train_curriculumagent.py
 python training/collect_rollouts.py
 python training/train_enn.py
 python run_example.py
@@ -145,7 +152,7 @@ two scripts used above handle any agent: `--agent expert` in
 `training/collect_rollouts.py` (after plugging in the ExpertAgent
 constructor) collects rollouts and curates the action set automatically by
 deduplication; `training/train_enn.py` then trains, exports the scaler and
-metadata, and calibrates. Full step-by-step guide: **[TRAINING.md](TRAINING.md)**.
+metadata, and calibrates. Full step-by-step guide: **[TRAINING.md](training/TRAINING.md)**.
 
 ## Agent API (InteractiveAI integration)
 
