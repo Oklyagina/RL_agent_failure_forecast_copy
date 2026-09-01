@@ -8,9 +8,7 @@ Outputs (in --out-dir):
     scaler_params.json           mean/std of the StandardScaler (JSON)
     enn_meta.json                input_dim, num_classes, class_mapping
                                  (identity: label k == curated action k)
-
-After this, run the existing calibrate_uncertainty.py on a set of reference
-observations to produce the percentile calibration (.npz). See TRAINING.md.
+    enn_pctile_calib.npz         percentile calibration reference
 
 NOTE(margarida): the loss below is the standard evidential-classification
 objective (Bayes-risk cross-entropy + annealed KL to the uniform Dirichlet,
@@ -19,12 +17,12 @@ objective or schedule, align this file with the original training script so
 both ENNs are comparable.
 
 Usage:
-    python training/train_enn.py --data-dir data_expert --out-dir models_expert \
-        --agent-name expert --epochs 100
+    python training/train_enn.py
 """
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -34,10 +32,29 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 
-# TODO(margarida): confirm import path of the ENN architecture.
-import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from src.enn_models import EvidentialNetwork
+from project_config import (AGENT_NAME, ARTIFACTS_DIR, ENN_ANNEAL_EPOCHS,
+                            ENN_BATCH_SIZE, ENN_EPOCHS, ENN_LR,
+                            ENN_VAL_FRAC, ENV_NAME, SEED)
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def default_rollout_dir(agent_name: str) -> Path:
+    return ARTIFACTS_DIR / ENV_NAME / agent_name / "rollouts"
+
+
+def default_model_dir(agent_name: str) -> Path:
+    return ARTIFACTS_DIR / ENV_NAME / agent_name / "model"
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path.resolve())
 
 
 # --- evidential loss ---------------------------------------------------------
@@ -75,16 +92,22 @@ def evidential_loss(alpha: torch.Tensor, targets: torch.Tensor,
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", type=Path, required=True)
-    ap.add_argument("--out-dir", type=Path, required=True)
-    ap.add_argument("--agent-name", type=str, default="expert")
-    ap.add_argument("--epochs", type=int, default=100)
-    ap.add_argument("--anneal-epochs", type=int, default=10)
-    ap.add_argument("--batch-size", type=int, default=512)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--val-frac", type=float, default=0.1)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--data-dir", type=Path, default=None,
+                    help=f"default: artifacts/{ENV_NAME}/<agent-name>/rollouts")
+    ap.add_argument("--out-dir", type=Path, default=None,
+                    help=f"default: artifacts/{ENV_NAME}/<agent-name>/model")
+    ap.add_argument("--agent-name", type=str, default=AGENT_NAME)
+    ap.add_argument("--epochs", type=int, default=ENN_EPOCHS)
+    ap.add_argument("--anneal-epochs", type=int, default=ENN_ANNEAL_EPOCHS)
+    ap.add_argument("--batch-size", type=int, default=ENN_BATCH_SIZE)
+    ap.add_argument("--lr", type=float, default=ENN_LR)
+    ap.add_argument("--val-frac", type=float, default=ENN_VAL_FRAC)
+    ap.add_argument("--seed", type=int, default=SEED)
     args = ap.parse_args()
+    if args.data_dir is None:
+        args.data_dir = default_rollout_dir(args.agent_name)
+    if args.out_dir is None:
+        args.out_dir = default_model_dir(args.agent_name)
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -160,9 +183,10 @@ def main() -> None:
         "input_dim": int(X.shape[1]),
         "num_classes": num_classes,
         "n_curated_actions": num_classes,
-        "environment": "l2rpn_icaps_2021_small",
+        "environment": ENV_NAME,
         "grid2op_version": "1.9.8",
         "agent": args.agent_name,
+        "action_set": _display_path(args.data_dir / "actions.npy"),
         "class_mapping": {int(k): int(k) for k in range(num_classes)},
     }))
     print(f"\n[ok] wrote enn_{args.agent_name}.pth, scaler_params.json, "
