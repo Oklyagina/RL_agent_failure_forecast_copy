@@ -40,7 +40,7 @@ automatically) → run the example. For the CurriculumAgent nothing needs to
 be edited:
 
 ```bash
-python st01_train_curriculumagent.py
+python training/curriculumagent.py
 python training/collect_rollouts.py
 python training/train_enn.py
 python run_example.py
