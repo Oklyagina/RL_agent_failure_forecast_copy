@@ -15,7 +15,7 @@ training step needs:
                                                         (action.to_vect())
 
 Usage:
-    python training/collect_rollouts.py --episodes 50 --out-dir data_expert
+    python training/collect_rollouts.py
 
 Then point training/train_enn.py at out_dir.
 """
@@ -23,16 +23,20 @@ Then point training/train_enn.py at out_dir.
 import argparse
 import sys
 from pathlib import Path
+import numpy as np
+import grid2op
+from lightsim2grid import LightSimBackend
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import numpy as np
-import grid2op
-from lightsim2grid import LightSimBackend
+from project_config import (AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR, ENV_DIR,
+                            ENV_NAME, ROLLOUT_EPISODES, SEED)
 
-ENV_NAME = "l2rpn_icaps_2021_small"
+
+def default_rollout_dir(agent_name: str) -> Path:
+    return ARTIFACTS_DIR / ENV_NAME / agent_name / "rollouts"
 
 
 def _has_valid_saved_model(agent_dir: Path) -> bool:
@@ -48,7 +52,8 @@ def _has_valid_saved_model(agent_dir: Path) -> bool:
 
 def _candidate_agent_dirs() -> list[Path]:
     preferred = [
-        ROOT / "assets" / "network36",
+        ASSETS_DIR / ENV_NAME,
+        ASSETS_DIR / "network36",
         ROOT / "src" / "models" / "network36",
     ]
     base = ROOT / "curriculumagent"
@@ -75,7 +80,8 @@ def make_curriculum_agent(env):
         hint = f" Skipped invalid SavedModel artifact(s): {bad}."
     raise FileNotFoundError(
         "no valid folder with model/ and actions/ found. Expected a "
-        "non-empty TensorFlow SavedModel under assets/network36/ or "
+        f"non-empty TensorFlow SavedModel under assets/{ENV_NAME}/, "
+        "assets/network36/ or "
         f"src/models/network36/.{hint}")
 
 
@@ -92,7 +98,10 @@ AGENTS = {"curriculum": make_curriculum_agent, "expert": make_expert_agent}
 
 def collect(agent_name: str, episodes: int, out_dir: Path, seed: int = 0,
             max_steps: int | None = None) -> None:
-    env = grid2op.make(ENV_NAME, backend=LightSimBackend())
+
+    print()
+
+    env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
     env.seed(seed)
     agent = AGENTS[agent_name](env)
 
@@ -128,10 +137,13 @@ def collect(agent_name: str, episodes: int, out_dir: Path, seed: int = 0,
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", choices=("curriculum", "expert"),
-                    default="curriculum")
-    ap.add_argument("--episodes", type=int, default=50)
-    ap.add_argument("--out-dir", type=Path, default=Path("data_expert"))
-    ap.add_argument("--seed", type=int, default=0)
+                    default=AGENT_NAME)
+    ap.add_argument("--episodes", type=int, default=ROLLOUT_EPISODES)
+    ap.add_argument("--out-dir", type=Path, default=None,
+                    help=f"default: artifacts/{ENV_NAME}/<agent>/rollouts")
+    ap.add_argument("--seed", type=int, default=SEED)
     ap.add_argument("--max-steps", type=int, default=None)
     args = ap.parse_args()
+    if args.out_dir is None:
+        args.out_dir = default_rollout_dir(args.agent)
     collect(args.agent, args.episodes, args.out_dir, args.seed, args.max_steps)

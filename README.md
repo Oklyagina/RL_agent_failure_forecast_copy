@@ -40,22 +40,33 @@ automatically) → run the example. For the CurriculumAgent nothing needs to
 be edited:
 
 ```bash
-python training/collect_rollouts.py --agent curriculum --episodes 50 --out-dir data_curriculum
-python training/train_enn.py --data-dir data_curriculum --out-dir models_curriculum --agent-name curriculum
+python training/curriculumagent.py
+python training/collect_rollouts.py
+python training/train_enn.py
 python run_example.py
 ```
+
+Shared defaults are read from `.env` (see `.env.example`). By default, the
+trained CurriculumAgent policy package is stored in `assets/ai4realnet_small/`,
+rollout data is written to `artifacts/ai4realnet_small/curriculum/rollouts/`,
+and trained ENN artifacts to `artifacts/ai4realnet_small/curriculum/model/`.
+For another agent, pass `--agent expert` to collection and `--agent-name expert`
+to training; the default directories become
+`artifacts/ai4realnet_small/expert/rollouts/` and
+`artifacts/ai4realnet_small/expert/model/`.
 
 On Windows, the first Grid2Op dataset download/cache setup may require running
 PowerShell as Administrator. If Grid2Op reports missing files such as
 `config.py` or `grid_layout.json`, rerun the rollout command from an Administrator shell.
 
-`run_example.py` is self-configuring: it locates the trained artifacts
-(newest `scaler_params.json` + `enn_meta.json` + calibration `.npz`, wherever
-the training wrote them), the curated action set, the ENN architecture module
-and the agent binaries, printing every resolved path (anything can be
-overridden in its CONFIG block). It then creates the
-`l2rpn_icaps_2021_small` environment (LightSim backend), loads the
-CurriculumAgent from `curriculumagent/`, rebuilds the training scaler from
+`run_example.py` is self-configuring: it prefers trained artifacts under
+`artifacts/`, then falls back to legacy `models_*` folders and other compatible
+locations. It locates `scaler_params.json`, `enn_meta.json`, calibration `.npz`,
+the curated action set, the ENN architecture module and the agent binaries,
+printing every resolved path (anything can be overridden in its CONFIG block).
+It then creates the
+configured environment (LightSim backend), loads the CurriculumAgent policy
+from `assets/<ENV_NAME>/`, rebuilds the training scaler from
 the exported JSON (no pickled scaler, so it reloads under any scikit-learn
 version), loads the calibration, and calls `assess_recommendation` on live
 observations, printing the two percentiles per step and the recommendations
@@ -68,19 +79,20 @@ prints the exact training commands to run first.
 |---|---|
 | `recommendation_uncertainty.py` | the module: `load_calibration`, `assess_recommendation` |
 | `src/enn_models.py` | ENN architecture (`EvidentialNetwork`) |
-| `data_<agent>/actions.npy` (produced by collection) | curated action set — rows are `action.to_vect()`, deduplicated from the rollouts |
-| `models_<agent>/` (produced by training) | `enn_<agent>.pth`, `scaler_params.json` (scaler mean/std as JSON — the scaler is created at training time), `enn_meta.json`, `enn_pctile_calib.npz` |
-| `curriculumagent/` | agent binaries (L2RPN submission layout) |
+| `assets/<ENV_NAME>/` (produced by CurriculumAgent training) | trained RL policy package with `model/` and `actions/` |
+| `artifacts/<ENV_NAME>/<agent>/rollouts/actions.npy` (produced by collection) | curated action set — rows are `action.to_vect()`, deduplicated from the rollouts |
+| `artifacts/<ENV_NAME>/<agent>/model/` (produced by ENN training) | `enn_<agent>.pth`, `scaler_params.json` (scaler mean/std as JSON — the scaler is created at training time), `enn_meta.json`, `enn_pctile_calib.npz` |
+| `curriculumagent/` | agent source/submission code |
 
 ## Usage in three lines
 
 ```python
 from recommendation_uncertainty import load_calibration, assess_recommendation
 
-calibration = load_calibration("models_curriculum/enn_pctile_calib.npz",
+calibration = load_calibration("artifacts/ai4realnet_small/curriculum/model/enn_pctile_calib.npz",
                                scaler=scaler,
-                               action_set="data_curriculum/actions.npy",
-                               class_mapping="models_curriculum/enn_meta.json")
+                               action_set="artifacts/ai4realnet_small/curriculum/rollouts/actions.npy",
+                               class_mapping="artifacts/ai4realnet_small/curriculum/model/enn_meta.json")
 info = assess_recommendation(obs, agent, enn, calibration)
 # {"chosen_action_id": ..., "epistemic_uncertainty_total_pctile": ...,
 #  "epistemic_uncertainty_action_pctile": ...}

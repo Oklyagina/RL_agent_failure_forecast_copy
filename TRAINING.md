@@ -21,14 +21,14 @@ For the **CurriculumAgent** (binaries already in the repository) nothing
 needs to be edited:
 
 ```bash
-python training/collect_rollouts.py --agent curriculum --episodes 50 --out-dir data_curriculum
+python training/collect_rollouts.py
 ```
 
 For the **ExpertAgent**, plug its constructor into `make_expert_agent()` in
 `training/collect_rollouts.py`, then:
 
 ```bash
-python training/collect_rollouts.py --agent expert --episodes 50 --out-dir data_expert
+python training/collect_rollouts.py --agent expert
 ```
 
 Produces `observations.npy` (obs vectors), `labels.npy` (index of each chosen
@@ -40,9 +40,13 @@ will face at inference time).
 ## Step 2 — Train the ENN
 
 ```bash
-python training/train_enn.py --data-dir data_expert --out-dir models_expert \
-    --agent-name expert --epochs 100
+python training/train_enn.py --agent-name expert
 ```
+
+Both scripts derive their default directories from the agent name:
+`artifacts/<ENV_NAME>/<agent>/rollouts/` for collected rollout arrays and
+`artifacts/<ENV_NAME>/<agent>/model/` for trained ENN artifacts. The trained
+RL policy package used for rollouts lives separately under `assets/<ENV_NAME>/`.
 
 **The scaler is created here, at training time** — fitted on the training
 split — and exported together with everything else. The script trains the
@@ -55,7 +59,8 @@ checkpoint by validation loss, and exports:
 - `enn_meta.json` — `input_dim`, `num_classes`, identity `class_mapping`;
 - `enn_pctile_calib.npz` — the percentile calibration (see Step 4).
 
-`run_example.py` picks these artifacts up automatically.
+`run_example.py` picks artifacts under `artifacts/` first, then falls back to
+legacy `models_*` folders.
 
 Sanity checks: validation top-1 accuracy well above chance (1/num_classes);
 if one action dominates the rollouts (e.g. do-nothing), consider collecting
@@ -81,8 +86,11 @@ repository's `calibrate_uncertainty.py` instead.
 ## Step 5 — Use it
 
 Exactly as in `run_example.py`, pointing the CONFIG block at the new
-artifacts (`enn_expert.pth`, `data_expert/actions.npy`, the new `.npz`,
-`models_expert/scaler_params.json`, `models_expert/enn_meta.json`) and
+artifacts (`artifacts/ai4realnet_small/expert/model/enn_expert.pth`,
+`artifacts/ai4realnet_small/expert/rollouts/actions.npy`,
+`artifacts/ai4realnet_small/expert/model/enn_pctile_calib.npz`,
+`artifacts/ai4realnet_small/expert/model/scaler_params.json`,
+`artifacts/ai4realnet_small/expert/model/enn_meta.json`) and
 loading the ExpertAgent instead of the CurriculumAgent:
 
 ```python
