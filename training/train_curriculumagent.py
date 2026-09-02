@@ -17,7 +17,7 @@ from lightsim2grid import LightSimBackend
 from curriculumagent.baseline import CurriculumAgent
 
 from project_config import (ASSETS_DIR, CURRICULUM_ITERATIONS,
-                            CURRICULUM_JOBS, ENV_DIR, ENV_LOCATION, ENV_NAME)
+                            CURRICULUM_JOBS, ENV_DIR, ENV_NAME)
 
 VERBOSE = False
 SHOW_PROGRESS = True
