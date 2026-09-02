@@ -16,7 +16,7 @@ DEFAULTS = {
     "ARTIFACTS_DIR": "artifacts",
 
 #============= Agent defaults =================#
-    "CURRICULUM_ITERATIONS": "3",
+    "CURRICULUM_ITERATIONS": "50",
     "CURRICULUM_JOBS": "1",
     "ROLLOUT_EPISODES": "50",
 

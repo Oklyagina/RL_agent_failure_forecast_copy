@@ -23,7 +23,7 @@ import joblib
 
 warnings.filterwarnings("ignore")
 
-import dual_llm as P   # reuse the same config, feature list and data loader
+import dual_llm as Predictor   # reuse the same config, feature list and data loader
 
 TOP_K = 8                 # features kept per line (dual_llm then sweeps k in {3..8} of these)
 MAX_ROWS_PER_LINE = 200   # subsample per line for SHAP speed (the ranking is stable)
@@ -51,25 +51,25 @@ def feature_importance(model, X):
 
 
 def main():
-    model = joblib.load(P.HGB_MODEL_PATH)
-    df = P.prepare_dataframe()
+    model = joblib.load(Predictor.HGB_MODEL_PATH)
+    df = Predictor.prepare_dataframe()
 
     rankings = {}
-    for line_name in P.LINE_MAP:
+    for line_name in Predictor.LINE_MAP:
         df_line = df[df["line_disconnected"] == line_name]
         if len(df_line) < 5:
             print(f"  [skip] {line_name}: too few rows ({len(df_line)})")
             continue
-        X = df_line[P.FEATURES].copy()
+        X = df_line[Predictor.FEATURES].copy()
         if len(X) > MAX_ROWS_PER_LINE:
             X = X.sample(MAX_ROWS_PER_LINE, random_state=0)
         importance, method = feature_importance(model, X)
         order = np.argsort(importance)[::-1]
-        ranked = [P.FEATURES[i] for i in order if P.FEATURES[i] in P.FEATURES_FOR_LLM][:TOP_K]
+        ranked = [Predictor.FEATURES[i] for i in order if Predictor.FEATURES[i] in Predictor.FEATURES_FOR_LLM][:TOP_K]
         rankings[line_name] = ranked
         print(f"  {line_name} [{method}]: {ranked}")
 
-    out = os.path.join(P.HERE, "shap_rankings.json")
+    out = os.path.join(Predictor.HERE, "shap_rankings.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump(rankings, f, indent=2)
     print(f"\nSaved {out}")

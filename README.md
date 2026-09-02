@@ -172,7 +172,7 @@ The `Dockerfile` mirrors the AI4REALNET ExpertAgent reference (it sets up the
 `ai4realnet_small` scenario from `grid2op-scenario`, the same the simulator
 uses) on `python:3.10-slim`. Full endpoint contract, the `curl` test and the
 two deployment caveats (the `get_parade_info` helper from ExpertOp4Grid and the
-environment/Grid2Op alignment) are in **[API.md](API.md)**. `python tests/test_api.py` validates the API with a
+environment/Grid2Op alignment) are in **[API.md](app/API.md)**. `python tests/test_api.py` validates the API with a
 synthetic ENN, no environment needed.
 
 For a pure reproducibility check (no API), run `python run_example.py`
