@@ -500,6 +500,9 @@ def make_agent(env, this_directory_path):
         model_path=Path(this_directory_path) / "model",
         this_directory_path=Path(this_directory_path),
         action_space_path=Path(this_directory_path) / "actions",
-        subset=True,
+        # The bundled network36 SavedModel was trained on full Grid2Op
+        # observation vectors (1363 features), not the reduced obs_to_vect
+        # subset (1221 features).
+        subset=False,
     )
     return my_agent

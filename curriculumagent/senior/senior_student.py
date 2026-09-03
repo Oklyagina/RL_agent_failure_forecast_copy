@@ -13,6 +13,7 @@ from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.models import ModelCatalog
 from ray.rllib.utils import check_env
 from sklearn.base import BaseEstimator
+from tqdm.auto import tqdm
 
 from curriculumagent.senior.rllib_execution.senior_env_rllib import SeniorEnvRllib
 from curriculumagent.senior.rllib_execution.senior_model_rllib import Grid2OpCustomModelTF, Grid2OpCustomModelTorch
@@ -146,16 +147,17 @@ class Senior:
 
         self.ppo = self.ppo_config.build()
 
-    def train(self, iterations: int = 1) -> dict:
+    def train(self, iterations: int = 1, show_progress: bool = True) -> dict:
         """ Train the Senior with the underlying PPO network36.
 
         Args:
             iterations: Number of Iterations for the PPO
+            show_progress: Whether to show a compact tqdm progress bar.
 
         Returns: rllib output
         """
         out = None
-        for i in range(iterations):
+        for i in tqdm(range(iterations), desc="Senior PPO", unit="iter", disable=not show_progress):
             out = self.ppo.train()
 
             # For every 5 steps, we save the current checkpoint:

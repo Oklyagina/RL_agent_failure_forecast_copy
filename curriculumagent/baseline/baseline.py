@@ -17,6 +17,7 @@ import numpy as np
 import ray
 from grid2op.Agent import BaseAgent
 from lightsim2grid import LightSimBackend
+from tqdm.auto import tqdm
 
 from curriculumagent.junior.junior_student import Junior
 from curriculumagent.senior.senior_student import Senior
@@ -231,6 +232,8 @@ class CurriculumAgent(BaseAgent):
             env: Union[str, grid2op.Environment.BaseEnv] = "l2rpn_case14_sandbox",
             iterations: int = 1,
             save_path: Optional[Path] = Path(os.getcwd()) / "out",
+            log_level: int = logging.WARNING,
+            show_progress: bool = True,
             **kwargs,
     ) -> grid2op.Agent.BaseAgent:
         """
@@ -250,6 +253,8 @@ class CurriculumAgent(BaseAgent):
             env: Str, Path to environment or the grid2op Environment.
             iterations: Number of iterations for the training
             save_path: Optional save_path argument, if you want to store your network36 somewhere else.
+            log_level: Standard logging level. Defaults to WARNING to keep long training runs quiet.
+            show_progress: Whether to show compact tqdm progress bars.
             **kwargs: Optional Parameters such as seed or jobs, or max_action_space_size
 
         Returns: Returns the fitted network36.
@@ -264,7 +269,9 @@ class CurriculumAgent(BaseAgent):
 
         # Prepare environment
         log_format = "(%(asctime)s) [%(name)-10s] %(levelname)8s: %(message)s [%(filename)s:%(lineno)s]"
-        logging.basicConfig(level=logging.INFO, format=log_format)
+        logging.basicConfig(level=log_level, format=log_format, force=True)
+        logging.getLogger().setLevel(log_level)
+        logging.disable(logging.INFO if log_level > logging.INFO else logging.NOTSET)
 
         # Make sure environment is present or downloaded.
         # For parallelization, this needs to be only the name
@@ -283,103 +290,123 @@ class CurriculumAgent(BaseAgent):
             (save_path / sub_dir).mkdir(exist_ok=True, parents=True)
 
         logging.info(f"All paths were created under {save_path}. Now let's start with the Teacher training.")
-
-        ############################################################################################
-        # Stage1 : Teacher
-        # Run Teacher / Do Action Space Reduction
-        teacher_experience_path = save_path / "teacher" / Path("general_teacher_experience.csv")
-        if not teacher_experience_path.exists():
-            logging.info(f"Finding good actions using Teacher...")
-            general_teacher(
-                save_path=teacher_experience_path,
-                env_name_path=env_path,
-                n_episodes=iterations,
-                jobs=jobs,
-            )
-        else:
-            logging.info(f"Skipping Teacher because {teacher_experience_path} already exists")
-
-        # Use experience to do action space reduction and save as our action space file
-        actions_path = save_path / "actions" / "actions.npy"
-        if not actions_path.exists():
-            logging.info("Reducing actionspace...")
-            make_unitary_actionspace(
-                actions_path, [teacher_experience_path], env_path,
-                best_n=max_actionspace_size
-            )
-        else:
-            logging.info(f"Skipping action space generation because {actions_path} already exists")
-
-        ############################################################################################
-        # Stage 2 : Tutor
-        tutor_experience_path = save_path / "tutor" / "tutor_experience.npy"
-        if not tutor_experience_path.exists():
-            logging.info("Generating experience using Tutor...")
-            generate_tutor_experience(
-                env_path,
-                tutor_experience_path,
-                actions_path,
-                num_chronics=iterations,
-                jobs=jobs,
-                seed=seed,
-            )
-        else:
-            logging.info(f"Skipping Tutor because {tutor_experience_path} already exists")
-
-        ############################################################################################
-        # Stage 3: Junior
-        junior_data_path = save_path / "tutor" / "junior_data"
-        junior_results_path = save_path / "junior"
-        junior_data_path.mkdir(exist_ok=True, parents=True)
-        prepare_dataset(
-            traindata_path=tutor_experience_path.parent,
-            target_path=junior_data_path,
-            dataset_name="test",
+        progress = tqdm(
+            total=5,
+            desc="Curriculum pipeline",
+            unit="stage",
+            disable=not show_progress,
         )
 
-        if not (junior_results_path / "saved_model.pb").exists():
-            junior = Junior(run_with_tf = True,
-                            action_space_file = actions_path,
-                            config = {},
-                            seed = seed,
-                            run_nni = False
-    )
-            junior.train(
-                run_name="junior",
-                dataset_path=junior_data_path,
-                target_model_path=junior_results_path,
+        try:
+            ############################################################################################
+            # Stage1 : Teacher
+            # Run Teacher / Do Action Space Reduction
+            progress.set_description("Teacher")
+            teacher_experience_path = save_path / "teacher" / Path("general_teacher_experience.csv")
+            if not teacher_experience_path.exists():
+                logging.info(f"Finding good actions using Teacher...")
+                general_teacher(
+                    save_path=teacher_experience_path,
+                    env_name_path=env_path,
+                    n_episodes=iterations,
+                    jobs=jobs,
+                )
+            else:
+                logging.info(f"Skipping Teacher because {teacher_experience_path} already exists")
+            progress.update(1)
+
+            # Use experience to do action space reduction and save as our action space file
+            progress.set_description("Action space")
+            actions_path = save_path / "actions" / "actions.npy"
+            if not actions_path.exists():
+                logging.info("Reducing actionspace...")
+                make_unitary_actionspace(
+                    actions_path, [teacher_experience_path], env_path,
+                    best_n=max_actionspace_size
+                )
+            else:
+                logging.info(f"Skipping action space generation because {actions_path} already exists")
+            progress.update(1)
+
+            ############################################################################################
+            # Stage 2 : Tutor
+            progress.set_description("Tutor")
+            tutor_experience_path = save_path / "tutor" / "tutor_experience.npy"
+            if not tutor_experience_path.exists():
+                logging.info("Generating experience using Tutor...")
+                generate_tutor_experience(
+                    env_path,
+                    tutor_experience_path,
+                    actions_path,
+                    num_chronics=iterations,
+                    jobs=jobs,
+                    seed=seed,
+                )
+            else:
+                logging.info(f"Skipping Tutor because {tutor_experience_path} already exists")
+            progress.update(1)
+
+            ############################################################################################
+            # Stage 3: Junior
+            progress.set_description("Junior")
+            junior_data_path = save_path / "tutor" / "junior_data"
+            junior_results_path = save_path / "junior"
+            junior_data_path.mkdir(exist_ok=True, parents=True)
+            prepare_dataset(
+                traindata_path=tutor_experience_path.parent,
+                target_path=junior_data_path,
                 dataset_name="test",
-                epochs=10 + iterations
             )
-        else:
-            logging.info(f"Skipping Junior because {junior_results_path / 'saved_model.pb'} already exists")
 
-        ############################################################################################
-        # Stage 4: Senior:
-        # Configure configs & register model:
-        # Given some import problems we only import ray here:
-        senior_results_path = save_path / "senior"
-        if ray.is_initialized() is False:
-            ray.init(num_gpus=0)
+            if not (junior_results_path / "saved_model.pb").exists():
+                junior = Junior(run_with_tf = True,
+                                action_space_file = actions_path,
+                                config = {},
+                                seed = seed,
+                                run_nni = False
+        )
+                junior.train(
+                    run_name="junior",
+                    dataset_path=junior_data_path,
+                    target_model_path=junior_results_path,
+                    dataset_name="test",
+                    epochs=10 + iterations
+                )
+            else:
+                logging.info(f"Skipping Junior because {junior_results_path / 'saved_model.pb'} already exists")
+            progress.update(1)
 
-        # get the resources:
-        resources = ray.nodes()
-        num_workers = int(resources[0]["Resources"]["CPU"] // 2)
+            ############################################################################################
+            # Stage 4: Senior:
+            # Configure configs & register model:
+            # Given some import problems we only import ray here:
+            progress.set_description("Senior")
+            senior_results_path = save_path / "senior"
+            if ray.is_initialized() is False:
+                ray.init(num_gpus=0, log_to_driver=log_level <= logging.INFO)
 
-        senior = Senior(env_path=env_path,
-                        action_space_path=actions_path,
-                        model_path=junior_results_path,
-                        ckpt_save_path=senior_results_path,
-                        num_workers=num_workers,
-                        subset=False)
+            if jobs in (None, -1):
+                num_workers = max((os.cpu_count() or 2) // 2, 1)
+            else:
+                num_workers = max(int(jobs), 1)
 
-        if not (senior_results_path / "sandbox").exists():
-            senior.train(iterations=iterations)
-        else:
-            logging.info(f"Skipping Senior training because {senior_results_path / 'sandbox'} already "
-                         f"exists. Instead we are loading the senior from checkpoints")  #
-            senior.restore(senior_results_path)
-            logging.info(f"The Senior trained for {senior.ppo.iteration} iterations.")
+            senior = Senior(env_path=env_path,
+                            action_space_path=actions_path,
+                            model_path=junior_results_path,
+                            ckpt_save_path=senior_results_path,
+                            num_workers=num_workers,
+                            subset=False)
+
+            if not (senior_results_path / "sandbox").exists():
+                senior.train(iterations=iterations, show_progress=show_progress)
+            else:
+                logging.info(f"Skipping Senior training because {senior_results_path / 'sandbox'} already "
+                             f"exists. Instead we are loading the senior from checkpoints")  #
+                senior.restore(senior_results_path)
+                logging.info(f"The Senior trained for {senior.ppo.iteration} iterations.")
+            progress.update(1)
+        finally:
+            progress.close()
 
         ############################################################################################
         # Stage 5.

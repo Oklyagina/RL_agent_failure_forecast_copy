@@ -6,8 +6,8 @@ module and the agent binaries, so no paths need to be edited. Every guess is
 printed; anything can still be overridden in CONFIG below.
 
 Pipeline: Grid2Op environment -> CurriculumAgent (curriculumagent/) ->
-trained ENN + training scaler (rebuilt from example_artifacts/, plain JSON)
--> percentile calibration -> assess_recommendation per step -> output,
+trained ENN + training scaler (rebuilt from artifacts/, plain JSON) ->
+percentile calibration -> assess_recommendation per step -> output,
 including the recommendations list in the InteractiveAI format ("kpis").
 
 Requirements: Python 3.9/3.10 + requirements.txt (see README).
@@ -22,54 +22,82 @@ from pathlib import Path
 
 import numpy as np
 
+from project_config import (AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR, ENV_DIR,
+                            ENV_NAME, EXAMPLE_N_STEPS,
+                            SEED as CONFIG_SEED)
+
 ROOT = Path(__file__).resolve().parent
 
 # ----------------------------------------------------------------------------
 # CONFIG -- everything is auto-discovered; set a value only to override.
 # ----------------------------------------------------------------------------
-ENV_NAME = "l2rpn_icaps_2021_small"
-ENN_WEIGHTS = None          # e.g. Path("src/models/enn_36.pth")
-ACTIONS_NPY = None          # e.g. Path("src/models/actions.npy")
-CALIBRATION_NPZ = None      # e.g. Path("models_curriculum/enn_pctile_calib.npz")
-SCALER_JSON = None          # e.g. Path("models_curriculum/scaler_params.json")
-ENN_META_JSON = None        # e.g. Path("models_curriculum/enn_meta.json")
+ENN_WEIGHTS = None          # e.g. Path("artifacts/ai4realnet_small/curriculum/model/enn_curriculum.pth")
+ACTIONS_NPY = None          # e.g. Path("artifacts/ai4realnet_small/curriculum/rollouts/actions.npy")
+CALIBRATION_NPZ = None      # e.g. Path("artifacts/ai4realnet_small/curriculum/model/enn_pctile_calib.npz")
+SCALER_JSON = None          # e.g. Path("artifacts/ai4realnet_small/curriculum/model/scaler_params.json")
+ENN_META_JSON = None        # e.g. Path("artifacts/ai4realnet_small/curriculum/model/enn_meta.json")
 AGENT_DIR = None            # dir containing model/ and actions/ subfolders
-N_STEPS = 5
-SEED = 0
+N_STEPS = EXAMPLE_N_STEPS
+SEED = CONFIG_SEED
 # ----------------------------------------------------------------------------
 
 _SKIP_DIRS = {".git", "__pycache__", "tests", "curriculumagent"}
 
 
+def _rel_parts(path: Path) -> tuple[str, ...]:
+    try:
+        return path.relative_to(ROOT).parts
+    except ValueError:
+        return ()
+
+
+def _artifact_rank(path: Path) -> int:
+    parts = _rel_parts(path)
+    if parts and parts[0] == "artifacts":
+        return 0
+    if path.name.startswith("models_"):
+        return 1
+    if path == ROOT:
+        return 99
+    return 2
+
+
 def find_artifact_set():
     """Locate scaler_params.json + enn_meta.json (+ calibration .npz).
 
-    Priority: (1) CONFIG overrides; (2) any folder produced by
-    training/train_enn.py (contains both JSONs -- newest wins); the
-    calibration .npz is taken from the same folder when present, else from
-    the repository root (enn_pctile_calib.npz).
+    Priority: (1) CONFIG overrides; (2) artifacts/ folders produced by
+    training/train_enn.py; (3) legacy models_* folders; (4) other fallback
+    folders. The calibration .npz must sit next to the selected metadata.
 
     The scaler is CREATED AT ENN TRAINING TIME -- if nothing is found, the
     pipeline must be trained first (see TRAINING.md)."""
     if SCALER_JSON and ENN_META_JSON:
         scaler_json, meta_json = Path(SCALER_JSON), Path(ENN_META_JSON)
     else:
-        cands = [d for d in {p.parent for p in ROOT.rglob("enn_meta.json")}
-                 if (d / "scaler_params.json").is_file()
-                 and not (_SKIP_DIRS & set(d.relative_to(ROOT).parts))]
+        configured_dir = ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "model"
+        cands = []
+        if (configured_dir / "enn_meta.json").is_file() \
+                and (configured_dir / "scaler_params.json").is_file():
+            cands.append(configured_dir)
+        cands.extend(
+            d for d in {p.parent for p in ROOT.rglob("enn_meta.json")}
+            if (d / "scaler_params.json").is_file()
+            and d != configured_dir
+            and not (_SKIP_DIRS & set(_rel_parts(d)))
+        )
         if not cands:
             sys.exit(
                 "[error] no trained artifacts found (scaler_params.json + "
                 "enn_meta.json).\n        The scaler is created when the ENN "
                 "is trained -- run the training pipeline first "
                 "(see TRAINING.md):\n"
-                "          python training/collect_rollouts.py --agent "
-                "curriculum --episodes 50 --out-dir data_curriculum\n"
-                "          python training/train_enn.py --data-dir "
-                "data_curriculum --out-dir models_curriculum --agent-name "
-                "curriculum\n        and then re-run this script.")
-        cands.sort(key=lambda d: (d / "enn_meta.json").stat().st_mtime,
-                   reverse=True)
+                "          python training/collect_rollouts.py\n"
+                "          python training/train_enn.py\n"
+                "        and then re-run this script.")
+        cands.sort(key=lambda d: (
+            _artifact_rank(d),
+            -(d / "enn_meta.json").stat().st_mtime,
+        ))
         d = cands[0]
         scaler_json, meta_json = d / "scaler_params.json", d / "enn_meta.json"
         print(f"       auto: artifacts   -> {d.relative_to(ROOT)}/")
@@ -77,8 +105,14 @@ def find_artifact_set():
         npz = Path(CALIBRATION_NPZ)
     elif (meta_json.parent / "enn_pctile_calib.npz").is_file():
         npz = meta_json.parent / "enn_pctile_calib.npz"
-    else:
+    elif meta_json.parent == ROOT and (ROOT / "enn_pctile_calib.npz").is_file():
         npz = ROOT / "enn_pctile_calib.npz"
+    else:
+        sys.exit(
+            "[error] no calibration file found next to the selected trained "
+            f"artifacts: {meta_json.parent.relative_to(ROOT)}/\n"
+            "        Expected enn_pctile_calib.npz there, or set "
+            "CALIBRATION_NPZ in the CONFIG block.")
     print(f"       auto: calibration -> {npz.relative_to(ROOT)}")
     return scaler_json, meta_json, npz
 
@@ -106,9 +140,19 @@ def find_enn_weights(prefer_dir: Path | None = None) -> Path:
     return cands[0]
 
 
-def find_actions_npy(n_curated: int | None) -> Path:
+def find_actions_npy(meta: dict) -> Path:
     if ACTIONS_NPY:
         return Path(ACTIONS_NPY)
+    for key in ("action_set", "actions_path"):
+        if meta.get(key):
+            p = Path(meta[key])
+            if not p.is_absolute():
+                p = ROOT / p
+            if p.is_file():
+                print(f"       auto: action set  -> {p.relative_to(ROOT)}")
+                return p
+            print(f"       warn: {key} in enn_meta.json not found -> {meta[key]}")
+    n_curated = meta.get("n_curated_actions")
     cands = []
     for p in _walk_files({".npy"}):
         try:
@@ -121,7 +165,11 @@ def find_actions_npy(n_curated: int | None) -> Path:
         exact = [c for c in cands if c[1][0] == n_curated]
         if exact:
             cands = exact
-    cands.sort(key=lambda c: ("action" not in c[0].name.lower(), str(c[0])))
+    cands.sort(key=lambda c: (
+        _artifact_rank(c[0].parent),
+        "action" not in c[0].name.lower(),
+        str(c[0]),
+    ))
     if not cands:
         sys.exit("[error] no 2-D .npy curated action set found. Commit "
                  "actions.npy (rows = action.to_vect()) or set ACTIONS_NPY "
@@ -159,13 +207,40 @@ def find_agent_dir() -> Path:
     to contain model/ and actions/ subfolders."""
     if AGENT_DIR:
         return Path(AGENT_DIR)
+    preferred = [
+        ASSETS_DIR / ENV_NAME,
+        ASSETS_DIR / "network36",
+        ROOT / "src" / "models" / "network36",
+    ]
     base = ROOT / "curriculumagent"
-    for d in [base, *sorted(p for p in base.rglob("*") if p.is_dir())]:
+    invalid = []
+    for d in [*preferred, base, *sorted(p for p in base.rglob("*") if p.is_dir())]:
         if (d / "model").is_dir() and (d / "actions").is_dir():
+            if not has_valid_saved_model(d):
+                invalid.append(d)
+                continue
             print(f"       auto: agent dir   -> {d.relative_to(ROOT)}")
             return d
-    sys.exit("[error] no folder with model/ and actions/ subfolders found "
-             "under curriculumagent/. Set AGENT_DIR in the CONFIG block.")
+    hint = ""
+    if invalid:
+        bad = ", ".join(str(d.relative_to(ROOT)) for d in invalid)
+        hint = f"\n        Skipped invalid SavedModel artifact(s): {bad}."
+    sys.exit("[error] no valid folder with model/ and actions/ subfolders "
+             "found. Expected a non-empty TensorFlow SavedModel under "
+             f"assets/{ENV_NAME}/, assets/network36/ or "
+             "src/models/network36/. Set AGENT_DIR in "
+             f"the CONFIG block to override.{hint}")
+
+
+def has_valid_saved_model(agent_dir: Path) -> bool:
+    model_dir = agent_dir / "model"
+    variables_dir = model_dir / "variables"
+    required_files = [
+        model_dir / "saved_model.pb",
+        variables_dir / "variables.index",
+        variables_dir / "variables.data-00000-of-00001",
+    ]
+    return all(p.is_file() and p.stat().st_size > 0 for p in required_files)
 
 
 def scaler_from_json(path: Path):
@@ -230,11 +305,11 @@ def main() -> None:
     scaler_json, meta_json, npz = find_artifact_set()
     meta = json.loads(meta_json.read_text())
     weights = find_enn_weights(prefer_dir=meta_json.parent)
-    actions_path = find_actions_npy(meta.get("n_curated_actions"))
+    actions_path = find_actions_npy(meta)
     agent_dir = find_agent_dir()
 
     # 1. Environment -----------------------------------------------------------
-    env = grid2op.make(ENV_NAME, backend=LightSimBackend())
+    env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
     env.seed(SEED)
     obs = env.reset()
     print(f"[1/4] environment '{ENV_NAME}' ready "
