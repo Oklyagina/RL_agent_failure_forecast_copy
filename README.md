@@ -38,20 +38,40 @@ conda activate enn_uq
 pip install -r requirements.txt
 ```
 
-## Quick start — full reproduction
+## Quick start
 
-The scaler used by the module is **created at ENN training time**, so the
-complete reproduction of the experiment is: collect rollouts → train (the
-training exports the scaler, the metadata and the percentile calibration
-automatically) → run the example. For the CurriculumAgent nothing needs to
-be edited:
+The standard workflow is: start from a trained CurriculumAgent → collect rollouts
+→ train the ENN (the training exports the scaler, the metadata and the
+percentile calibration automatically) → run the example.
+
+Training the CurriculumAgent itself can take a long time. For the default
+`ai4realnet_small` / `curriculum` setup, you can download the pre-trained
+CurriculumAgent package from the GitHub release assets instead, then extract it
+from the repository root so it restores:
+
+```text
+assets/ai4realnet_small/model/
+assets/ai4realnet_small/actions/
+```
+
+If you use the GitHub CLI, the release-asset download looks like:
 
 ```bash
-python training/train_curriculumagent.py
+gh release download artifacts-ai4realnet_small-curriculum-v2026.09.02 \
+  --pattern "ai4realnet_small-curriculum-v2026.09.02-agent.zip" \
+  --dir downloads
+```
+
+After extracting the archive, run:
+
+```bash
 python training/collect_rollouts.py
 python training/train_enn.py
 python run_example.py
 ```
+
+To reproduce the CurriculumAgent training from scratch instead of downloading
+the pre-trained package, run `python training/train_curriculumagent.py` first.
 
 Shared defaults are read from `.env` (see `.env.example`). By default, the
 trained CurriculumAgent policy package is stored in `assets/ai4realnet_small/`,
@@ -86,7 +106,7 @@ prints the exact training commands to run first.
 |---|---|
 | `recommendation_uncertainty.py` | the module: `load_calibration`, `assess_recommendation` |
 | `src/enn_models.py` | ENN architecture (`EvidentialNetwork`) |
-| `assets/<ENV_NAME>/` (produced by CurriculumAgent training) | trained RL policy package with `model/` and `actions/` |
+| `assets/<ENV_NAME>/` (downloaded from release assets, or produced by CurriculumAgent training) | trained RL policy package with `model/` and `actions/` |
 | `artifacts/<ENV_NAME>/<agent>/rollouts/actions.npy` (produced by collection) | curated action set — rows are `action.to_vect()`, deduplicated from the rollouts |
 | `artifacts/<ENV_NAME>/<agent>/model/` (produced by ENN training) | `enn_<agent>.pth`, `scaler_params.json` (scaler mean/std as JSON — the scaler is created at training time), `enn_meta.json`, `enn_pctile_calib.npz` |
 | `curriculumagent/` | agent source/submission code |
