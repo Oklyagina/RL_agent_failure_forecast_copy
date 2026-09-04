@@ -2,8 +2,51 @@ import os
 import sys
 import subprocess
 import time
+from pathlib import Path
 
+ROOT = Path(__file__).resolve().parent
+SRC_DIR = ROOT / "src"
+for path in (ROOT, SRC_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from project_config import (AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR, ENV_DIR,
+                            ENV_NAME)
+from src import config as src_config
 from src.config import CFG, TRAIN_MODE, PREDICT_PROBA_MODE, TEST_SINGLE_EPISODE
+
+sys.modules["config"] = src_config
+os.environ.setdefault("GRID2OP_DATA_PATH", str(ENV_DIR.parent))
+
+PIPELINE_DIR = ARTIFACTS_DIR / ENV_NAME / AGENT_NAME
+PIPELINE_DATA_DIR = PIPELINE_DIR / "data"
+PIPELINE_MODEL_DIR = PIPELINE_DIR / "model"
+
+agent_path = ASSETS_DIR / ENV_NAME
+if not ((agent_path / "model").is_dir() and (agent_path / "actions").is_dir()):
+    for candidate in (ASSETS_DIR / "network36", ROOT / "src" / "models" / "network36"):
+        if (candidate / "model").is_dir() and (candidate / "actions").is_dir():
+            agent_path = candidate
+            break
+
+for path in (PIPELINE_DATA_DIR, PIPELINE_MODEL_DIR):
+    path.mkdir(parents=True, exist_ok=True)
+
+CFG.ENV_NAME = str(ENV_DIR)
+CFG.MODEL_MEAN_PATH = str(PIPELINE_MODEL_DIR / "HBGB_36.pkl")
+CFG.MODEL_ALEATORIC_PATH = str(PIPELINE_MODEL_DIR / "HBGB_36_aleatoric.pkl")
+CFG.MODEL_ENN_PATH = str(PIPELINE_MODEL_DIR / "enn_36.pth")
+CFG.MODEL_CLASSIFIER_PATH = str(PIPELINE_MODEL_DIR / "final_classifier_36.pkl")
+CFG.AGENT_PATH = str(agent_path)
+CFG.X_TRAIN_PATH = str(PIPELINE_DATA_DIR / "X_train_36.npy")
+CFG.Y_TRAIN_PATH = str(PIPELINE_DATA_DIR / "y_train_36.npy")
+CFG.X_TEST_PATH = str(PIPELINE_DATA_DIR / "X_test36.npy")
+CFG.Y_TEST_PATH = str(PIPELINE_DATA_DIR / "Y_test36.npy")
+CFG.CSV_OUTPUT_PATH = str(PIPELINE_DATA_DIR / "uncertainty_disconnection_analysis.csv")
+CFG.TUTOR_DIR = str(Path(CFG.AGENT_PATH) / "tutor" / "junior_data")
+CFG.TRAIN_FILE = str(Path(CFG.TUTOR_DIR) / "test_train.npz")
+CFG.VAL_FILE = str(Path(CFG.TUTOR_DIR) / "test_val.npz")
+CFG.TEST_FILE = str(Path(CFG.TUTOR_DIR) / "test_test.npz")
 
 # LLM_RULE_MODE is the new flag for symbolic rule inference.
 # If it does not yet exist in config.py, it defaults to False.
@@ -33,16 +76,33 @@ def execute_module(module_path: str) -> None:
     print(f"{'=' * 60}\n")
 
     env = os.environ.copy()
-    current_directory = os.getcwd()
-    parent_directory  = os.path.dirname(current_directory)
-    python_path       = f"{current_directory}{os.pathsep}{parent_directory}"
+    python_path = os.pathsep.join((str(ROOT), str(SRC_DIR)))
     env["PYTHONPATH"] = python_path + os.pathsep + env.get("PYTHONPATH", "")
 
     start_time = time.time()
-    command    = [sys.executable, module_path]
+    bootstrap = """
+import runpy
+import sys
+import run_pipeline
+
+module_path = sys.argv[1]
+if module_path.endswith("training_enn.py"):
+    run_pipeline.CFG.ENV_NAME = run_pipeline.ENV_NAME
+else:
+    run_pipeline.CFG.ENV_NAME = str(run_pipeline.ENV_DIR)
+
+if module_path.endswith("collect_data.py"):
+    import training_enn
+    training_enn._scaler_path = lambda: str(run_pipeline.PIPELINE_MODEL_DIR / ("scaler_" + run_pipeline.ENV_NAME + "_enn.pkl"))
+    training_enn._best_weights_path = lambda: str(run_pipeline.PIPELINE_MODEL_DIR / ("enn_best_" + run_pipeline.ENV_NAME + ".pth"))
+    training_enn._meta_path = lambda: str(run_pipeline.PIPELINE_MODEL_DIR / ("enn_meta_" + run_pipeline.ENV_NAME + ".json"))
+
+runpy.run_path(module_path, run_name="__main__")
+"""
+    command = [sys.executable, "-c", bootstrap, module_path]
 
     try:
-        subprocess.run(command, check=True, env=env)
+        subprocess.run(command, check=True, env=env, cwd=str(ROOT))
         elapsed = time.time() - start_time
         print(f"\n  SUCCESS: {module_path} completed in {elapsed:.2f} seconds.")
     except subprocess.CalledProcessError as e:
@@ -109,7 +169,12 @@ def run_llm_rule_inference() -> None:
     from curriculumagent.baseline.baseline import CurriculumAgent
 
     # Local imports (src/ is on PYTHONPATH when run via run_pipeline.py)
-    from src.training_enn import load_trained_enn, _scaler_path, get_uncertainty
+    import training_enn
+    training_enn._scaler_path = lambda: str(PIPELINE_MODEL_DIR / ("scaler_" + ENV_NAME + "_enn.pkl"))
+    training_enn._best_weights_path = lambda: str(PIPELINE_MODEL_DIR / ("enn_best_" + ENV_NAME + ".pth"))
+    training_enn._meta_path = lambda: str(PIPELINE_MODEL_DIR / ("enn_meta_" + ENV_NAME + ".json"))
+    load_trained_enn = training_enn.load_trained_enn
+    get_uncertainty = training_enn.get_uncertainty
     from src.utils import compute_grid_stats
     from src.collect_data import get_features_with_history
     from src.rule_predictor import RulePredictor
@@ -150,9 +215,10 @@ def run_llm_rule_inference() -> None:
         model_predict=model_predict,
         model_aleatoric=model_aleatoric,
         model_enn=model_enn,
-        # The functions and CFG are imported automatically inside rule_predictor.py
-        # from the project modules — no need to pass them explicitly.
         observations_array=observations_array,
+        compute_grid_stats_fn=compute_grid_stats,
+        get_uncertainty_fn=get_uncertainty,
+        get_features_with_history_fn=get_features_with_history,
     )
 
     # Print all rule sentences at startup (useful for the paper table)
