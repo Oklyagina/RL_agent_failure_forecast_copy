@@ -8,6 +8,7 @@ import optuna
 import numpy as np
 import grid2op
 from typing import Any, Dict, List, Sequence, Tuple
+from tqdm import tqdm
 
 from grid2op.Reward import L2RPNReward
 from lightsim2grid import LightSimBackend
@@ -95,12 +96,16 @@ def collect_data(env: grid2op.Environment, agent: CurriculumAgent, episode_seeds
     """
     Executes episodes using the agent and collects state transitions for supervised learning.
     """
+    if os.path.exists(x_path) and os.path.exists(y_path):
+        print(f"[DATA] Reusing existing data at {x_path} and {y_path}")
+        return
+
     print(f"[INFO] Collecting data to {x_path} and {y_path}...")
 
     if os.path.exists(x_path): os.remove(x_path)
     if os.path.exists(y_path): os.remove(y_path)
 
-    for idx, ep_seed in enumerate(episode_seeds):
+    for idx, ep_seed in enumerate(tqdm(episode_seeds, desc="Collecting forecast data", unit="episode")):
         obs = env.reset(seed=int(ep_seed))
         done = False
 
@@ -167,7 +172,7 @@ def train_mean_model(x_path: str, y_path: str, n_trials: int = 20, max_subsample
         return rmse
 
     study = optuna.create_study(direction="minimize")
-    study.optimize(objective, n_trials=n_trials)
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     best_params = dict(study.best_params)
     best_params["early_stopping"] = True
