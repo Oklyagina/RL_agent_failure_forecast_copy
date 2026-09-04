@@ -193,7 +193,12 @@ if __name__ == "__main__":
         print(f"[OPTUNA] Starting hyperparameter search (Cross-Validation)")
 
         study = optuna.create_study(direction="minimize")
-        study.optimize(lambda trial: objective(trial, X_train, y_train, cat_indices, X_val, y_val), n_trials=500, n_jobs=-1)
+        study.optimize(
+            lambda trial: objective(trial, X_train, y_train, cat_indices, X_val, y_val),
+            n_trials=500,
+            n_jobs=-1,
+            show_progress_bar=True,
+        )
 
         best_params = study.best_params.copy()
         best_threshold = best_params.pop("threshold")

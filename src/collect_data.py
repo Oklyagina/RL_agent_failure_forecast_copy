@@ -15,6 +15,7 @@ import pandas as pd
 import torch
 from typing import List, Any, Dict
 from pathlib import Path
+from tqdm import tqdm
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
@@ -33,6 +34,8 @@ from config import CFG, DEVICE, TRAIN_MODE, TEST_SINGLE_EPISODE
 from training_enn import get_uncertainty, load_trained_enn, _scaler_path
 from utils import get_features, compute_grid_stats
 from curriculumagent.baseline.baseline import CurriculumAgent
+
+VERBOSE = os.environ.get("RUN_PIPELINE_VERBOSE", "1") == "1"
 
 
 # =============================================================================
@@ -307,9 +310,19 @@ def run_single_episode_test(
     done = False
     observations_array = []
     results_list = []
+    try:
+        max_steps = env.max_episode_duration()
+    except Exception:
+        max_steps = None
+    progress = tqdm(
+        total=max_steps if isinstance(max_steps, int) and max_steps > 0 else None,
+        desc="Running test episode",
+        unit="step",
+    )
 
     while not done:
-        print(f"[TEST] Episode {episode_id} | Step {obs.current_step}")
+        if VERBOSE:
+            tqdm.write(f"[TEST] Episode {episode_id} | Step {obs.current_step}")
         observations_array.append(obs)
 
         action = agent.act(obs, 0.0, done)
@@ -328,7 +341,9 @@ def run_single_episode_test(
                     print(f"    -> [WARNING] Potential failures detected on lines: {failures['line_disconnected'].tolist()}")
 
         obs, _, done, _ = env.step(action)
+        progress.update(1)
 
+    progress.close()
     if results_list:
         full_df = pd.concat(results_list)
         save_incremental(full_df, CFG.CSV_OUTPUT_PATH)
@@ -356,7 +371,7 @@ def run_simulation_phase(
     except Exception:
         print("[WARNING] CurriculumAgent not loaded. Proceeding with fallback.")
 
-    for ep in range(ep_start, ep_end):
+    for ep in tqdm(range(ep_start, ep_end), desc=f"{phase_name} episodes", unit="episode"):
         obs = env.reset(seed=ep)
         done = False
         observations_array = []
