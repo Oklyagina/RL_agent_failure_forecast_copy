@@ -96,6 +96,10 @@ def collect_data(env: grid2op.Environment, agent: CurriculumAgent, episode_seeds
     """
     Executes episodes using the agent and collects state transitions for supervised learning.
     """
+    if os.path.exists(x_path) and os.path.exists(y_path):
+        print(f"[DATA] Reusing existing data at {x_path} and {y_path}")
+        return
+
     print(f"[INFO] Collecting data to {x_path} and {y_path}...")
 
     if os.path.exists(x_path): os.remove(x_path)
