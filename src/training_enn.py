@@ -12,6 +12,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, Dataset
 from sklearn.preprocessing import StandardScaler
 import joblib
+from tqdm import tqdm
 
 # Centralized configuration
 from config import CFG, DEVICE, ENN_PARAMS
@@ -263,7 +264,8 @@ def train_enn(top_k: int = CFG.ENN_TOP_K) -> EvidentialNetwork:
     t0 = time.time()
 
     # 5. Execute Training Loop
-    for epoch in range(1, CFG.ENN_EPOCHS + 1):
+    progress = tqdm(range(1, CFG.ENN_EPOCHS + 1), desc="Training ENN", unit="epoch")
+    for epoch in progress:
         model.train()
         tr_loss, tr_correct, tr_n = 0.0, 0, 0
 
@@ -338,25 +340,24 @@ def train_enn(top_k: int = CFG.ENN_TOP_K) -> EvidentialNetwork:
             else:
                 patience_counter += 1
 
-        # 7. Logging
-        if epoch <= 5 or epoch % 10 == 0:
-            elapsed = time.time() - t0
-            lr_now = optimizer.param_groups[0]["lr"]
-            v_str = ""
-            if val_info:
-                v_str = (
-                    f" | val_loss: {val_info['val_loss']:.4f} "
-                    f"| val_acc: {val_info['val_acc']:.3f} "
-                    f"| U: {val_info['u_mean']:.3f}±{val_info['u_std']:.3f}"
-                )
-
-            print(f"Epoch {epoch:3d}/{CFG.ENN_EPOCHS} "
-                  f"| tr_loss: {tr_loss / tr_n:.4f} "
-                  f"| tr_acc: {tr_correct / tr_n:.3f}"
-                  f"{v_str} | lr: {lr_now:.1e} | [{elapsed:.0f}s]")
+        elapsed = time.time() - t0
+        lr_now = optimizer.param_groups[0]["lr"]
+        postfix = {
+            "tr_loss": f"{tr_loss / tr_n:.4f}",
+            "tr_acc": f"{tr_correct / tr_n:.3f}",
+            "lr": f"{lr_now:.1e}",
+            "elapsed": f"{elapsed:.0f}s",
+        }
+        if val_info:
+            postfix.update({
+                "val_loss": f"{val_info['val_loss']:.4f}",
+                "val_acc": f"{val_info['val_acc']:.3f}",
+                "U": f"{val_info['u_mean']:.3f}+/-{val_info['u_std']:.3f}",
+            })
+        progress.set_postfix(postfix)
 
         if patience_counter >= CFG.ENN_PATIENCE:
-            print(f"\n[ENN] Early stopping triggered at epoch {epoch}.")
+            tqdm.write(f"\n[ENN] Early stopping triggered at epoch {epoch}.")
             break
 
     # 8. Post-training: Load best weights and save artifacts

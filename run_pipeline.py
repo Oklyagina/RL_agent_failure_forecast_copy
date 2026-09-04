@@ -2,7 +2,11 @@ import os
 import sys
 import subprocess
 import time
+import logging
+import argparse
 from pathlib import Path
+
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parent
 SRC_DIR = ROOT / "src"
@@ -56,11 +60,23 @@ except ImportError:
     LLM_RULE_MODE = False
 
 
+def configure_verbosity(verbose: bool = False) -> None:
+    """Configure logging verbosity for this runner and imported modules."""
+    level = logging.INFO if verbose else logging.WARNING
+    logging.basicConfig(level=level, force=True)
+    logging.getLogger().setLevel(level)
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.INFO if verbose else optuna.logging.WARNING)
+    except Exception:
+        pass
+
+
 # =============================================================================
 # Subprocess executor (unchanged from original)
 # =============================================================================
 
-def execute_module(module_path: str) -> None:
+def execute_module(module_path: str, verbose: bool = False) -> None:
     """
     Executes a Python module as a subprocess, ensuring the project root
     is correctly appended to the PYTHONPATH to prevent module resolution errors.
@@ -78,6 +94,8 @@ def execute_module(module_path: str) -> None:
     env = os.environ.copy()
     python_path = os.pathsep.join((str(ROOT), str(SRC_DIR)))
     env["PYTHONPATH"] = python_path + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONUNBUFFERED"] = "1"
+    env["RUN_PIPELINE_VERBOSE"] = "1" if verbose else "0"
 
     start_time = time.time()
     bootstrap = """
@@ -86,6 +104,8 @@ import sys
 import run_pipeline
 
 module_path = sys.argv[1]
+run_pipeline.configure_verbosity(run_pipeline.os.environ.get("RUN_PIPELINE_VERBOSE") == "1")
+
 if module_path.endswith("training_enn.py"):
     run_pipeline.CFG.ENV_NAME = run_pipeline.ENV_NAME
 else:
@@ -102,7 +122,25 @@ runpy.run_path(module_path, run_name="__main__")
     command = [sys.executable, "-c", bootstrap, module_path]
 
     try:
-        subprocess.run(command, check=True, env=env, cwd=str(ROOT))
+        if verbose:
+            subprocess.run(command, check=True, env=env, cwd=str(ROOT))
+        else:
+            process = subprocess.Popen(
+                command,
+                env=env,
+                cwd=str(ROOT),
+                stdout=subprocess.PIPE,
+                stderr=None,
+                text=True,
+                bufsize=1,
+            )
+            assert process.stdout is not None
+            for line in process.stdout:
+                if "[INFO]" not in line:
+                    print(line, end="")
+            return_code = process.wait()
+            if return_code:
+                raise subprocess.CalledProcessError(return_code, command)
         elapsed = time.time() - start_time
         print(f"\n  SUCCESS: {module_path} completed in {elapsed:.2f} seconds.")
     except subprocess.CalledProcessError as e:
@@ -114,7 +152,7 @@ runpy.run_path(module_path, run_name="__main__")
 # Training pipeline (unchanged from original)
 # =============================================================================
 
-def run_training_pipeline() -> None:
+def run_training_pipeline(verbose: bool = False) -> None:
     """
     Manages the execution flow of the full training pipeline, checking
     for existing artifacts to avoid redundant and expensive computations.
@@ -122,28 +160,28 @@ def run_training_pipeline() -> None:
     print("\n[MODE] INITIALIZING FULL TRAINING PIPELINE")
 
     if not os.path.exists(CFG.MODEL_MEAN_PATH):
-        execute_module("src/train_forecast.py")
+        execute_module("src/train_forecast.py", verbose=verbose)
     else:
         print(f"  SKIP: Forecast model already exists at {CFG.MODEL_MEAN_PATH}")
 
     if not os.path.exists(CFG.MODEL_ENN_PATH):
-        execute_module("src/training_enn.py")
+        execute_module("src/training_enn.py", verbose=verbose)
     else:
         print(f"  SKIP: ENN model already exists at {CFG.MODEL_ENN_PATH}")
 
     if not os.path.exists(CFG.CSV_OUTPUT_PATH):
-        execute_module("src/collect_data.py")
+        execute_module("src/collect_data.py", verbose=verbose)
     else:
         print(f"  SKIP: Data already collected at {CFG.CSV_OUTPUT_PATH}")
 
-    execute_module("src/train_classifier.py")
+    execute_module("src/train_classifier.py", verbose=verbose)
 
 
 # =============================================================================
 # LLM Rule Inference mode  ← NEW
 # =============================================================================
 
-def run_llm_rule_inference() -> None:
+def run_llm_rule_inference(verbose: bool = False) -> None:
     """
     Loads the trained models and the LLM symbolic rules, then runs one
     simulation episode. For each monitored line, at every analysis step it:
@@ -161,6 +199,8 @@ def run_llm_rule_inference() -> None:
     The sentences for all available lines are also printed at startup so you
     can use them directly in the paper table.
     """
+    configure_verbosity(verbose)
+
     import joblib
     import numpy as np
     import grid2op
@@ -249,6 +289,16 @@ def run_llm_rule_inference() -> None:
 
     print(f"  Starting episode (seed={episode_seed})...\n")
 
+    try:
+        max_steps = env.max_episode_duration()
+    except Exception:
+        max_steps = None
+    progress = tqdm(
+        total=max_steps if isinstance(max_steps, int) and max_steps > 0 else None,
+        desc="Running LLM episode",
+        unit="step",
+    )
+
     while not done:
         observations_array.append(obs)
         # observations_array is the same list object referenced by rule_predictor,
@@ -277,7 +327,9 @@ def run_llm_rule_inference() -> None:
             action = env.action_space({})
 
         obs, reward, done, _ = env.step(action)
+        progress.update(1)
 
+    progress.close()
     env.close()
     print("\n  Episode finished.")
 
@@ -294,7 +346,7 @@ def _line_id_to_name(line_id: int, env) -> str:
 # Main entry point
 # =============================================================================
 
-def main() -> None:
+def main(verbose: bool = False) -> None:
     """
     Routes execution based on the configuration flags in src/config.py:
 
@@ -311,21 +363,26 @@ def main() -> None:
         PREDICT_PROBA_MODE  = False
         LLM_RULE_MODE       = True
     """
+    configure_verbosity(verbose)
+
     environment_name = getattr(CFG, "ENV_NAME", "UNKNOWN")
     print(f"  CONFIGURATION: ENV={environment_name}")
 
     if TRAIN_MODE:
-        run_training_pipeline()
+        run_training_pipeline(verbose=verbose)
     elif TEST_SINGLE_EPISODE:
-        execute_module("src/collect_data.py")
+        execute_module("src/collect_data.py", verbose=verbose)
     elif PREDICT_PROBA_MODE:
-        execute_module("src/train_classifier.py")
+        execute_module("src/train_classifier.py", verbose=verbose)
     elif LLM_RULE_MODE:
-        run_llm_rule_inference()
+        run_llm_rule_inference(verbose=verbose)
     else:
         print("\n  WARNING: No active execution mode selected in src/config.py.")
         print("  Set one of: TRAIN_MODE, TEST_SINGLE_EPISODE, PREDICT_PROBA_MODE, LLM_RULE_MODE = True")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--verbose", action="store_true", help="show INFO logs")
+    args = parser.parse_args()
+    main(verbose=args.verbose)
