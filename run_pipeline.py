@@ -159,10 +159,10 @@ def run_training_pipeline(verbose: bool = False) -> None:
     """
     print("\n[MODE] INITIALIZING FULL TRAINING PIPELINE")
 
-    if not os.path.exists(CFG.MODEL_MEAN_PATH):
+    if not (os.path.exists(CFG.MODEL_MEAN_PATH) and os.path.exists(CFG.MODEL_ALEATORIC_PATH)):
         execute_module("src/train_forecast.py", verbose=verbose)
     else:
-        print(f"  SKIP: Forecast model already exists at {CFG.MODEL_MEAN_PATH}")
+        print(f"  SKIP: Forecast models already exist at {PIPELINE_MODEL_DIR}")
 
     if not os.path.exists(CFG.MODEL_ENN_PATH):
         execute_module("src/training_enn.py", verbose=verbose)
