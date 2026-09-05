@@ -16,14 +16,14 @@ import loguru
 import ray
 from lightsim2grid import LightSimBackend
 from curriculumagent.baseline import CurriculumAgent
-
+import warnings
 from project_config import (ASSETS_DIR, CURRICULUM_ITERATIONS,
                             CURRICULUM_JOBS, ENV_DIR, ENV_NAME)
 
 VERBOSE = False
 SHOW_PROGRESS = True
 LOG_LEVEL = logging.INFO if VERBOSE else logging.WARNING
-
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 SUPPRESSED_LOG_MESSAGES = (
     "Your env doesn't have a .spec.max_episode_steps attribute.",
     "You have specified 1 evaluation workers, but your `evaluation_interval` is None!",
