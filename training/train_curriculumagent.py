@@ -24,7 +24,30 @@ VERBOSE = False
 SHOW_PROGRESS = True
 LOG_LEVEL = logging.INFO if VERBOSE else logging.WARNING
 
+SUPPRESSED_LOG_MESSAGES = (
+    "Your env doesn't have a .spec.max_episode_steps attribute.",
+    "You have specified 1 evaluation workers, but your `evaluation_interval` is None!",
+)
+
+
+class _TrainingNoiseFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not any(suppressed in message for suppressed in SUPPRESSED_LOG_MESSAGES)
+
+
+TRAINING_NOISE_FILTER = _TrainingNoiseFilter()
+
+
 def configure_warnings() -> None:
+    warning_categories = [DeprecationWarning]
+    try:
+        from ray.rllib.utils.deprecation import RayDeprecationWarning
+
+        warning_categories.append(RayDeprecationWarning)
+    except Exception:
+        pass
+
     warnings.filterwarnings(
         "ignore",
         message=r"You are using a legacy grid2op version, please upgrade grid2op\.",
@@ -42,22 +65,36 @@ def configure_warnings() -> None:
         category=UserWarning,
         module=r"lightsim2grid\.gridmodel\.from_pandapower\._aux_add_slack",
     )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"The custom dictionary did not have the correct keys\. Using default model\.",
+        category=UserWarning,
+        module=r"curriculumagent\.senior\.rllib_execution\.senior_model_rllib",
+    )
     for message in (
-        r"`UnifiedLogger` will be removed in Ray 2\.7\.",
-        r"The `JsonLogger interface is deprecated in favor of the `ray\.tune\.json\.JsonLoggerCallback` interface and will be removed in Ray 2\.7\.",
-        r"The `CSVLogger interface is deprecated in favor of the `ray\.tune\.csv\.CSVLoggerCallback` interface and will be removed in Ray 2\.7\.",
-        r"The `TBXLogger interface is deprecated in favor of the `ray\.tune\.tensorboardx\.TBXLoggerCallback` interface and will be removed in Ray 2\.7\.",
+        r".*UnifiedLogger.*will be removed in Ray 2\.7\.",
+        r".*JsonLogger interface is deprecated.*will be removed in Ray 2\.7\.",
+        r".*CSVLogger interface is deprecated.*will be removed in Ray 2\.7\.",
+        r".*TBXLogger interface is deprecated.*will be removed in Ray 2\.7\.",
     ):
-        warnings.filterwarnings(
-            "ignore",
-            message=message,
-            category=DeprecationWarning,
-            module=r"ray\..*",
-        )
+        for category in warning_categories:
+            warnings.filterwarnings(
+                "ignore",
+                message=message,
+                category=category,
+                module=r"ray\..*",
+            )
 
 def configure_logging() -> None:
     logging.basicConfig(level=LOG_LEVEL, force=True)
     logging.getLogger().setLevel(LOG_LEVEL)
+    for handler in logging.getLogger().handlers:
+        handler.addFilter(TRAINING_NOISE_FILTER)
+    for logger_name in (
+        "ray.rllib.env.env_context",
+        "ray.rllib.algorithms.algorithm_config",
+    ):
+        logging.getLogger(logger_name).addFilter(TRAINING_NOISE_FILTER)
     logging.disable(logging.INFO if not VERBOSE else logging.NOTSET)
 
 def shutdown_ray() -> None:
