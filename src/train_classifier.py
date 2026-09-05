@@ -10,14 +10,33 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import confusion_matrix
 
-# Local imports
-from config import CFG, TRAIN_MODE, PREDICT_PROBA_MODE
+# Local imports (support both ``python src/train_classifier.py`` and package imports)
+try:
+    from .config import CFG, TRAIN_MODE, PREDICT_PROBA_MODE
+except ImportError:
+    from config import CFG, TRAIN_MODE, PREDICT_PROBA_MODE
+from project_config import AGENT_NAME, ENV_NAME
 
 # ==============================================================================
 # DYNAMIC LINE MAPPING
 # ==============================================================================
 # Deterministic encoding: maps line names to integers based on the central config.
 LINE_MAP: Dict[str, int] = {line: idx for idx, line in enumerate(CFG.LINES_TO_TEST)}
+
+CLASSIFIER_FEATURES = [
+    "line_id_encoded", "sum_load_p", "sum_load_q", "sum_gen_p",
+    "var_line_rho", "avg_line_rho", "max_line_rho", "nb_rho_ge_0.95",
+    "load_gen_ratio", "fcast_sum_load_p", "fcast_sum_load_q", "fcast_sum_gen_p",
+    "fcast_var_line_rho", "fcast_avg_line_rho", "fcast_max_line_rho",
+    "fcast_nb_rho_ge_0.95", "aleatoric_load_p_mean", "aleatoric_load_q_mean",
+    "aleatoric_gen_p_mean", "epistemic_before", "epistemic_after",
+]
+
+ANALYSIS_REQUIRED_COLUMNS = {
+    "line_disconnected", "failed",
+    *(feature for feature in CLASSIFIER_FEATURES
+      if feature not in {"line_id_encoded", "load_gen_ratio"}),
+}
 
 # ==============================================================================
 # DATA PREPARATION & METRICS
@@ -135,7 +154,12 @@ def save_best_metadata(save_dir: str, config_name: str, model_params: Dict[str, 
     if isinstance(safe_params.get("class_weight"), dict):
         safe_params["class_weight"] = {str(k): v for k, v in safe_params["class_weight"].items()}
 
-    metadata = {"best_model_params": safe_params, "best_threshold": threshold}
+    metadata = {
+        "environment": ENV_NAME,
+        "agent": AGENT_NAME,
+        "best_model_params": safe_params,
+        "best_threshold": threshold,
+    }
     save_path = os.path.join(save_dir, f"classifier_metadata_{config_name}.json")
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -155,13 +179,7 @@ if __name__ == "__main__":
             raise SystemExit(1)
 
         # Define the features
-        features = [
-            'line_id_encoded', 'sum_load_p', 'sum_load_q', 'sum_gen_p',
-            'var_line_rho', 'avg_line_rho', 'max_line_rho', 'nb_rho_ge_0.95',
-            'load_gen_ratio', 'fcast_sum_load_p', 'fcast_sum_load_q', 'fcast_sum_gen_p',
-            'fcast_var_line_rho', 'fcast_avg_line_rho', 'fcast_max_line_rho', 'fcast_nb_rho_ge_0.95',
-            "aleatoric_load_p_mean", "aleatoric_load_q_mean", "aleatoric_gen_p_mean",
-            "epistemic_before", "epistemic_after"]
+        features = CLASSIFIER_FEATURES
 
         config_name = "All features"
 

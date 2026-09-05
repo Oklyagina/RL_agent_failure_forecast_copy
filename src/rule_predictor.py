@@ -302,10 +302,11 @@ def _run_forecast(
         "aleatoric_gen_p_mean":  float("nan"),
         "fcast_grid_stats":      {},
     }
+    enn_input_dim = int(getattr(model_enn, "input_dim", cfg.ENN_INPUT_DIM))
 
     # 1. Epistemic uncertainty at t=0
     try:
-        obs_vect = obs.to_vect()[:cfg.ENN_INPUT_DIM].reshape(1, -1)
+        obs_vect = obs.to_vect()[:enn_input_dim].reshape(1, -1)
         out["epistemic_before"] = float(get_uncertainty_fn(model_enn, obs_vect))
     except Exception as e:
         print(f"[WARN] rule_predictor: epistemic_before failed: {e}")
@@ -347,7 +348,7 @@ def _run_forecast(
         out["fcast_grid_stats"] = compute_grid_stats_fn(sim_obs)
 
         # 5. Epistemic uncertainty at t+12
-        sim_vect = sim_obs.to_vect()[:cfg.ENN_INPUT_DIM].reshape(1, -1)
+        sim_vect = sim_obs.to_vect()[:enn_input_dim].reshape(1, -1)
         out["epistemic_after"] = float(get_uncertainty_fn(model_enn, sim_vect))
 
     except Exception as e:
