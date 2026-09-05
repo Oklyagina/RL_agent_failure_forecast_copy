@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -92,11 +93,11 @@ def get_features_with_history(observations_array: List[Any], obs: Any) -> np.nda
 # =============================================================================
 
 def collect_data(env: grid2op.Environment, agent: CurriculumAgent, episode_seeds: Sequence[int],
-                 x_path: str, y_path: str) -> None:
+                 x_path: str, y_path: str, force: bool = False) -> None:
     """
     Executes episodes using the agent and collects state transitions for supervised learning.
     """
-    if os.path.exists(x_path) and os.path.exists(y_path):
+    if not force and os.path.exists(x_path) and os.path.exists(y_path):
         print(f"[DATA] Reusing existing data at {x_path} and {y_path}")
         return
 
@@ -216,11 +217,8 @@ def train_aleatoric_model(x_path: str, y_path: str) -> None:
 # Main Execution
 # =============================================================================
 
-if __name__ == "__main__":
-    if not TRAIN_MODE:
-        print("[INFO] TRAIN_MODE is False. Skipping training.")
-        raise SystemExit(0)
-
+def _collect_forecast_datasets(force_train: bool = False, force_test: bool = False) -> None:
+    """Collect only the requested invalid/missing forecast dataset pairs."""
     env: grid2op.Environment = grid2op.make(
         CFG.ENV_NAME,
         backend=LightSimBackend(),
@@ -231,18 +229,52 @@ if __name__ == "__main__":
     try:
         agent.load(CFG.AGENT_PATH)
         print("[INFO] CurriculumAgent loaded.")
-    except Exception:
-        print("[WARN] Agent could not be loaded. Defaulting to untrained behavior.")
+    except Exception as exc:
+        env.close()
+        raise RuntimeError(
+            f"CurriculumAgent could not be loaded from {CFG.AGENT_PATH}: {exc}"
+        ) from exc
 
-    train_seeds: List[int] = list(range(0, 900))
-    test_seeds: List[int] = list(range(900, 970))
+    try:
+        train_seeds: List[int] = list(range(0, 900))
+        test_seeds: List[int] = list(range(900, 970))
+        collect_data(
+            env, agent, train_seeds, CFG.X_TRAIN_PATH, CFG.Y_TRAIN_PATH,
+            force=force_train,
+        )
+        collect_data(
+            env, agent, test_seeds, CFG.X_TEST_PATH, CFG.Y_TEST_PATH,
+            force=force_test,
+        )
+    finally:
+        env.close()
 
-    # 1) Collect Data
-    collect_data(env, agent, train_seeds, CFG.X_TRAIN_PATH, CFG.Y_TRAIN_PATH)
-    collect_data(env, agent, test_seeds, CFG.X_TEST_PATH, CFG.Y_TEST_PATH)
 
-    # 2) Train Models
-    train_mean_model(CFG.X_TRAIN_PATH, CFG.Y_TRAIN_PATH, n_trials=500)
-    train_aleatoric_model(CFG.X_TRAIN_PATH, CFG.Y_TRAIN_PATH)
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--stage",
+        choices=("data", "mean", "aleatoric", "all"),
+        default="all",
+        help="run only the selected forecast stage",
+    )
+    parser.add_argument("--force-train-data", action="store_true")
+    parser.add_argument("--force-test-data", action="store_true")
+    args = parser.parse_args()
+
+    if not TRAIN_MODE:
+        print("[INFO] TRAIN_MODE is False. Skipping training.")
+        raise SystemExit(0)
+
+    if args.stage in {"data", "all"}:
+        _collect_forecast_datasets(args.force_train_data, args.force_test_data)
+    if args.stage in {"mean", "all"}:
+        train_mean_model(CFG.X_TRAIN_PATH, CFG.Y_TRAIN_PATH, n_trials=500)
+    if args.stage in {"aleatoric", "all"}:
+        train_aleatoric_model(CFG.X_TRAIN_PATH, CFG.Y_TRAIN_PATH)
 
     print("[INFO] Forecast training pipeline completed successfully.")
+
+
+if __name__ == "__main__":
+    main()
