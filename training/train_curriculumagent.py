@@ -17,7 +17,11 @@ from lightsim2grid import LightSimBackend
 from curriculumagent.baseline import CurriculumAgent
 
 from project_config import (ASSETS_DIR, CURRICULUM_ITERATIONS,
-                            CURRICULUM_JOBS, ENV_DIR, ENV_NAME)
+                            CURRICULUM_JOBS,
+                            CURRICULUM_TUTOR_BEST_ACTION_THRESHOLD,
+                            CURRICULUM_TUTOR_DO_NOTHING_THRESHOLD,
+                            CURRICULUM_TUTOR_MIN_UNIQUE_ROWS, ENV_DIR,
+                            ENV_NAME)
 
 VERBOSE = False
 SHOW_PROGRESS = True
@@ -58,6 +62,9 @@ def main() -> None:
             iterations=CURRICULUM_ITERATIONS,
             save_path=ASSETS_DIR / ENV_NAME,
             jobs=CURRICULUM_JOBS,
+            tutor_do_nothing_threshold=CURRICULUM_TUTOR_DO_NOTHING_THRESHOLD,
+            tutor_best_action_threshold=CURRICULUM_TUTOR_BEST_ACTION_THRESHOLD,
+            min_unique_tutor_rows=CURRICULUM_TUTOR_MIN_UNIQUE_ROWS,
             log_level=LOG_LEVEL,
             show_progress=SHOW_PROGRESS,
         )
