@@ -264,6 +264,9 @@ class CurriculumAgent(BaseAgent):
         seed = kwargs.get("seed", 42)
         jobs = kwargs.get("jobs", os.cpu_count())
         max_actionspace_size = kwargs.get("max_actionspace_size", 250)
+        tutor_do_nothing_threshold = kwargs.get("tutor_do_nothing_threshold", 0.85)
+        tutor_best_action_threshold = kwargs.get("tutor_best_action_threshold", 0.999)
+        min_unique_tutor_rows = kwargs.get("min_unique_tutor_rows", 100)
         # Set seed:
         np.random.seed(seed)
 
@@ -341,6 +344,10 @@ class CurriculumAgent(BaseAgent):
                     num_chronics=iterations,
                     jobs=jobs,
                     seed=seed,
+                    tutor_kwargs={
+                        "do_nothing_threshold": tutor_do_nothing_threshold,
+                        "best_action_threshold": tutor_best_action_threshold,
+                    },
                 )
             else:
                 logging.info(f"Skipping Tutor because {tutor_experience_path} already exists")
@@ -356,6 +363,7 @@ class CurriculumAgent(BaseAgent):
                 traindata_path=tutor_experience_path.parent,
                 target_path=junior_data_path,
                 dataset_name="test",
+                min_unique_rows=min_unique_tutor_rows,
             )
 
             if not (junior_results_path / "saved_model.pb").exists():
