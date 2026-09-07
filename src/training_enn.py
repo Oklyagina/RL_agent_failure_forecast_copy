@@ -4,7 +4,7 @@ import math
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List
 
 import numpy as np
 import torch
@@ -165,6 +165,56 @@ def _remap_topk(act_tr: np.ndarray, act_val: Optional[np.ndarray], act_te: Optio
 
     return (act_tr_r, act_val_r, act_te_r, mask_tr, mask_val, mask_te, mapping, len(topk))
 
+def _print_split_diagnostics(split_rows: Dict[str, Tuple[np.ndarray, np.ndarray]]) -> None:
+    """Print compact data diagnostics before ENN top-K filtering."""
+    print("\n[ENN] Tutor split diagnostics")
+    for name, (_, actions) in split_rows.items():
+        unique_actions = np.unique(actions)
+        print(f"  {name:10s}: rows={len(actions):6d}, unique_actions={len(unique_actions):4d}")
+
+    train_actions = set(split_rows["train"][1].tolist())
+    for name in ("validation", "test"):
+        other = set(split_rows[name][1].tolist())
+        overlap = len(train_actions & other)
+        print(
+            f"  train/{name:10s} action overlap: {overlap}/{len(other)} "
+            f"({len(other - train_actions)} outside train)"
+        )
+
+    all_actions = np.concatenate([actions for _, actions in split_rows.values()])
+    counts = Counter(all_actions.tolist())
+    top_counts = ", ".join(
+        f"{int(action)}:{count}" for action, count in counts.most_common(10)
+    )
+    print(f"  top action frequencies: {top_counts}")
+
+
+def _print_topk_diagnostics(
+        act_tr: np.ndarray,
+        act_val: Optional[np.ndarray],
+        act_te: Optional[np.ndarray],
+        mask_tr: np.ndarray,
+        mask_val: Optional[np.ndarray],
+        mask_te: Optional[np.ndarray],
+        n_cls: int,
+) -> None:
+    """Print retained rows after the existing train-split-based top-K filtering."""
+    val_rows = 0 if mask_val is None else int(mask_val.sum())
+    test_rows = 0 if mask_te is None else int(mask_te.sum())
+    print("\n[ENN] Existing top-K filter diagnostics")
+    print(f"  num_classes={n_cls}, chance_accuracy={1.0 / max(n_cls, 1):.4f}")
+    print(
+        f"  retained rows: train={int(mask_tr.sum())}/{len(mask_tr)}, "
+        f"validation={val_rows}/{0 if mask_val is None else len(mask_val)}, "
+        f"test={test_rows}/{0 if mask_te is None else len(mask_te)}"
+    )
+    print(
+        "  retained unique actions: "
+        f"train={len(np.unique(act_tr))}, "
+        f"validation={0 if act_val is None else len(np.unique(act_val))}, "
+        f"test={0 if act_te is None else len(np.unique(act_te))}"
+    )
+
 def compute_effective_weights(actions: np.ndarray, num_classes: int, beta: float = 0.999) -> torch.Tensor:
     """
     Computes Effective Number of Samples weights to handle extreme class imbalance.
@@ -229,8 +279,15 @@ def train_enn(top_k: int = CFG.ENN_TOP_K) -> EvidentialNetwork:
     obs_val, act_val = _load_tutor_split(Path(CFG.VAL_FILE))
     obs_te, act_te = _load_tutor_split(Path(CFG.TEST_FILE))
 
+    split_rows = {
+        "train": (obs_tr, act_tr),
+        "validation": (obs_val, act_val),
+        "test": (obs_te, act_te),
+    }
+    _print_split_diagnostics(split_rows)
+
     input_dim = int(obs_tr.shape[1])
-    for split_name, obs in (("validation", obs_val), ("test", obs_te)):
+    for split_name, (obs, _) in split_rows.items():
         if obs.shape[1] != input_dim:
             raise ValueError(
                 f"ENN {split_name} feature width {obs.shape[1]} does not match "
@@ -238,6 +295,8 @@ def train_enn(top_k: int = CFG.ENN_TOP_K) -> EvidentialNetwork:
             )
 
     (act_tr, act_val, act_te, mask_tr, mask_val, mask_te, cls_mapping, n_cls) = _remap_topk(act_tr, act_val, act_te, top_k=top_k)
+
+    _print_topk_diagnostics(act_tr, act_val, act_te, mask_tr, mask_val, mask_te, n_cls)
 
     obs_tr = obs_tr[mask_tr]
     obs_val = obs_val[mask_val]
@@ -294,6 +353,7 @@ def train_enn(top_k: int = CFG.ENN_TOP_K) -> EvidentialNetwork:
     scheduler = _cosine_with_warmup(optimizer, CFG.ENN_WARMUP, CFG.ENN_EPOCHS)
 
     best_val_loss = float("inf")
+    best_epoch = None
     patience_counter = 0
     best_path = _best_weights_path()
     if os.path.exists(best_path):
@@ -378,6 +438,7 @@ def train_enn(top_k: int = CFG.ENN_TOP_K) -> EvidentialNetwork:
             if val_info["val_loss"] < best_val_loss - 1e-5:
                 best_val_loss = val_info["val_loss"]
                 patience_counter = 0
+                best_epoch = epoch
                 os.makedirs(os.path.dirname(best_path), exist_ok=True)
                 torch.save(model.state_dict(), best_path)
             else:
@@ -406,6 +467,10 @@ def train_enn(top_k: int = CFG.ENN_TOP_K) -> EvidentialNetwork:
     # 8. Post-training: Load best weights and save artifacts
     if os.path.exists(best_path):
         model.load_state_dict(torch.load(best_path, map_location=DEVICE))
+    if best_epoch is not None:
+        print(f"[ENN] Best epoch: {best_epoch} | best validation loss: {best_val_loss:.4f}")
+    else:
+        print("[ENN] No validation checkpoint was written; saving final epoch weights.")
 
     os.makedirs(os.path.dirname(CFG.MODEL_ENN_PATH), exist_ok=True)
     torch.save(model.state_dict(), CFG.MODEL_ENN_PATH)
