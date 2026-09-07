@@ -128,7 +128,7 @@ def objective(trial: optuna.Trial, X_train: pd.DataFrame, y_train: pd.Series,
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     scores = []
 
-    for train_idx, _ in skf.split(X, y):
+    for train_idx, _ in skf.split(X_train, y_train):
         X_tr = X.iloc[train_idx]
         y_tr = y.iloc[train_idx]
 
@@ -202,7 +202,7 @@ if __name__ == "__main__":
         )
 
         X_val, X_test, y_val, y_test = train_test_split(
-            X_temp, y_temp, test_size=0.5, random_state=42, stratify=y
+            X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
         )
 
         cat_indices = [features.index('line_id_encoded')] if 'line_id_encoded' in features else None
