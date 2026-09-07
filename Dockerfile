@@ -19,10 +19,8 @@ RUN git clone https://github.com/AI4REALNET/grid2op-scenario.git /tmp/grid2op-sc
     && cp -r /tmp/grid2op-scenario/ai4realnet_small /root/data_grid2op/ai4realnet_small \
     && rm -rf /tmp/grid2op-scenario
 
-# NOTE: the CurriculumAgent was trained on l2rpn_icaps_2021_small. If it does
-# not run natively on ai4realnet_small (cf. the observation shape mismatch you
-# fixed), set GRID2OP_ENV=l2rpn_icaps_2021_small below, or keep whatever your
-# fix established as the correct environment.
+# NOTE: the API uses the same project_config.py settings as run_pipeline.py.
+# Runtime environment variables override .env, and .env overrides defaults.
 
 # Python dependencies
 COPY requirements.txt .
@@ -30,9 +28,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # API + agent binaries + module + trained artifacts (whole repo)
 COPY . .
-RUN pip install .
 
 EXPOSE 8000
 
-ENV GRID2OP_ENV=ai4realnet_small
+ENV ENV_NAME=ai4realnet_small
+ENV ENV_LOCATION=/root/data_grid2op
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

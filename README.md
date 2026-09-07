@@ -344,7 +344,7 @@ The scripts read their defaults from `.env` through `project_config.py`. For ano
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-The endpoint is `POST /api/v1/recommendation`, and `/health` reports the active Grid2Op environment. The API reads `GRID2OP_ENV` from the environment, defaulting to `l2rpn_icaps_2021_small` in `app/main.py`.
+The endpoint is `POST /api/v1/recommendation`, and `/health` reports the active Grid2Op environment. The API uses the same `project_config.py` configuration as `run_pipeline.py`: environment variables override `.env`, and `.env` overrides the defaults. Configure `ENV_NAME` and `ENV_LOCATION` so they resolve to `<ENV_LOCATION>/<ENV_NAME>`.
 
 The Docker container uses `python:3.10-slim`, installs the pinned requirements, copies the repository, and starts uvicorn on port 8000:
 
@@ -353,7 +353,7 @@ docker build -t curriculum-agent-api .
 docker run -p 8000:8000 curriculum-agent-api
 ```
 
-The `Dockerfile` sets `GRID2OP_ENV=ai4realnet_small` and copies the `ai4realnet_small` scenario from `grid2op-scenario`. It currently runs `pip install .`, so add a packaging file or remove that line before relying on the image build. See `app/API.md` for the endpoint contract and deployment notes.
+The `Dockerfile` sets `ENV_NAME=ai4realnet_small` and `ENV_LOCATION=/root/data_grid2op`, then copies the `ai4realnet_small` scenario from `grid2op-scenario`. See `app/API.md` for the endpoint contract and deployment notes.
 
 ## Methodology
 

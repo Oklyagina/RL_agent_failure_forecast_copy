@@ -17,11 +17,12 @@ Run locally:
     uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 The environment must match the InteractiveAI simulator's Grid2Op version and
-scenario -- set GRID2OP_ENV if it differs from the CurriculumAgent's training
-environment (see the Dockerfile and API.md).
+scenario. The API uses the same .env/environment configuration as the main
+pipeline code (see project_config.py, Dockerfile, and API.md).
 """
 import json
 import os
+import sys
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -33,7 +34,14 @@ from pydantic import BaseModel
 app = FastAPI(title="CurriculumAgent + ENN uncertainty API")
 
 ROOT = Path(__file__).resolve().parents[1]
-ENV_NAME = os.environ.get("GRID2OP_ENV", "l2rpn_icaps_2021_small")
+SRC_DIR = ROOT / "src"
+for path in (ROOT, SRC_DIR):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from project_config import ENV_DIR, ENV_NAME
+
+os.environ.setdefault("GRID2OP_DATA_PATH", str(ENV_DIR.parent))
 
 
 # --------------------------------------------------------------------------- #
@@ -54,12 +62,12 @@ def get_services():
     import run_example as rx                    # reuse the auto-discovery
     from recommendation_uncertainty import load_calibration
 
-    env = grid2op.make(ENV_NAME, backend=LightSimBackend())
+    env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
 
     scaler_json, meta_json, npz = rx.find_artifact_set()
     meta = json.loads(meta_json.read_text())
     weights = rx.find_enn_weights(prefer_dir=meta_json.parent)
-    actions_path = rx.find_actions_npy(meta.get("n_curated_actions"))
+    actions_path = rx.find_actions_npy(meta)
     agent_dir = rx.find_agent_dir()
 
     agent = rx.load_agent(env, agent_dir)
