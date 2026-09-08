@@ -41,7 +41,7 @@ N_STEPS = EXAMPLE_N_STEPS
 SEED = CONFIG_SEED
 # ----------------------------------------------------------------------------
 
-_SKIP_DIRS = {".git", "__pycache__", "tests", "curriculumagent"}
+_SKIP_DIRS = {".git", "__pycache__", "tests", "curriculumagent", "archive"}
 
 
 def _rel_parts(path: Path) -> tuple[str, ...]:
@@ -66,7 +66,7 @@ def find_artifact_set():
     """Locate scaler_params.json + enn_meta.json (+ calibration .npz).
 
     Priority: (1) CONFIG overrides; (2) artifacts/ folders produced by
-    training/train_enn.py; (3) legacy models_* folders; (4) other fallback
+    training/train_enn.py; (3) models_* folders; (4) other active fallback
     folders. The calibration .npz must sit next to the selected metadata.
 
     The scaler is CREATED AT ENN TRAINING TIME -- if nothing is found, the
@@ -133,8 +133,8 @@ def find_enn_weights(prefer_dir: Path | None = None) -> Path:
                                   "enn" not in p.name.lower(), str(p)))
     if not cands:
         sys.exit("[error] no .pth/.pt ENN weights found in the repository. "
-                 "Commit the trained ENN (e.g. src/models/enn_36.pth) or set "
-                 "ENN_WEIGHTS in the CONFIG block.")
+                 "Commit the trained ENN under artifacts/ or set ENN_WEIGHTS "
+                 "in the CONFIG block.")
     print(f"       auto: ENN weights -> {cands[0].relative_to(ROOT)}"
           + (f"  (candidates: {len(cands)})" if len(cands) > 1 else ""))
     return cands[0]
@@ -212,7 +212,6 @@ def find_agent_dir() -> Path:
     preferred = [
         ASSETS_DIR / ENV_NAME,
         ASSETS_DIR / "network36",
-        ROOT / "src" / "models" / "network36",
     ]
     base = ROOT / "curriculumagent"
     invalid = []
@@ -230,7 +229,7 @@ def find_agent_dir() -> Path:
     sys.exit("[error] no valid folder with model/ and actions/ subfolders "
              "found. Expected a non-empty TensorFlow SavedModel under "
              f"assets/{ENV_NAME}/, assets/network36/ or "
-             "src/models/network36/. Set AGENT_DIR in "
+             "another configured active agent directory. Set AGENT_DIR in "
              f"the CONFIG block to override.{hint}")
 
 
