@@ -17,8 +17,8 @@ Run locally:
     uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 The environment must match the InteractiveAI simulator's Grid2Op version and
-scenario. The API uses the same .env/environment configuration as the main
-pipeline code (see project_config.py, Dockerfile, and API.md).
+scenario. The API uses .env/environment configuration from project_config.py
+(see Dockerfile and API.md).
 """
 import json
 import logging
@@ -192,8 +192,8 @@ def _find_agent_dir() -> Path:
 def _api_artifact_paths() -> Dict[str, Path]:
     """Select one consistent API artifact bundle.
 
-    The API intentionally prefers the refactored ENN outputs so it does not
-    mix legacy `enn_36.pth` weights with refactored `enn_meta.json` metadata.
+    The API intentionally selects the refactored ENN outputs as one consistent
+    bundle so checkpoint, metadata, scaler, calibration, and actions match.
     """
     model_dir = ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "model"
     rollouts_dir = ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "rollouts"
@@ -328,8 +328,8 @@ def get_services():
             metadata_num_classes=meta.get("num_classes"),
             exception_type=type(exc).__name__,
             exception=str(exc),
-            hint="Use enn_<AGENT_NAME>.pth with enn_meta.json, or use a "
-                 "matching legacy metadata/checkpoint bundle.",
+            hint="Use enn_<AGENT_NAME>.pth with the matching enn_meta.json "
+                 "from the same refactored training run.",
         ) from exc
     calibration = load_calibration(
         str(npz), scaler=rx.scaler_from_json(scaler_json),
@@ -539,19 +539,6 @@ def diagnostics():
         },
         "selected_artifacts": {
             name: _file_info(path) for name, path in paths.items()
-        },
-        "legacy_artifacts_present": {
-            "legacy_metadata": _file_info(
-                ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "model"
-                / f"enn_meta_{ENV_NAME}.json"
-            ),
-            "legacy_weights": _file_info(
-                ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "model" / "enn_36.pth"
-            ),
-            "legacy_scaler": _file_info(
-                ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "model"
-                / f"scaler_{ENV_NAME}_enn.pkl"
-            ),
         },
     }
 

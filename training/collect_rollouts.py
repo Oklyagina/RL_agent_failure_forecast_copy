@@ -8,11 +8,13 @@ an object exposing ``act``.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 import grid2op
 from lightsim2grid import LightSimBackend
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -34,7 +36,6 @@ def _candidate_agent_dirs() -> list[Path]:
     return [
         ASSETS_DIR / ENV_NAME,
         ASSETS_DIR / "network36",
-        ROOT / "src" / "models" / "network36",
     ]
 
 
@@ -45,6 +46,12 @@ def _default_agent_path() -> Path:
     return ASSETS_DIR / ENV_NAME
 
 
+def configure_logging() -> None:
+    """Keep rollout collection output focused on warnings and progress."""
+    logging.basicConfig(level=logging.WARNING, force=True)
+    logging.getLogger().setLevel(logging.WARNING)
+
+
 def collect(
     agent_name: str,
     episodes: int,
@@ -53,7 +60,23 @@ def collect(
     max_steps: int | None = None,
     agent_factory_spec: str | None = None,
 ) -> None:
+    configure_logging()
     env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
+    progress = tqdm(
+        total=episodes,
+        desc="Collecting rollouts",
+        unit="episode",
+        dynamic_ncols=True,
+    )
+
+    def update_progress(_episode: int, steps: int, total_pairs: int) -> None:
+        progress.update(1)
+        progress.set_postfix(
+            last_steps=steps,
+            total_pairs=total_pairs,
+            refresh=False,
+        )
+
     try:
         spec = agent_factory_spec or AGENT_FACTORY or None
         agent = build_agent(
@@ -62,9 +85,15 @@ def collect(
             agent_path=None if spec else _default_agent_path(),
         )
         observations, labels, action_set = collect_policy_rollouts(
-            env, agent, episodes=episodes, seed=seed, max_steps=max_steps
+            env,
+            agent,
+            episodes=episodes,
+            seed=seed,
+            max_steps=max_steps,
+            progress_callback=update_progress,
         )
     finally:
+        progress.close()
         env.close()
 
     save_rollout_bundle(out_dir, observations, labels, action_set, seed=seed)

@@ -55,19 +55,22 @@ def _artifact_rank(path: Path) -> int:
     parts = _rel_parts(path)
     if parts and parts[0] == "artifacts":
         return 0
-    if path.name.startswith("models_"):
-        return 1
     if path == ROOT:
         return 99
-    return 2
+    return 1
+
+
+def _is_skipped_path(path: Path) -> bool:
+    parts = _rel_parts(path)
+    return bool(_SKIP_DIRS & set(parts)) or any(part.startswith("models_") for part in parts)
 
 
 def find_artifact_set():
     """Locate scaler_params.json + enn_meta.json (+ calibration .npz).
 
     Priority: (1) CONFIG overrides; (2) artifacts/ folders produced by
-    training/train_enn.py; (3) models_* folders; (4) other active fallback
-    folders. The calibration .npz must sit next to the selected metadata.
+    training/train_enn.py; (3) other active fallback folders. The calibration
+    .npz must sit next to the selected metadata.
 
     The scaler is CREATED AT ENN TRAINING TIME -- if nothing is found, the
     pipeline must be trained first (see TRAINING.md)."""
@@ -83,7 +86,7 @@ def find_artifact_set():
             d for d in {p.parent for p in ROOT.rglob("enn_meta.json")}
             if (d / "scaler_params.json").is_file()
             and d != configured_dir
-            and not (_SKIP_DIRS & set(_rel_parts(d)))
+            and not _is_skipped_path(d)
         )
         if not cands:
             sys.exit(
@@ -119,8 +122,7 @@ def find_artifact_set():
 
 def _walk_files(suffixes):
     for p in ROOT.rglob("*"):
-        if p.is_file() and p.suffix in suffixes \
-                and not (_SKIP_DIRS & set(p.relative_to(ROOT).parts[:-1])):
+        if p.is_file() and p.suffix in suffixes and not _is_skipped_path(p):
             yield p
 
 
@@ -203,7 +205,7 @@ def import_evidential_network():
 
 
 def find_agent_dir() -> Path:
-    """Locate legacy bundled policy assets (model/ + actions/).
+    """Locate configured bundled policy assets (model/ + actions/).
 
     Custom policies configured with ``AGENT_FACTORY`` do not use this helper.
     """

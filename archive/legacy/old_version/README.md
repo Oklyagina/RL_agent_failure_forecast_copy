@@ -56,11 +56,15 @@ archive/legacy/old_version/
 |   |-- training_enn.py
 |   |-- train_classifier.py
 |   |-- utils.py
+|   |-- failure_probability.py
+|   |-- pipeline_artifacts.py
 |   |-- rule_predictor.py
 |   |-- test_rule_predictor.py
 |   `-- models/network36/
 `-- tests/
-    `-- test_training_enn_data.py
+    |-- test_training_enn_data.py
+    |-- test_enn_training_fallback.py
+    `-- test_new_components.py
 ```
 
 ## Legacy Training Pipeline

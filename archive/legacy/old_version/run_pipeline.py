@@ -6,7 +6,7 @@ import logging
 import argparse
 import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 from tqdm import tqdm
 
@@ -16,11 +16,22 @@ for path in (ROOT, SRC_DIR):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from project_config import (AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR, ENV_DIR,
-                            ENV_NAME)
+from project_config import (
+    AGENT_FACTORY, AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR,
+    CLASSIFIER_OPTUNA_TRIALS, ENV_DIR, ENV_NAME,
+    ENN_ANNEAL_EPOCHS, ENN_BATCH_SIZE, ENN_EPOCHS, ENN_LR,
+    ENN_ROLLOUT_MAX_STEPS, ROLLOUT_EPISODES, SEED,
+)
 from src import config as src_config
-from src.config import (CFG, DEVICE, TRAIN_MODE, PREDICT_PROBA_MODE,
-                        TEST_SINGLE_EPISODE, LLM_RULE_MODE)
+from src.config import CFG, TRAIN_MODE, PREDICT_PROBA_MODE, TEST_SINGLE_EPISODE
+from src.pipeline_artifacts import (
+    ArtifactStatus,
+    StageCheck,
+    classify_outputs,
+    mark_provenance_stale,
+    provenance_path,
+    write_provenance,
+)
 
 sys.modules["config"] = src_config
 os.environ.setdefault("GRID2OP_DATA_PATH", str(ENV_DIR.parent))
@@ -30,16 +41,13 @@ PIPELINE_DATA_DIR = PIPELINE_DIR / "data"
 PIPELINE_MODEL_DIR = PIPELINE_DIR / "model"
 
 agent_path = ASSETS_DIR / ENV_NAME
-if not ((agent_path / "model").is_dir() and (agent_path / "actions").is_dir()):
-    for candidate in (ASSETS_DIR / "network36", ROOT / "src" / "models" / "network36"):
-        if (candidate / "model").is_dir() and (candidate / "actions").is_dir():
-            agent_path = candidate
-            break
 
 for path in (PIPELINE_DATA_DIR, PIPELINE_MODEL_DIR):
     path.mkdir(parents=True, exist_ok=True)
 
 CFG.ENV_NAME = str(ENV_DIR)
+CFG.AGENT_NAME = AGENT_NAME
+CFG.AGENT_FACTORY = AGENT_FACTORY
 CFG.MODEL_MEAN_PATH = str(PIPELINE_MODEL_DIR / "HBGB_36.pkl")
 CFG.MODEL_ALEATORIC_PATH = str(PIPELINE_MODEL_DIR / "HBGB_36_aleatoric.pkl")
 CFG.MODEL_ENN_PATH = str(PIPELINE_MODEL_DIR / "enn_36.pth")
@@ -54,6 +62,22 @@ CFG.TUTOR_DIR = str(Path(CFG.AGENT_PATH) / "tutor" / "junior_data")
 CFG.TRAIN_FILE = str(Path(CFG.TUTOR_DIR) / "test_train.npz")
 CFG.VAL_FILE = str(Path(CFG.TUTOR_DIR) / "test_val.npz")
 CFG.TEST_FILE = str(Path(CFG.TUTOR_DIR) / "test_test.npz")
+CFG.ENN_ROLLOUT_DIR = str(PIPELINE_DATA_DIR / "enn_rollouts")
+CFG.ENN_ROLLOUT_EPISODES = ROLLOUT_EPISODES
+CFG.ENN_ROLLOUT_MAX_STEPS = ENN_ROLLOUT_MAX_STEPS or None
+CFG.ENN_EPOCHS = ENN_EPOCHS
+CFG.ENN_BATCH_SIZE = ENN_BATCH_SIZE
+CFG.ENN_MAX_LR = ENN_LR
+CFG.ENN_ANNEAL_EPOCHS = ENN_ANNEAL_EPOCHS
+CFG.CLASSIFIER_OPTUNA_TRIALS = CLASSIFIER_OPTUNA_TRIALS
+CFG.SEED = SEED
+
+# LLM_RULE_MODE is the new flag for symbolic rule inference.
+# If it does not yet exist in config.py, it defaults to False.
+try:
+    from src.config import LLM_RULE_MODE
+except ImportError:
+    LLM_RULE_MODE = False
 
 
 def configure_verbosity(verbose: bool = False) -> None:
@@ -68,230 +92,15 @@ def configure_verbosity(verbose: bool = False) -> None:
         pass
 
 
-def _display_path(path: Path) -> str:
-    """Return a compact path for console diagnostics."""
-    try:
-        return str(path.resolve().relative_to(ROOT))
-    except ValueError:
-        return str(path)
-
-
-def _has_rule_files(path: Path) -> bool:
-    return path.is_dir() and any(path.glob("line_*/best_rule.py"))
-
-
-def _count_rule_files(path: Path) -> int:
-    if not path.is_dir():
-        return 0
-    return sum(1 for _ in path.glob("line_*/best_rule.py"))
-
-
-def _resolve_llm_rules_dir() -> Path:
-    """Resolve the folder containing line_*/best_rule.py symbolic rules."""
-    explicit = getattr(CFG, "LLM_RULES_DIR", None)
-    if isinstance(explicit, str):
-        explicit = explicit.strip()
-    if explicit and str(explicit).lower() not in {"none", "null"}:
-        path = Path(explicit)
-        if not path.is_absolute():
-            path = ROOT / path
-        if not _has_rule_files(path):
-            raise FileNotFoundError(
-                "Configured CFG.LLM_RULES_DIR does not contain line_*/best_rule.py files: "
-                f"{_display_path(path)}"
-            )
-        return path
-
-    candidates = []
-    for base, pattern in (
-        (ROOT / "results", "seed_*"),
-        (ROOT / "llm_rules_results", "temp_*"),
-        (ROOT / "llm_rule_results", "temp_*"),
-    ):
-        if base.is_dir():
-            candidates.extend(
-                path for path in base.glob(pattern)
-                if path.is_dir() and _has_rule_files(path)
-            )
-
-    if candidates:
-        return max(candidates, key=lambda path: path.stat().st_mtime)
-
-    searched = ", ".join(
-        _display_path(path) for path in (
-            ROOT / "results" / "seed_*",
-            ROOT / "llm_rules_results" / "temp_*",
-            ROOT / "llm_rule_results" / "temp_*",
-        )
-    )
-    raise FileNotFoundError(
-        "No symbolic LLM rules were found. Run or copy dual_llm.py outputs first, "
-        "or set CFG.LLM_RULES_DIR to a directory containing line_*/best_rule.py. "
-        f"Searched: {searched}"
-    )
-
-
-def _file_status(path: Path) -> str:
-    exists = path.is_file()
-    size = path.stat().st_size if exists else 0
-    state = "OK" if exists and size > 0 else "MISSING"
-    return f"{state:7s} {_display_path(path)} ({size} bytes)"
-
-
-def _read_json(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _load_json_scaler(path: Path):
-    from sklearn.preprocessing import StandardScaler
-    import numpy as np
-
-    params = _read_json(path)
-    scaler = StandardScaler()
-    scaler.mean_ = np.asarray(params["mean"], dtype=np.float64)
-    scaler.scale_ = np.asarray(params["scale"], dtype=np.float64)
-    scaler.var_ = np.asarray(params["var"], dtype=np.float64)
-    scaler.n_features_in_ = int(params["n_features_in"])
-    return scaler
-
-
-def _torch_load_state_dict(path: Path) -> Dict[str, Any]:
-    import torch
-
-    try:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    except TypeError:
-        checkpoint = torch.load(path, map_location="cpu")
-    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        checkpoint = checkpoint["state_dict"]
-    if not isinstance(checkpoint, dict):
-        raise ValueError(f"ENN checkpoint is not a state_dict: {_display_path(path)}")
-    return checkpoint
-
-
-def _checkpoint_dimensions(checkpoint: Dict[str, Any]) -> Dict[str, int]:
-    required = ("embedding.0.weight", "head.3.bias")
-    missing = [key for key in required if key not in checkpoint]
-    if missing:
-        raise ValueError(f"ENN checkpoint is missing keys: {missing}")
-    return {
-        "input_dim": int(checkpoint["embedding.0.weight"].shape[1]),
-        "hidden_dim": int(checkpoint["embedding.0.weight"].shape[0]),
-        "num_classes": int(checkpoint["head.3.bias"].shape[0]),
-    }
-
-
-def _llm_enn_paths() -> Tuple[str, Dict[str, Path], str]:
-    bundle = str(getattr(CFG, "LLM_ENN_BUNDLE", "refactored") or "refactored").lower()
-    if bundle in {"refactored", "curriculum"}:
-        return "refactored", {
-            "weights": PIPELINE_MODEL_DIR / f"enn_{AGENT_NAME}.pth",
-            "metadata": PIPELINE_MODEL_DIR / "enn_meta.json",
-            "scaler": PIPELINE_MODEL_DIR / "scaler_params.json",
-            "actions": PIPELINE_DIR / "rollouts" / "actions.npy",
-        }, "json"
-    if bundle == "legacy":
-        return "legacy", {
-            "weights": PIPELINE_MODEL_DIR / "enn_36.pth",
-            "metadata": PIPELINE_MODEL_DIR / f"enn_meta_{ENV_NAME}.json",
-            "scaler": PIPELINE_MODEL_DIR / f"scaler_{ENV_NAME}_enn.pkl",
-            "actions": Path(CFG.AGENT_PATH) / "actions" / "actions.npy",
-        }, "joblib"
-    raise ValueError("CFG.LLM_ENN_BUNDLE must be 'refactored' or 'legacy'.")
-
-
-def _load_llm_enn_bundle() -> Tuple[Any, Any, Dict[str, Any]]:
-    import joblib
-    import numpy as np
-    from src.enn_models import EvidentialNetwork
-
-    bundle, paths, scaler_format = _llm_enn_paths()
-    for name in ("weights", "metadata", "scaler", "actions"):
-        path = paths[name]
-        if not path.is_file() or path.stat().st_size == 0:
-            raise FileNotFoundError(f"Missing or empty ENN {name}: {_display_path(path)}")
-
-    metadata = _read_json(paths["metadata"])
-    checkpoint = _torch_load_state_dict(paths["weights"])
-    dims = _checkpoint_dimensions(checkpoint)
-
-    meta_input_dim = int(metadata["input_dim"])
-    meta_num_classes = int(metadata["num_classes"])
-    if dims["input_dim"] != meta_input_dim or dims["num_classes"] != meta_num_classes:
-        raise ValueError(
-            "Selected ENN metadata and checkpoint are incompatible: "
-            f"metadata input_dim={meta_input_dim}, num_classes={meta_num_classes}; "
-            f"checkpoint input_dim={dims['input_dim']}, num_classes={dims['num_classes']}; "
-            f"metadata={_display_path(paths['metadata'])}; weights={_display_path(paths['weights'])}"
-        )
-
-    scaler = _load_json_scaler(paths["scaler"]) if scaler_format == "json" else joblib.load(paths["scaler"])
-    scaler_features = int(getattr(scaler, "n_features_in_", -1))
-    if scaler_features != meta_input_dim:
-        raise ValueError(
-            "Selected ENN scaler and metadata are incompatible: "
-            f"scaler n_features_in_={scaler_features}; metadata input_dim={meta_input_dim}; "
-            f"scaler={_display_path(paths['scaler'])}; metadata={_display_path(paths['metadata'])}"
-        )
-
-    actions = np.load(paths["actions"], mmap_mode="r")
-    if bundle == "refactored" and int(actions.shape[0]) != meta_num_classes:
-        raise ValueError(
-            "Selected ENN actions and metadata are incompatible: "
-            f"actions rows={int(actions.shape[0])}; metadata num_classes={meta_num_classes}; "
-            f"actions={_display_path(paths['actions'])}; metadata={_display_path(paths['metadata'])}"
-        )
-    if bundle == "legacy" and len(metadata.get("class_mapping", {})) != meta_num_classes:
-        raise ValueError(
-            "Selected legacy ENN metadata has an invalid class_mapping: "
-            f"mapping size={len(metadata.get('class_mapping', {}))}; num_classes={meta_num_classes}"
-        )
-
-    model = EvidentialNetwork(
-        input_dim=dims["input_dim"],
-        num_classes=dims["num_classes"],
-        hidden_dim=dims["hidden_dim"],
-        dropout=CFG.ENN_DROPOUT,
-    ).to(DEVICE)
-    model.load_state_dict(checkpoint)
-    model.eval()
-
-    info = {
-        "bundle": bundle,
-        "paths": paths,
-        "metadata": metadata,
-        "checkpoint_dimensions": dims,
-        "scaler_features": scaler_features,
-        "actions_shape": tuple(int(v) for v in actions.shape),
-    }
-    return model, scaler, info
-
-
-def _make_scaled_uncertainty_fn(scaler):
-    import numpy as np
-    import torch
-
-    def get_scaled_uncertainty(model, obs_array) -> float:
-        input_dim = int(getattr(model, "input_dim", scaler.n_features_in_))
-        obs = np.asarray(obs_array, dtype=np.float32).reshape(-1, input_dim)
-        obs_scaled = scaler.transform(obs).astype(np.float32)
-        obs_tensor = torch.as_tensor(obs_scaled, dtype=torch.float32, device=DEVICE)
-
-        model.eval()
-        with torch.no_grad():
-            out = model(obs_tensor)
-            uncertainty = out["uncertainty"].squeeze(-1)
-        return float(uncertainty.mean().item())
-
-    return get_scaled_uncertainty
-
-
 # =============================================================================
-# Subprocess executor (unchanged from original)
+# Subprocess executor
 # =============================================================================
 
-def execute_module(module_path: str, verbose: bool = False) -> None:
+def execute_module(
+    module_path: str,
+    verbose: bool = False,
+    module_args: Optional[Sequence[str]] = None,
+) -> None:
     """
     Executes a Python module as a subprocess, ensuring the project root
     is correctly appended to the PYTHONPATH to prevent module resolution errors.
@@ -319,12 +128,19 @@ import sys
 import run_pipeline
 
 module_path = sys.argv[1]
+module_args = sys.argv[2:]
+sys.argv = [module_path, *module_args]
 run_pipeline.configure_verbosity(run_pipeline.os.environ.get("RUN_PIPELINE_VERBOSE") == "1")
 
 if module_path.endswith("training_enn.py"):
     run_pipeline.CFG.ENV_NAME = run_pipeline.ENV_NAME
 else:
     run_pipeline.CFG.ENV_NAME = str(run_pipeline.ENV_DIR)
+
+# Derive grid dimensions and generator limits from the actual Grid2Op
+# environment in every subprocess.  This removes the original 36-bus shape
+# dependency from forecast / analysis stages.
+run_pipeline._inspect_environment()
 
 if module_path.endswith("collect_data.py"):
     import training_enn
@@ -334,7 +150,7 @@ if module_path.endswith("collect_data.py"):
 
 runpy.run_path(module_path, run_name="__main__")
 """
-    command = [sys.executable, "-c", bootstrap, module_path]
+    command = [sys.executable, "-c", bootstrap, module_path, *(module_args or [])]
 
     try:
         if verbose:
@@ -364,32 +180,512 @@ runpy.run_path(module_path, run_name="__main__")
 
 
 # =============================================================================
-# Training pipeline (unchanged from original)
+# Environment-aware resumable training pipeline
 # =============================================================================
 
+FORECAST_DATA_PATHS = (
+    Path(CFG.X_TRAIN_PATH), Path(CFG.Y_TRAIN_PATH),
+    Path(CFG.X_TEST_PATH), Path(CFG.Y_TEST_PATH),
+)
+FORECAST_DATA_PRIMARY = PIPELINE_DATA_DIR / "forecast_data"
+MEAN_MODEL_PATH = Path(CFG.MODEL_MEAN_PATH)
+ALEATORIC_MODEL_PATH = Path(CFG.MODEL_ALEATORIC_PATH)
+ENN_MODEL_PATH = Path(CFG.MODEL_ENN_PATH)
+ENN_SCALER_PATH = PIPELINE_MODEL_DIR / f"scaler_{ENV_NAME}_enn.pkl"
+ENN_META_PATH = PIPELINE_MODEL_DIR / f"enn_meta_{ENV_NAME}.json"
+ENN_PORTABLE_META_PATH = PIPELINE_MODEL_DIR / "enn_meta.json"
+ENN_PORTABLE_SCALER_PATH = PIPELINE_MODEL_DIR / "scaler_params.json"
+ENN_CALIBRATION_PATH = PIPELINE_MODEL_DIR / "enn_pctile_calib.npz"
+ENN_ACTION_SET_PATH = PIPELINE_MODEL_DIR / "actions.npy"
+CLASSIFIER_METADATA_PATH = PIPELINE_MODEL_DIR / "classifier_metadata.json"
+ANALYSIS_PATH = Path(CFG.CSV_OUTPUT_PATH)
+CLASSIFIER_PATH = Path(CFG.MODEL_CLASSIFIER_PATH)
+
+
+def _inspect_environment() -> Dict[str, int]:
+    import numpy as np
+    import grid2op
+    from lightsim2grid import LightSimBackend
+
+    try:
+        env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
+        obs = env.reset()
+    except Exception as exc:
+        raise RuntimeError(
+            f"Cannot load configured environment {ENV_NAME!r} from {ENV_DIR}: {exc}"
+        ) from exc
+    try:
+        target_dim = 2 * len(obs.load_p) + len(obs.gen_p)
+        dimensions = {
+            "observation_dim": int(len(obs.to_vect())),
+            "forecast_input_dim": int(4 * target_dim + 7),
+            "forecast_target_dim": int(target_dim),
+            "loads": int(len(obs.load_p)),
+            "generators": int(len(obs.gen_p)),
+            "lines": int(len(obs.rho)),
+        }
+        # Keep the legacy CFG-based feature code, but populate it from the
+        # environment rather than requiring users to edit 36-bus constants.
+        CFG.NO_LOADS = dimensions["loads"]
+        CFG.NO_GENS = dimensions["generators"]
+        CFG.NO_LINES = dimensions["lines"]
+        CFG.ENN_INPUT_DIM = dimensions["observation_dim"]
+        if hasattr(env, "gen_pmax"):
+            CFG.GEN_MAX = np.asarray(env.gen_pmax, dtype=float).copy()
+        else:
+            CFG.GEN_MAX = np.full(dimensions["generators"], np.inf, dtype=float)
+        if hasattr(env, "gen_pmin"):
+            CFG.GEN_MIN = np.asarray(env.gen_pmin, dtype=float).copy()
+        else:
+            CFG.GEN_MIN = np.full(dimensions["generators"], -np.inf, dtype=float)
+    finally:
+        env.close()
+    return dimensions
+
+
+def _validate_agent_assets() -> None:
+    # A custom policy factory is sufficient; it owns its own model loading.
+    if AGENT_FACTORY:
+        from src.agent_runtime import import_agent_factory
+        import_agent_factory(AGENT_FACTORY)
+        return
+    root = Path(CFG.AGENT_PATH)
+    required = [
+        root / "actions" / "actions.npy",
+        root / "model" / "saved_model.pb",
+        root / "model" / "variables" / "variables.index",
+        root / "model" / "variables" / "variables.data-00000-of-00001",
+    ]
+    missing = [str(path) for path in required if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        raise FileNotFoundError(
+            "Configured agent assets are incomplete. Missing: " + ", ".join(missing)
+            + ". For another policy, set AGENT_FACTORY=module:function."
+        )
+
+
+def _check_with_validator(
+    outputs: Iterable[Path],
+    sidecar: Path,
+    validator: Callable[[], Dict[str, int]],
+) -> StageCheck:
+    check = classify_outputs(outputs, sidecar, ENV_NAME, AGENT_NAME)
+    if check.status == ArtifactStatus.MISSING:
+        return check
+    try:
+        check.dimensions = validator()
+    except Exception as exc:
+        return StageCheck(ArtifactStatus.INCOMPATIBLE, str(exc))
+    return check
+
+
+def _validate_forecast_data(expected: Dict[str, int]) -> Dict[str, int]:
+    import numpy as np
+
+    arrays = [np.load(path, mmap_mode="r", allow_pickle=False) for path in FORECAST_DATA_PATHS]
+    x_train, y_train, x_test, y_test = arrays
+    for name, array in zip(("X_train", "y_train", "X_test", "Y_test"), arrays):
+        if array.ndim != 2 or array.shape[0] == 0:
+            raise ValueError(f"{name} must be a non-empty 2-D array; got {array.shape}")
+    if len(x_train) != len(y_train) or len(x_test) != len(y_test):
+        raise ValueError("forecast feature/target row counts do not match")
+    if x_train.shape[1] != expected["forecast_input_dim"] or x_test.shape[1] != expected["forecast_input_dim"]:
+        raise ValueError(
+            f"forecast input width must be {expected['forecast_input_dim']}; "
+            f"got train={x_train.shape[1]}, test={x_test.shape[1]}"
+        )
+    if y_train.shape[1] != expected["forecast_target_dim"] or y_test.shape[1] != expected["forecast_target_dim"]:
+        raise ValueError(
+            f"forecast target width must be {expected['forecast_target_dim']}; "
+            f"got train={y_train.shape[1]}, test={y_test.shape[1]}"
+        )
+    return {
+        "input_dim": int(x_train.shape[1]),
+        "target_dim": int(y_train.shape[1]),
+        "train_rows": int(len(x_train)),
+        "test_rows": int(len(x_test)),
+    }
+
+
+def _forecast_pair_valid(x_path: Path, y_path: Path, expected: Dict[str, int]) -> bool:
+    import numpy as np
+
+    try:
+        x = np.load(x_path, mmap_mode="r", allow_pickle=False)
+        y = np.load(y_path, mmap_mode="r", allow_pickle=False)
+        return bool(
+            x.ndim == y.ndim == 2 and len(x) > 0 and len(x) == len(y)
+            and x.shape[1] == expected["forecast_input_dim"]
+            and y.shape[1] == expected["forecast_target_dim"]
+        )
+    except Exception:
+        return False
+
+
+def _validate_regressor(path: Path, expected: Dict[str, int]) -> Dict[str, int]:
+    import joblib
+
+    model = joblib.load(path)
+    input_dim = int(getattr(model, "n_features_in_", -1))
+    estimators = getattr(model, "estimators_", None)
+    output_dim = len(estimators) if estimators is not None else -1
+    if input_dim != expected["forecast_input_dim"] or output_dim != expected["forecast_target_dim"]:
+        raise ValueError(
+            f"{path.name} dimensions are input={input_dim}, output={output_dim}; expected "
+            f"input={expected['forecast_input_dim']}, output={expected['forecast_target_dim']}"
+        )
+    return {"input_dim": input_dim, "output_dim": output_dim}
+
+
+def _validate_tutor_data(observation_dim: int) -> None:
+    import numpy as np
+
+    expected_keys = (
+        (Path(CFG.TRAIN_FILE), "s_train", "a_train"),
+        (Path(CFG.VAL_FILE), "s_validate", "a_validate"),
+        (Path(CFG.TEST_FILE), "s_test", "a_test"),
+    )
+    for path, state_key, action_key in expected_keys:
+        if not path.is_file():
+            raise FileNotFoundError(f"Required ENN tutor split is missing: {path}")
+        with np.load(path, mmap_mode="r", allow_pickle=False) as data:
+            if state_key not in data or action_key not in data:
+                raise ValueError(
+                    f"{path} must contain {state_key!r} and {action_key!r}; found {data.files}"
+                )
+            states, actions = data[state_key], data[action_key]
+            if states.ndim != 2 or len(states) == 0 or len(states) != len(actions):
+                raise ValueError(
+                    f"{path} is invalid: state shape={states.shape}, action shape={actions.shape}"
+                )
+            if states.shape[1] != observation_dim:
+                raise ValueError(
+                    f"{path} has {states.shape[1]} observation features; current environment "
+                    f"{ENV_NAME} has {observation_dim}."
+                )
+
+
+def _validate_enn(expected: Dict[str, int]) -> Dict[str, int]:
+    import joblib
+    import numpy as np
+    import torch
+
+    meta = json.loads(ENN_META_PATH.read_text(encoding="utf-8"))
+    portable_meta = json.loads(ENN_PORTABLE_META_PATH.read_text(encoding="utf-8"))
+    if portable_meta.get("input_dim") != meta.get("input_dim") or portable_meta.get("num_classes") != meta.get("num_classes"):
+        raise ValueError("Portable ENN metadata does not match environment-specific metadata")
+    meta_env = meta.get("environment")
+    if meta_env and Path(str(meta_env)).name != ENV_NAME:
+        raise ValueError(f"ENN metadata environment is {meta_env!r}, expected {ENV_NAME!r}")
+
+    scaler = joblib.load(ENN_SCALER_PATH)
+    scaler_dim = int(getattr(scaler, "n_features_in_", -1))
+    state = torch.load(ENN_MODEL_PATH, map_location="cpu")
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    matrices = [value for value in state.values() if getattr(value, "ndim", 0) == 2]
+    if not matrices:
+        raise ValueError("ENN checkpoint contains no two-dimensional weight tensors")
+    input_dim = int(matrices[0].shape[1])
+    num_classes = int(matrices[-1].shape[0])
+    if input_dim != expected["observation_dim"] or scaler_dim != input_dim:
+        raise ValueError(
+            f"ENN/scaler dimensions are model={input_dim}, scaler={scaler_dim}; current "
+            f"environment requires {expected['observation_dim']}"
+        )
+    meta_input = int(meta.get("input_dim", input_dim))
+    meta_classes = int(meta.get("num_classes", num_classes))
+    if meta_input != input_dim or meta_classes != num_classes:
+        raise ValueError("ENN metadata dimensions do not match its checkpoint")
+
+    portable_scaler = json.loads(ENN_PORTABLE_SCALER_PATH.read_text(encoding="utf-8"))
+    portable_scaler_dim = int(portable_scaler.get("n_features_in", -1))
+    for key in ("mean", "scale", "var"):
+        values = np.asarray(portable_scaler.get(key, []), dtype=float)
+        if values.shape != (input_dim,) or not np.all(np.isfinite(values)):
+            raise ValueError(
+                f"portable ENN scaler field {key!r} is invalid for input_dim={input_dim}"
+            )
+    if portable_scaler_dim != input_dim:
+        raise ValueError(
+            f"portable ENN scaler width is {portable_scaler_dim}; expected {input_dim}"
+        )
+
+    with np.load(ENN_CALIBRATION_PATH, allow_pickle=False) as calibration:
+        if "total_ref" not in calibration or "action_ref" not in calibration:
+            raise ValueError("ENN calibration must contain total_ref and action_ref")
+        total_ref = np.asarray(calibration["total_ref"], dtype=float).reshape(-1)
+        action_ref = np.asarray(calibration["action_ref"], dtype=float).reshape(-1)
+    if len(total_ref) == 0 or len(action_ref) == 0:
+        raise ValueError("ENN calibration reference arrays must be non-empty")
+    if not np.all(np.isfinite(total_ref)) or not np.all(np.isfinite(action_ref)):
+        raise ValueError("ENN calibration contains non-finite values")
+
+    actions = np.load(ENN_ACTION_SET_PATH, mmap_mode="r", allow_pickle=False)
+    if actions.ndim != 2 or len(actions) < 2:
+        raise ValueError(f"ENN action set must be a 2-D array with >=2 rows; got {actions.shape}")
+    mapping = meta.get("class_mapping", {})
+    if not isinstance(mapping, dict) or not mapping:
+        raise ValueError("ENN metadata class_mapping is missing or empty")
+    for old_id, new_id in mapping.items():
+        old_id = int(old_id)
+        new_id = int(new_id)
+        if not 0 <= old_id < len(actions):
+            raise ValueError(
+                f"ENN class_mapping action id {old_id} is outside action set with {len(actions)} rows"
+            )
+        if not 0 <= new_id < num_classes:
+            raise ValueError(
+                f"ENN class_mapping class id {new_id} is outside [0, {num_classes - 1}]"
+            )
+    return {
+        "input_dim": input_dim,
+        "num_classes": num_classes,
+        "action_count": int(len(actions)),
+        "calibration_rows": int(len(total_ref)),
+    }
+
+
+def _validate_analysis_csv() -> Dict[str, int]:
+    import pandas as pd
+    from src.train_classifier import ANALYSIS_REQUIRED_COLUMNS
+
+    frame = pd.read_csv(ANALYSIS_PATH)
+    if frame.empty:
+        raise ValueError("analysis CSV is empty")
+    missing = sorted(ANALYSIS_REQUIRED_COLUMNS - set(frame.columns))
+    if missing:
+        raise ValueError("analysis CSV is missing columns: " + ", ".join(missing))
+    return {"rows": int(len(frame)), "columns": int(len(frame.columns))}
+
+
+def _validate_classifier() -> Dict[str, int]:
+    import joblib
+    from src.train_classifier import CLASSIFIER_FEATURES
+
+    model = joblib.load(CLASSIFIER_PATH)
+    input_dim = int(getattr(model, "n_features_in_", -1))
+    if input_dim != len(CLASSIFIER_FEATURES):
+        raise ValueError(
+            f"classifier input width is {input_dim}; expected {len(CLASSIFIER_FEATURES)}"
+        )
+    meta = json.loads(CLASSIFIER_METADATA_PATH.read_text(encoding="utf-8"))
+    if meta.get("features") != CLASSIFIER_FEATURES:
+        raise ValueError("classifier metadata feature order does not match the trained feature contract")
+    threshold = float(meta.get("decision_threshold", -1))
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError(f"invalid classifier decision threshold {threshold}")
+    line_map = meta.get("line_map")
+    if not isinstance(line_map, dict) or not line_map:
+        raise ValueError("classifier metadata line_map is missing or empty")
+    encoded = sorted(int(value) for value in line_map.values())
+    if encoded != list(range(len(encoded))):
+        raise ValueError("classifier metadata line_map values must be contiguous from 0")
+    return {"input_dim": input_dim, "line_count": len(line_map)}
+
+
+def _write_stage_provenance(
+    stage: str,
+    primary: Path,
+    outputs: Iterable[Path],
+    dimensions: Dict[str, int],
+    adopted: bool = False,
+) -> None:
+    write_provenance(
+        provenance_path(primary), stage, ENV_NAME, AGENT_NAME,
+        outputs, dimensions, adopted=adopted,
+    )
+
+
+def _print_preflight(rows: List[tuple[str, ArtifactStatus, str]]) -> None:
+    print("\n  PIPELINE PREFLIGHT")
+    print(f"  Environment : {ENV_NAME} ({ENV_DIR.resolve()})")
+    print(f"  Agent       : {AGENT_NAME}")
+    print(f"  Assets      : {Path(CFG.AGENT_PATH).resolve()}")
+    print(f"  Artifacts   : {PIPELINE_DIR.resolve()}")
+    print(f"\n  {'Stage':24} {'Status':20} Action")
+    print(f"  {'-' * 24} {'-' * 20} {'-' * 24}")
+    for stage, status, action in rows:
+        print(f"  {stage:24} {status.value:20} {action}")
+
+
 def run_training_pipeline(verbose: bool = False) -> None:
-    """
-    Manages the execution flow of the full training pipeline, checking
-    for existing artifacts to avoid redundant and expensive computations.
-    """
-    print("\n[MODE] INITIALIZING FULL TRAINING PIPELINE")
+    """Validate, adopt, reuse, or train each pipeline artifact stage."""
+    print("\n[MODE] INITIALIZING ENVIRONMENT-AWARE TRAINING PIPELINE")
+    _validate_agent_assets()
+    expected = _inspect_environment()
 
-    if not (os.path.exists(CFG.MODEL_MEAN_PATH) and os.path.exists(CFG.MODEL_ALEATORIC_PATH)):
-        execute_module("src/train_forecast.py", verbose=verbose)
+    data_sidecar = provenance_path(FORECAST_DATA_PRIMARY)
+    data_check = _check_with_validator(
+        FORECAST_DATA_PATHS, data_sidecar, lambda: _validate_forecast_data(expected)
+    )
+    mean_check = _check_with_validator(
+        [MEAN_MODEL_PATH], provenance_path(MEAN_MODEL_PATH),
+        lambda: _validate_regressor(MEAN_MODEL_PATH, expected),
+    )
+    aleatoric_check = _check_with_validator(
+        [ALEATORIC_MODEL_PATH], provenance_path(ALEATORIC_MODEL_PATH),
+        lambda: _validate_regressor(ALEATORIC_MODEL_PATH, expected),
+    )
+    enn_outputs = [
+        ENN_MODEL_PATH, ENN_SCALER_PATH, ENN_META_PATH, ENN_PORTABLE_META_PATH,
+        ENN_PORTABLE_SCALER_PATH, ENN_CALIBRATION_PATH, ENN_ACTION_SET_PATH,
+    ]
+    enn_check = _check_with_validator(
+        enn_outputs, provenance_path(ENN_MODEL_PATH), lambda: _validate_enn(expected)
+    )
+    analysis_check = _check_with_validator(
+        [ANALYSIS_PATH], provenance_path(ANALYSIS_PATH), _validate_analysis_csv
+    )
+    classifier_check = _check_with_validator(
+        [CLASSIFIER_PATH, CLASSIFIER_METADATA_PATH], provenance_path(CLASSIFIER_PATH), _validate_classifier
+    )
+
+    train_mean = not mean_check.reusable
+    train_aleatoric = not aleatoric_check.reusable or train_mean
+    need_forecast_data = train_mean or train_aleatoric
+    collect_forecast_data = need_forecast_data and not data_check.reusable
+    train_enn = not enn_check.reusable
+    regenerate_analysis = (
+        not analysis_check.reusable or train_mean or train_aleatoric or train_enn
+    )
+    train_classifier = not classifier_check.reusable or regenerate_analysis
+
+    def action(check: StageCheck, run: bool, verb: str) -> str:
+        if run:
+            return verb
+        if check.status == ArtifactStatus.LEGACY_ADOPTABLE:
+            return "validate and adopt"
+        return "reuse"
+
+    analysis_status = (
+        ArtifactStatus.STALE_DEPENDENCY
+        if analysis_check.reusable and (train_mean or train_aleatoric or train_enn)
+        else analysis_check.status
+    )
+    classifier_status = (
+        ArtifactStatus.STALE_DEPENDENCY
+        if classifier_check.reusable and regenerate_analysis
+        else classifier_check.status
+    )
+    data_action = action(data_check, collect_forecast_data, "collect")
+    if not need_forecast_data and not data_check.reusable:
+        data_action = "not required by reusable models"
+    _print_preflight([
+        ("Forecast data", data_check.status, data_action),
+        ("Mean forecaster", mean_check.status, action(mean_check, train_mean, "train")),
+        ("Aleatoric forecaster", aleatoric_check.status,
+         action(aleatoric_check, train_aleatoric, "train")),
+        ("ENN bundle", enn_check.status, action(enn_check, train_enn, "train")),
+        ("Analysis CSV", analysis_status,
+         action(analysis_check, regenerate_analysis, "regenerate")),
+        ("Classifier", classifier_status,
+         action(classifier_check, train_classifier, "train")),
+    ])
+    print(
+        f"\n  Dimensions: observation={expected['observation_dim']}, "
+        f"forecast_input={expected['forecast_input_dim']}, "
+        f"forecast_target={expected['forecast_target_dim']}"
+    )
+
+    # Adopt structurally compatible legacy artifacts before executing stages.
+    adoption_specs = [
+        ("forecast_data", FORECAST_DATA_PRIMARY, FORECAST_DATA_PATHS, data_check, False),
+        ("mean_forecaster", MEAN_MODEL_PATH, [MEAN_MODEL_PATH], mean_check, train_mean),
+        ("aleatoric_forecaster", ALEATORIC_MODEL_PATH, [ALEATORIC_MODEL_PATH],
+         aleatoric_check, train_aleatoric),
+        ("enn", ENN_MODEL_PATH, enn_outputs, enn_check, train_enn),
+        ("analysis", ANALYSIS_PATH, [ANALYSIS_PATH], analysis_check, regenerate_analysis),
+        ("classifier", CLASSIFIER_PATH, [CLASSIFIER_PATH, CLASSIFIER_METADATA_PATH], classifier_check, train_classifier),
+    ]
+    for stage, primary, outputs, check, will_run in adoption_specs:
+        if check.status == ArtifactStatus.LEGACY_ADOPTABLE and not will_run:
+            print(f"[ADOPT] {stage}: structurally valid legacy artifact for {ENV_NAME}/{AGENT_NAME}")
+            _write_stage_provenance(stage, primary, outputs, check.dimensions, adopted=True)
+
+    scheduled = [
+        ("forecast_data", FORECAST_DATA_PRIMARY, collect_forecast_data),
+        ("mean_forecaster", MEAN_MODEL_PATH, train_mean),
+        ("aleatoric_forecaster", ALEATORIC_MODEL_PATH, train_aleatoric),
+        ("enn", ENN_MODEL_PATH, train_enn),
+        ("analysis", ANALYSIS_PATH, regenerate_analysis),
+        ("classifier", CLASSIFIER_PATH, train_classifier),
+    ]
+    for stage, primary, will_run in scheduled:
+        if will_run:
+            mark_provenance_stale(
+                provenance_path(primary), stage, ENV_NAME, AGENT_NAME,
+                "stage scheduled to run",
+            )
+
+    if collect_forecast_data:
+        force_train = not _forecast_pair_valid(
+            Path(CFG.X_TRAIN_PATH), Path(CFG.Y_TRAIN_PATH), expected
+        ) or data_check.status == ArtifactStatus.INCOMPATIBLE
+        force_test = not _forecast_pair_valid(
+            Path(CFG.X_TEST_PATH), Path(CFG.Y_TEST_PATH), expected
+        ) or data_check.status == ArtifactStatus.INCOMPATIBLE
+        args = ["--stage", "data"]
+        if force_train:
+            args.append("--force-train-data")
+        if force_test:
+            args.append("--force-test-data")
+        execute_module("src/train_forecast.py", verbose=verbose, module_args=args)
+        dimensions = _validate_forecast_data(expected)
+        _write_stage_provenance(
+            "forecast_data", FORECAST_DATA_PRIMARY, FORECAST_DATA_PATHS, dimensions
+        )
+    elif need_forecast_data and not data_check.reusable:
+        raise RuntimeError(f"Forecast data is required but invalid: {data_check.reason}")
+
+    if train_mean:
+        execute_module(
+            "src/train_forecast.py", verbose=verbose, module_args=["--stage", "mean"]
+        )
+        dimensions = _validate_regressor(MEAN_MODEL_PATH, expected)
+        _write_stage_provenance("mean_forecaster", MEAN_MODEL_PATH, [MEAN_MODEL_PATH], dimensions)
     else:
-        print(f"  SKIP: Forecast models already exist at {PIPELINE_MODEL_DIR}")
+        print(f"  SKIP: valid mean forecaster at {MEAN_MODEL_PATH}")
 
-    if not os.path.exists(CFG.MODEL_ENN_PATH):
+    if train_aleatoric:
+        execute_module(
+            "src/train_forecast.py", verbose=verbose, module_args=["--stage", "aleatoric"]
+        )
+        dimensions = _validate_regressor(ALEATORIC_MODEL_PATH, expected)
+        _write_stage_provenance(
+            "aleatoric_forecaster", ALEATORIC_MODEL_PATH,
+            [ALEATORIC_MODEL_PATH], dimensions,
+        )
+    else:
+        print(f"  SKIP: valid aleatoric forecaster at {ALEATORIC_MODEL_PATH}")
+
+    if train_enn:
+        tutor_available = all(Path(p).is_file() for p in (CFG.TRAIN_FILE, CFG.VAL_FILE, CFG.TEST_FILE))
+        if tutor_available:
+            print("[ENN] Tutor splits found; using them as the preferred ENN data source.")
+        else:
+            print("[ENN] Tutor splits not found; the configured agent will be executed to collect ENN rollouts.")
         execute_module("src/training_enn.py", verbose=verbose)
+        dimensions = _validate_enn(expected)
+        _write_stage_provenance("enn", ENN_MODEL_PATH, enn_outputs, dimensions)
     else:
-        print(f"  SKIP: ENN model already exists at {CFG.MODEL_ENN_PATH}")
+        print(f"  SKIP: valid ENN bundle at {PIPELINE_MODEL_DIR}")
 
-    if not os.path.exists(CFG.CSV_OUTPUT_PATH):
+    if regenerate_analysis:
         execute_module("src/collect_data.py", verbose=verbose)
+        dimensions = _validate_analysis_csv()
+        _write_stage_provenance("analysis", ANALYSIS_PATH, [ANALYSIS_PATH], dimensions)
     else:
-        print(f"  SKIP: Data already collected at {CFG.CSV_OUTPUT_PATH}")
+        print(f"  SKIP: valid analysis data at {ANALYSIS_PATH}")
 
-    execute_module("src/train_classifier.py", verbose=verbose)
+    if train_classifier:
+        execute_module("src/train_classifier.py", verbose=verbose)
+        dimensions = _validate_classifier()
+        _write_stage_provenance(
+            "classifier", CLASSIFIER_PATH, [CLASSIFIER_PATH, CLASSIFIER_METADATA_PATH], dimensions
+        )
+    else:
+        print(f"  SKIP: valid classifier at {CLASSIFIER_PATH}")
 
 
 # =============================================================================
@@ -416,13 +712,20 @@ def run_llm_rule_inference(verbose: bool = False) -> None:
     """
     configure_verbosity(verbose)
 
-    import grid2op
     import joblib
+    import numpy as np
+    import grid2op
     from lightsim2grid import LightSimBackend
     from grid2op.Reward import L2RPNReward
-    from curriculumagent.baseline.baseline import CurriculumAgent
+    from src.agent_runtime import build_agent, call_agent
 
     # Local imports (src/ is on PYTHONPATH when run via run_pipeline.py)
+    import training_enn
+    training_enn._scaler_path = lambda: str(PIPELINE_MODEL_DIR / ("scaler_" + ENV_NAME + "_enn.pkl"))
+    training_enn._best_weights_path = lambda: str(PIPELINE_MODEL_DIR / ("enn_best_" + ENV_NAME + ".pth"))
+    training_enn._meta_path = lambda: str(PIPELINE_MODEL_DIR / ("enn_meta_" + ENV_NAME + ".json"))
+    load_trained_enn = training_enn.load_trained_enn
+    get_uncertainty = training_enn.get_uncertainty
     from src.utils import compute_grid_stats
     from src.collect_data import get_features_with_history
     from src.rule_predictor import RulePredictor
@@ -430,60 +733,28 @@ def run_llm_rule_inference(verbose: bool = False) -> None:
     # ------------------------------------------------------------------
     # Configuration
     # ------------------------------------------------------------------
+    rules_dir      = getattr(CFG, "LLM_RULES_DIR",     "llm_rules_results/temp_0.5")
     episode_seed   = getattr(CFG, "LLM_RULES_EPISODE",  getattr(CFG, "PROBA_TEST_EPISODE_ID", 50))
     analysis_every = getattr(CFG, "ANALYSIS_STEP",       20)   # analyse every N steps
-    try:
-        rules_dir = _resolve_llm_rules_dir()
-        enn_bundle, enn_paths, _ = _llm_enn_paths()
-    except Exception as e:
-        print(f"\n[MODE] LLM RULE INFERENCE")
-        print(f"  [ERROR] {e}")
-        sys.exit(1)
 
     print(f"\n[MODE] LLM RULE INFERENCE")
-    print(f"  Rules directory : {_display_path(rules_dir)}")
-    print(f"  Rule files      : {_count_rule_files(rules_dir)}")
+    print(f"  Rules directory : {rules_dir}")
     print(f"  Episode seed    : {episode_seed}")
     print(f"  Analysis every  : {analysis_every} steps")
-    print(f"  ENN bundle      : {enn_bundle}")
-    print(f"  Mean forecaster : {_file_status(Path(CFG.MODEL_MEAN_PATH))}")
-    print(f"  Aleatoric model : {_file_status(Path(CFG.MODEL_ALEATORIC_PATH))}")
-    for label in ("weights", "metadata", "scaler", "actions"):
-        print(f"  ENN {label:8s}: {_file_status(enn_paths[label])}")
 
     # ------------------------------------------------------------------
     # Load models
     # ------------------------------------------------------------------
     print("\n  Loading models...")
     try:
-        for path in (Path(CFG.MODEL_MEAN_PATH), Path(CFG.MODEL_ALEATORIC_PATH)):
-            if not path.is_file() or path.stat().st_size == 0:
-                raise FileNotFoundError(f"Missing or empty forecast model: {_display_path(path)}")
         model_predict   = joblib.load(CFG.MODEL_MEAN_PATH)
         model_aleatoric = joblib.load(CFG.MODEL_ALEATORIC_PATH)
-        model_enn, enn_scaler, enn_info = _load_llm_enn_bundle()
-        get_uncertainty = _make_scaled_uncertainty_fn(enn_scaler)
+        model_enn       = load_trained_enn()
         print("  All models loaded successfully.")
-        print(
-            "  ENN dimensions  : "
-            f"input_dim={enn_info['checkpoint_dimensions']['input_dim']}, "
-            f"num_classes={enn_info['checkpoint_dimensions']['num_classes']}, "
-            f"actions_shape={enn_info['actions_shape']}"
-        )
     except Exception as e:
         print(f"  [ERROR] Could not load models: {e}")
-        print("  Run the training pipeline first, or check the selected LLM ENN bundle paths above.")
+        print("  Run the training pipeline first (TRAIN_MODE=True).")
         sys.exit(1)
-
-    # ------------------------------------------------------------------
-    # Simulation episode
-    # ------------------------------------------------------------------
-    env   = grid2op.make(CFG.ENV_NAME, reward_class=L2RPNReward, backend=LightSimBackend())
-    agent = CurriculumAgent(env.action_space, env.observation_space, name="CA")
-    try:
-        agent.load(CFG.AGENT_PATH)
-    except Exception:
-        print("  [WARN] Agent could not be loaded — using do-nothing fallback.")
 
     # ------------------------------------------------------------------
     # Instantiate RulePredictor  (once — reused across all steps)
@@ -491,7 +762,7 @@ def run_llm_rule_inference(verbose: bool = False) -> None:
     observations_array = []   # accumulated observations for the episode
 
     rule_predictor = RulePredictor(
-        rules_dir=str(rules_dir),
+        rules_dir=rules_dir,
         model_predict=model_predict,
         model_aleatoric=model_aleatoric,
         model_enn=model_enn,
@@ -499,7 +770,6 @@ def run_llm_rule_inference(verbose: bool = False) -> None:
         compute_grid_stats_fn=compute_grid_stats,
         get_uncertainty_fn=get_uncertainty,
         get_features_with_history_fn=get_features_with_history,
-        action_space=env.action_space,
     )
 
     # Print all rule sentences at startup (useful for the paper table)
@@ -512,9 +782,17 @@ def run_llm_rule_inference(verbose: bool = False) -> None:
             print(f"\n  [{line_name}]\n  {sentence}")
         print(f"\n{'=' * 70}\n")
     else:
-        print(f"  [ERROR] No usable rules loaded from '{_display_path(rules_dir)}'.")
-        env.close()
-        sys.exit(1)
+        print(f"  [WARN] No rules found in '{rules_dir}'. Check the path.")
+
+    # ------------------------------------------------------------------
+    # Simulation episode
+    # ------------------------------------------------------------------
+    env = grid2op.make(CFG.ENV_NAME, reward_class=L2RPNReward, backend=LightSimBackend())
+    agent = build_agent(
+        env,
+        factory_spec=getattr(CFG, "AGENT_FACTORY", None) or None,
+        agent_path=None if getattr(CFG, "AGENT_FACTORY", None) else CFG.AGENT_PATH,
+    )
 
     obs  = env.reset(seed=episode_seed)
     done = False
@@ -555,7 +833,7 @@ def run_llm_rule_inference(verbose: bool = False) -> None:
                     print(f"      {result['sentence']}")
 
         try:
-            action = agent.act(obs, reward, done)
+            action = call_agent(agent, obs, reward, done)
         except Exception:
             action = env.action_space({})
 
@@ -599,7 +877,6 @@ def main(verbose: bool = False) -> None:
     configure_verbosity(verbose)
 
     environment_name = getattr(CFG, "ENV_NAME", "UNKNOWN")
-    llm_rule_mode = bool(getattr(CFG, "LLM_RULE_MODE", LLM_RULE_MODE) or LLM_RULE_MODE)
     print(f"  CONFIGURATION: ENV={environment_name}")
 
     if TRAIN_MODE:
@@ -608,7 +885,7 @@ def main(verbose: bool = False) -> None:
         execute_module("src/collect_data.py", verbose=verbose)
     elif PREDICT_PROBA_MODE:
         execute_module("src/train_classifier.py", verbose=verbose)
-    elif llm_rule_mode:
+    elif LLM_RULE_MODE:
         run_llm_rule_inference(verbose=verbose)
     else:
         print("\n  WARNING: No active execution mode selected in src/config.py.")

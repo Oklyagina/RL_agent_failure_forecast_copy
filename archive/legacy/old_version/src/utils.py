@@ -4,10 +4,7 @@ import datetime
 from typing import Tuple, List, Dict, Any, Optional
 
 # Import the active configuration
-try:
-    from .config import CFG
-except ImportError:
-    from config import CFG
+from config import CFG
 
 def convert_to_cos_sin(value: int, period: int) -> Tuple[float, float]:
     val_cos = np.cos(2 * np.pi * value / period)
