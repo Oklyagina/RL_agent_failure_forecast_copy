@@ -10,12 +10,6 @@ Outputs (in --out-dir):
                                  (identity: label k == curated action k)
     enn_pctile_calib.npz         percentile calibration reference
 
-NOTE(margarida): the loss below is the standard evidential-classification
-objective (Bayes-risk cross-entropy + annealed KL to the uniform Dirichlet,
-Sensoy et al. 2018). If the CurriculumAgent ENN was trained with a different
-objective or schedule, align this file with the original training script so
-both ENNs are comparable.
-
 Usage:
     python training/train_enn.py
 """
