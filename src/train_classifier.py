@@ -1,27 +1,32 @@
-import os
+"""Training utilities for the line-disconnection failure classifier."""
+from __future__ import annotations
+
 import json
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
 import joblib
+import numpy as np
 import optuna
 import pandas as pd
-import numpy as np
-
-from typing import Tuple, List, Any, Dict
-from sklearn.model_selection import StratifiedKFold, train_test_split
+from optuna.samplers import TPESampler
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
-# Local imports (support both ``python src/train_classifier.py`` and package imports)
 try:
     from .config import CFG, TRAIN_MODE, PREDICT_PROBA_MODE
-except ImportError:
+except ImportError:  # pragma: no cover
     from config import CFG, TRAIN_MODE, PREDICT_PROBA_MODE
-from project_config import AGENT_NAME, ENV_NAME
 
-# ==============================================================================
-# DYNAMIC LINE MAPPING
-# ==============================================================================
-# Deterministic encoding: maps line names to integers based on the central config.
-LINE_MAP: Dict[str, int] = {line: idx for idx, line in enumerate(CFG.LINES_TO_TEST)}
+try:
+    from project_config import AGENT_NAME, ENV_NAME
+except ImportError:  # pragma: no cover
+    AGENT_NAME, ENV_NAME = "agent", str(getattr(CFG, "ENV_NAME", "environment"))
+
+
+LINE_MAP: Dict[str, int] = {str(line).replace("line_", ""): idx for idx, line in enumerate(CFG.LINES_TO_TEST)}
 
 CLASSIFIER_FEATURES = [
     "line_id_encoded", "sum_load_p", "sum_load_q", "sum_gen_p",
@@ -38,73 +43,75 @@ ANALYSIS_REQUIRED_COLUMNS = {
       if feature not in {"line_id_encoded", "load_gen_ratio"}),
 }
 
-# ==============================================================================
-# DATA PREPARATION & METRICS
-# ==============================================================================
+
+def normalize_line_name(line: Any) -> str:
+    return str(line).replace("line_", "")
+
+
+def encode_line(line: Any, line_map: Optional[Dict[str, int]] = None) -> int:
+    mapping = LINE_MAP if line_map is None else line_map
+    return int(mapping.get(normalize_line_name(line), -1))
+
 
 def load_and_prep_data(filepath: str) -> pd.DataFrame:
-    """Loads the CSV dataset, handles missing values, and encodes categorical features."""
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Dataset not found at: {filepath}")
-
     df = pd.read_csv(filepath)
+    missing = sorted(ANALYSIS_REQUIRED_COLUMNS - set(df.columns))
+    if missing:
+        raise ValueError("Dataset is missing required columns: " + ", ".join(missing))
+    if df["line_disconnected"].isna().any():
+        raise ValueError("'line_disconnected' contains missing values.")
 
-    df["line_id_encoded"] = df["line_disconnected"].map(LINE_MAP)
-
-    unknown_lines = df["line_id_encoded"].isna()
-    if unknown_lines.any():
-        unknown = df.loc[unknown_lines, "line_disconnected"].unique().tolist()
-        print(f"[WARNING] Unmapped lines found (encoded as -1): {unknown}")
-        df["line_id_encoded"] = df["line_id_encoded"].fillna(-1)
-
-    df["line_id_encoded"] = df["line_id_encoded"].astype(int)
+    # Derive the encoding from the actual training data instead of assuming the
+    # original 36-bus line list.  Stable first-seen order keeps artifacts
+    # reproducible while allowing the classifier to be used on another Grid2Op
+    # environment / contingency set.
+    line_names = [normalize_line_name(value) for value in df["line_disconnected"]]
+    line_map: Dict[str, int] = {}
+    for name in line_names:
+        if name not in line_map:
+            line_map[name] = len(line_map)
+    df["line_id_encoded"] = pd.Series(line_names, index=df.index).map(line_map).astype(int)
     df["load_gen_ratio"] = df["sum_load_p"] / (df["sum_gen_p"] + 1e-6)
-    df["label"] = df["failed"].astype(int)
+    df["label"] = pd.to_numeric(df["failed"], errors="raise").astype(int)
+    invalid_labels = sorted(set(df["label"].unique()) - {0, 1})
+    if invalid_labels:
+        raise ValueError(f"'failed' must be binary 0/1; found {invalid_labels}")
 
-    cols_to_clean = [
-        "epistemic_before", "sum_load_p", "sum_load_q", "sum_gen_p",
-        "var_line_rho", "avg_line_rho", "max_line_rho", "nb_rho_ge_0.95",
-        "aleatoric_load_p_mean", "aleatoric_load_q_mean", "aleatoric_gen_p_mean",
-        "load_gen_ratio", "epistemic_after"
-    ]
-
-    for col in cols_to_clean:
+    # HistGradientBoosting supports NaNs natively; only remove infinities.
+    for col in CLASSIFIER_FEATURES:
         if col in df.columns:
-            df[col] = df[col].replace([np.inf, -np.inf], 0).fillna(0)
-
+            df[col] = pd.to_numeric(df[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+    df.attrs["line_map"] = line_map
     return df
 
+
 def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, np.ndarray]:
-    """Calculates False Alarm (FA) rate, Oversight (OVR) rate, and Confusion Matrix."""
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
+    fa_rate = (fp / (tn + fp) * 100.0) if (tn + fp) else 0.0
+    oversight_rate = (fn / (tp + fn) * 100.0) if (tp + fn) else 0.0
+    return fa_rate, oversight_rate, cm
 
-    denom_fa = tn + fp
-    fa_rate = (fp / denom_fa * 100.0) if denom_fa > 0 else 0.0
-
-    denom_ovr = tp + fn
-    ovr_rate = (fn / denom_ovr * 100.0) if denom_ovr > 0 else 0.0
-
-    return fa_rate, ovr_rate, cm
-
-
-# ==============================================================================
-# OPTUNA HYPERPARAMETER TUNING
-# ==============================================================================
 
 def decode_class_weight(choice: str):
-    """Safely decodes string representations of class weights into dictionaries."""
-    if choice == "none": return None
-    if choice == "balanced": return "balanced"
-    if choice == "w3": return {0: 1, 1: 3}
-    if choice == "w5": return {0: 1, 1: 5}
-    if choice == "w10": return {0: 1, 1: 10}
-    raise ValueError(f"Unknown class_weight_choice: {choice}")
+    choices = {
+        "none": None,
+        "balanced": "balanced",
+        "w3": {0: 1, 1: 3},
+        "w5": {0: 1, 1: 5},
+        "w10": {0: 1, 1: 10},
+    }
+    if choice not in choices:
+        raise ValueError(f"Unknown class_weight_choice: {choice}")
+    return choices[choice]
+
 
 def build_model_params(trial: optuna.Trial) -> Tuple[Dict[str, Any], float]:
-    """Defines the search space for the HistGradientBoostingClassifier."""
-    class_weight_choice = trial.suggest_categorical("class_weight_choice", ["none", "balanced", "w3", "w5", "w10"])
-
+    class_weight_choice = trial.suggest_categorical(
+        "class_weight_choice", ["none", "balanced", "w3", "w5", "w10"]
+    )
     params = {
         "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.2, log=True),
         "max_iter": trial.suggest_int("max_iter", 100, 800),
@@ -112,140 +119,169 @@ def build_model_params(trial: optuna.Trial) -> Tuple[Dict[str, Any], float]:
         "min_samples_leaf": trial.suggest_int("min_samples_leaf", 10, 100),
         "l2_regularization": trial.suggest_float("l2_regularization", 1e-6, 5.0, log=True),
         "class_weight": decode_class_weight(class_weight_choice),
-        "random_state": 42
+        "random_state": 42,
     }
-
     threshold = trial.suggest_float("threshold", 0.10, 0.90)
     return params, threshold
 
-def objective(trial: optuna.Trial, X_train: pd.DataFrame, y_train: pd.Series,
-              cat_indices: List[int], X_val: pd.DataFrame, y_val: pd.Series) -> float:
-    """
-    Optuna objective function. Trains models using Stratified K-Fold and
-    evaluates using a custom risk metric: 0.4 * False Alarm + 0.6 * Oversight.
-    """
+
+def _failure_probability(model: Any, X: pd.DataFrame) -> np.ndarray:
+    proba = np.asarray(model.predict_proba(X), dtype=float)
+    classes = np.asarray(getattr(model, "classes_", [0, 1]))
+    matches = np.where(classes == 1)[0]
+    if len(matches) != 1:
+        raise ValueError(f"Classifier classes {classes.tolist()} do not contain failure class 1 exactly once.")
+    return proba[:, int(matches[0])]
+
+
+def objective(
+    trial: optuna.Trial,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    cat_indices: Optional[List[int]],
+) -> float:
+    """Cross-validated risk objective using the *trial threshold* correctly."""
     params, threshold = build_model_params(trial)
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    class_counts = y_train.value_counts()
+    min_count = int(class_counts.min()) if len(class_counts) > 1 else 0
+    n_splits = min(5, min_count)
+    if n_splits < 2:
+        raise ValueError("Classifier training needs at least two samples of each class for CV.")
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
     scores = []
-
-    for train_idx, _ in skf.split(X_train, y_train):
-        X_tr = X.iloc[train_idx]
-        y_tr = y.iloc[train_idx]
-
+    for train_idx, val_idx in skf.split(X_train, y_train):
+        X_tr, y_tr = X_train.iloc[train_idx], y_train.iloc[train_idx]
+        X_va, y_va = X_train.iloc[val_idx], y_train.iloc[val_idx]
         model = HistGradientBoostingClassifier(categorical_features=cat_indices, **params)
         model.fit(X_tr, y_tr)
-
-        preds = model.predict(X_val)
-
-        # Calculate custom risk metric: Heavily penalize oversights (missing a failure)
-        fa, ovr, _ = calculate_metrics(y_val.to_numpy(), preds)
-        custom_loss = 0.4 * fa + 0.6 * ovr
-
-        scores.append(custom_loss)
-
+        probs = _failure_probability(model, X_va)
+        preds = (probs >= threshold).astype(int)
+        fa, oversight, _ = calculate_metrics(y_va.to_numpy(), preds)
+        scores.append(0.4 * fa + 0.6 * oversight)
     return float(np.mean(scores))
 
-def save_best_metadata(save_dir: str, config_name: str, model_params: Dict[str, Any], threshold: float) -> None:
-    """Saves the best hyperparameters as a JSON artifact for traceability."""
-    os.makedirs(save_dir, exist_ok=True)
 
-    # class_weight might not be JSON serializable natively if it's a dict with int keys
-    safe_params = model_params.copy()
+def classifier_metadata_path(model_path: str | Path) -> Path:
+    return Path(model_path).with_name("classifier_metadata.json")
+
+
+def save_metadata(
+    model_path: str | Path,
+    model_params: Dict[str, Any],
+    threshold: float,
+    line_map: Optional[Dict[str, int]] = None,
+    metrics: Optional[Dict[str, Any]] = None,
+) -> Path:
+    safe_params = dict(model_params)
     if isinstance(safe_params.get("class_weight"), dict):
         safe_params["class_weight"] = {str(k): v for k, v in safe_params["class_weight"].items()}
-
-    metadata = {
-        "environment": ENV_NAME,
-        "agent": AGENT_NAME,
-        "best_model_params": safe_params,
-        "best_threshold": threshold,
+    payload = {
+        "environment": str(ENV_NAME),
+        "agent": str(AGENT_NAME),
+        "features": CLASSIFIER_FEATURES,
+        "line_map": LINE_MAP if line_map is None else line_map,
+        "failure_class": 1,
+        "decision_threshold": float(threshold),
+        "model_params": safe_params,
+        "metrics": metrics or {},
     }
-    save_path = os.path.join(save_dir, f"classifier_metadata_{config_name}.json")
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=2)
+    path = classifier_metadata_path(model_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
 
 
-# ==============================================================================
-# MAIN EXECUTION
-# ==============================================================================
+def train_failure_classifier(
+    dataframe: pd.DataFrame,
+    *,
+    model_path: str | Path,
+    n_trials: int = 100,
+    seed: int = 42,
+) -> Tuple[Any, dict]:
+    missing = [feature for feature in CLASSIFIER_FEATURES if feature not in dataframe.columns]
+    if missing:
+        raise ValueError("Missing classifier features: " + ", ".join(missing))
+    if "label" not in dataframe.columns:
+        raise ValueError("Prepared classifier dataframe must contain 'label'.")
+
+    X = dataframe[CLASSIFIER_FEATURES].copy()
+    y = dataframe["label"].astype(int)
+    if y.nunique() < 2:
+        raise ValueError("Failure classifier requires both success (0) and failure (1) examples.")
+    if int(y.value_counts().min()) < 3:
+        raise ValueError(
+            "Failure classifier needs at least three examples of each class so the "
+            "hold-out split and cross-validation both contain success/failure examples."
+        )
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.20, random_state=seed, stratify=y
+    )
+    cat_indices = [CLASSIFIER_FEATURES.index("line_id_encoded")]
+
+    study = optuna.create_study(direction="minimize", sampler=TPESampler(seed=seed))
+    study.optimize(
+        lambda trial: objective(trial, X_train, y_train, cat_indices),
+        n_trials=int(n_trials),
+        n_jobs=1,
+        show_progress_bar=False,
+    )
+
+    best = dict(study.best_params)
+    threshold = float(best.pop("threshold"))
+    class_weight = decode_class_weight(best.pop("class_weight_choice"))
+    final_params = {**best, "class_weight": class_weight, "random_state": seed}
+
+    model = HistGradientBoostingClassifier(
+        categorical_features=cat_indices, **final_params
+    )
+    model.fit(X_train, y_train)
+    probs = _failure_probability(model, X_test)
+    preds = (probs >= threshold).astype(int)
+    fa, oversight, cm = calculate_metrics(y_test.to_numpy(), preds)
+    try:
+        auc = float(roc_auc_score(y_test, probs))
+    except ValueError:
+        auc = float("nan")
+    metrics = {
+        "false_alarm_pct": fa,
+        "oversight_pct": oversight,
+        "roc_auc": auc,
+        "confusion_matrix": cm.tolist(),
+        "test_rows": int(len(y_test)),
+    }
+
+    model_path = Path(model_path)
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, model_path)
+    trained_line_map = {
+        str(k): int(v) for k, v in dataframe.attrs.get("line_map", LINE_MAP).items()
+    }
+    metadata_path = save_metadata(
+        model_path, final_params, threshold, line_map=trained_line_map, metrics=metrics
+    )
+    return model, {"threshold": threshold, "metadata_path": str(metadata_path), **metrics}
+
 
 if __name__ == "__main__":
-
     if TRAIN_MODE:
-        try:
-            df = load_and_prep_data(CFG.CSV_OUTPUT_PATH)
-        except FileNotFoundError:
-            print(f"[ERROR] Data file not found at {CFG.CSV_OUTPUT_PATH}.")
-            raise SystemExit(1)
-
-        # Define the features
-        features = CLASSIFIER_FEATURES
-
-        config_name = "All features"
-
-        models_dir = os.path.dirname(CFG.MODEL_CLASSIFIER_PATH)
-
-        print(f"\n{'=' * 60}")
-        print(f"[INFO] Optimizing and Training Final Production Strategy: {config_name}")
-        print(f"{'=' * 60}")
-
-        missing = [f for f in features if f not in df.columns]
-        if missing:
-            print(f"[FATAL ERROR] Missing features in dataset: {missing}")
-            raise SystemExit(1)
-
-        X = df[features].copy()
-        y = df["label"].copy()
-
-        X_train, X_temp, y_train, y_temp = train_test_split(
-            X, y, test_size=0.3, random_state=42, stratify=y
+        df = load_and_prep_data(CFG.CSV_OUTPUT_PATH)
+        n_trials = int(getattr(CFG, "CLASSIFIER_OPTUNA_TRIALS", 100))
+        _, info = train_failure_classifier(
+            df,
+            model_path=CFG.MODEL_CLASSIFIER_PATH,
+            n_trials=n_trials,
         )
-
-        X_val, X_test, y_val, y_test = train_test_split(
-            X_temp, y_temp, test_size=0.5, random_state=42, stratify=y_temp
+        print(f"[SAVE] Failure classifier: {CFG.MODEL_CLASSIFIER_PATH}")
+        print(f"[SAVE] Metadata: {info['metadata_path']}")
+        print(
+            f"[TEST] FA={info['false_alarm_pct']:.2f}% | "
+            f"oversight={info['oversight_pct']:.2f}% | AUC={info['roc_auc']:.3f}"
         )
-
-        cat_indices = [features.index('line_id_encoded')] if 'line_id_encoded' in features else None
-
-        # --- OPTUNA OPTIMIZATION ---
-        print(f"[OPTUNA] Starting hyperparameter search (Cross-Validation)")
-
-        study = optuna.create_study(direction="minimize")
-        study.optimize(
-            lambda trial: objective(trial, X_train, y_train, cat_indices, X_val, y_val),
-            n_trials=500,
-            n_jobs=-1,
-            show_progress_bar=True,
-        )
-
-        best_params = study.best_params.copy()
-        best_threshold = best_params.pop("threshold")
-        class_weight = decode_class_weight(best_params.pop("class_weight_choice"))
-
-        final_params = best_params.copy()
-        final_params["class_weight"] = class_weight
-
-        print(f"[OPTUNA] Best Custom Loss: {study.best_value:.4f}")
-        print(f"[OPTUNA] Best Parameters selected.")
-
-        print(f"[TRAIN] Fitting final model of the data...")
-        final_model = HistGradientBoostingClassifier(
-            categorical_features=cat_indices, **final_params
-        )
-        final_model.fit(X_train, y_train)
-
-        # --- SAVE ARTIFACTS ---
-        model_path = os.path.join(models_dir, CFG.MODEL_CLASSIFIER_PATH)
-        joblib.dump(final_model, model_path)
-
-        # Optionally overwrite the generic path from config so other scripts find it easily
-        joblib.dump(final_model, CFG.MODEL_CLASSIFIER_PATH)
-
-        save_best_metadata(models_dir, config_name, final_params, best_threshold)
-        print(f"[SAVE] Model and metadata saved successfully to {models_dir}")
-        print("\n[INFO] Classification training pipeline completed.")
-
     elif PREDICT_PROBA_MODE:
-        print("[INFO] PREDICT_PROBA_MODE is enabled. Single inference logic goes here.")
+        print(
+            "[INFO] Use src.failure_probability.FailureProbabilityPredictor for single-observation inference."
+        )
     else:
-        print("[INFO] Please enable TRAIN_MODE or PREDICT_PROBA_MODE in config.py")
+        print("[INFO] No classifier training mode is active.")

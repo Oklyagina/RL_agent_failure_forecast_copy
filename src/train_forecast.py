@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
 # Local imports
 from config import CFG, TRAIN_MODE
 from utils import append_to_npy
-from curriculumagent.baseline.baseline import CurriculumAgent
+from agent_runtime import build_agent, call_agent
 
 
 # =============================================================================
@@ -92,7 +92,7 @@ def get_features_with_history(observations_array: List[Any], obs: Any) -> np.nda
 # Data Collection (Target: t -> t+1)
 # =============================================================================
 
-def collect_data(env: grid2op.Environment, agent: CurriculumAgent, episode_seeds: Sequence[int],
+def collect_data(env: grid2op.Environment, agent: Any, episode_seeds: Sequence[int],
                  x_path: str, y_path: str, force: bool = False) -> None:
     """
     Executes episodes using the agent and collects state transitions for supervised learning.
@@ -118,7 +118,7 @@ def collect_data(env: grid2op.Environment, agent: CurriculumAgent, episode_seeds
             observations.append(obs)
             x = get_features_with_history(observations, obs)
 
-            action = agent.act(obs, env.reward_range[0], done)
+            action = call_agent(agent, obs, env.reward_range[0], done)
             obs_next, _, done, _ = env.step(action)
 
             if done: break
@@ -225,15 +225,16 @@ def _collect_forecast_datasets(force_train: bool = False, force_test: bool = Fal
         reward_class=L2RPNReward,
     )
 
-    agent = CurriculumAgent(env.action_space, env.observation_space, name="CA")
     try:
-        agent.load(CFG.AGENT_PATH)
-        print("[INFO] CurriculumAgent loaded.")
-    except Exception as exc:
+        agent = build_agent(
+            env,
+            factory_spec=getattr(CFG, "AGENT_FACTORY", None) or None,
+            agent_path=None if getattr(CFG, "AGENT_FACTORY", None) else CFG.AGENT_PATH,
+        )
+        print(f"[INFO] Policy agent loaded ({getattr(CFG, 'AGENT_NAME', 'agent')}).")
+    except Exception:
         env.close()
-        raise RuntimeError(
-            f"CurriculumAgent could not be loaded from {CFG.AGENT_PATH}: {exc}"
-        ) from exc
+        raise
 
     try:
         train_seeds: List[int] = list(range(0, 900))

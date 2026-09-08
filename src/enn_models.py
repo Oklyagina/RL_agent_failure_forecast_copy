@@ -34,11 +34,11 @@ class ResidualBlock(nn.Module):
 
 class EvidentialNetwork(nn.Module):
     """
-    Evidential Neural Network for evaluating CurriculumAgent states.
+    Evidential Neural Network for evaluating policy familiarity in Grid2Op states.
 
     Architecture Design Rationale:
     Kept intentionally shallow (Embedding -> 2x ResBlocks -> Head) to prevent
-    overfitting on small/noisy datasets from the Grid2Op tutor.
+    overfitting on small/noisy policy behavior-cloning datasets from Grid2Op.
     """
 
     def __init__(self, input_dim: int, num_classes: int, hidden_dim: int = 256, dropout: float = 0.05):
@@ -133,8 +133,15 @@ def calculate_epistemic_uncertainty(output: Dict[str, torch.Tensor]) -> torch.Te
     return output["uncertainty"].squeeze(-1)
 
 
-def evidential_loss(alpha: torch.Tensor, target: torch.Tensor, epoch: int, total_epochs: int,
-                    class_weights: torch.Tensor = None, lam: float = 0.05) -> torch.Tensor:
+def evidential_loss(
+    alpha: torch.Tensor,
+    target: torch.Tensor,
+    epoch: int,
+    total_epochs: int,
+    class_weights: torch.Tensor = None,
+    lam: float = 0.05,
+    anneal_epochs: int = 20,
+) -> torch.Tensor:
     """
     Evidential Loss combining Expected Cross Entropy (NLL Type II) with a KL Divergence penalty.
 
@@ -163,11 +170,14 @@ def evidential_loss(alpha: torch.Tensor, target: torch.Tensor, epoch: int, total
     # The KL term penalizes evidence on incorrect classes.
     # Warmup is critical: we must allow the network to learn basic classification
     # features before enforcing strict uncertainty bounds, otherwise we risk gradient starvation.
-    if epoch <= 20:
+    anneal_epochs = max(int(anneal_epochs), 0)
+    if epoch <= anneal_epochs:
         kl_weight = 0.0
     else:
         # Progressive annealing up to ~40% of the training duration
-        kl_weight = lam * min(1.0, (epoch - 20) / max(total_epochs * 0.4, 1))
+        kl_weight = lam * min(
+            1.0, (epoch - anneal_epochs) / max(total_epochs * 0.4, 1)
+        )
 
     # alpha_tilde removes evidence from the true class to calculate the penalty
     # solely on the incorrect classes.
