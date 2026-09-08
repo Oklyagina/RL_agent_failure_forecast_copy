@@ -80,8 +80,9 @@ The two outputs are **percentiles (0–100)** relative to a reference
 distribution. `train_enn.py` builds this calibration automatically at the
 end of training (on a sample of the scaled training states) and writes
 `enn_pctile_calib.npz` next to the other artifacts. To calibrate on a
-different reference set (e.g. specific normal-operation episodes), use the
-repository's `calibrate_uncertainty.py` instead.
+different reference set (e.g. specific normal-operation episodes), build the
+reference arrays with `recommendation_uncertainty.build_calibration()` and
+write them with `recommendation_uncertainty.save_calibration()`.
 
 ## Step 5 — Use it
 

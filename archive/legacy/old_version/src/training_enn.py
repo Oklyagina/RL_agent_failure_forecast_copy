@@ -15,9 +15,12 @@ import joblib
 from tqdm import tqdm
 
 # Centralized configuration
-from config import CFG, DEVICE, ENN_PARAMS
-
-from enn_models import EvidentialNetwork, evidential_loss
+try:
+    from .config import CFG, DEVICE, ENN_PARAMS, PROJECT_ENV_NAME
+    from .enn_models import EvidentialNetwork, evidential_loss
+except ImportError:
+    from config import CFG, DEVICE, ENN_PARAMS, PROJECT_ENV_NAME
+    from enn_models import EvidentialNetwork, evidential_loss
 
 # ==============================================================================
 # Helper Methods
@@ -25,15 +28,15 @@ from enn_models import EvidentialNetwork, evidential_loss
 
 def _scaler_path() -> str:
     """Returns the dynamic path for the StandardScaler based on the active environment."""
-    return os.path.join(os.path.dirname(CFG.MODEL_ENN_PATH), f"scaler_{CFG.ENV_NAME}_enn.pkl")
+    return str(Path(CFG.MODEL_ENN_PATH).parent / f"scaler_{PROJECT_ENV_NAME}_enn.pkl")
 
 def _best_weights_path() -> str:
     """Returns the dynamic path for saving the best model checkpoint."""
-    return os.path.join(os.path.dirname(CFG.MODEL_ENN_PATH), f"enn_best_{CFG.ENV_NAME}.pth")
+    return str(Path(CFG.MODEL_ENN_PATH).parent / f"enn_best_{PROJECT_ENV_NAME}.pth")
 
 def _meta_path() -> str:
     """Returns the dynamic path for saving model metadata (class mappings, etc.)."""
-    return os.path.join(os.path.dirname(CFG.MODEL_ENN_PATH), f"enn_meta_{CFG.ENV_NAME}.json")
+    return str(Path(CFG.MODEL_ENN_PATH).parent / f"enn_meta_{PROJECT_ENV_NAME}.json")
 
 def get_uncertainty(model: EvidentialNetwork, obs_array: np.ndarray) -> float:
     """
@@ -41,7 +44,8 @@ def get_uncertainty(model: EvidentialNetwork, obs_array: np.ndarray) -> float:
     Automatically applies the pre-fitted standard scaler.
     """
     scaler = _load_scaler()
-    obs_scaled = scaler.transform(obs_array.reshape(-1, CFG.ENN_INPUT_DIM))
+    input_dim = int(getattr(model, "input_dim", scaler.n_features_in_))
+    obs_scaled = scaler.transform(obs_array.reshape(-1, input_dim))
     obs_tensor = torch.tensor(obs_scaled, dtype=torch.float32, device=DEVICE)
 
     model.eval()
@@ -53,21 +57,39 @@ def get_uncertainty(model: EvidentialNetwork, obs_array: np.ndarray) -> float:
 
 def load_trained_enn() -> EvidentialNetwork:
     """Safely initializes and loads the pre-trained Evidential Network weights."""
+    checkpoint = None
+    for path in [_best_weights_path(), CFG.MODEL_ENN_PATH]:
+        if os.path.exists(path):
+            checkpoint = torch.load(path, map_location=DEVICE)
+            if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+                checkpoint = checkpoint["state_dict"]
+            break
+
     meta = _load_enn_meta()
-    num_classes = meta.get("num_classes", ENN_PARAMS["num_classes"])
+    if checkpoint is not None:
+        hidden_dim = checkpoint["embedding.0.weight"].shape[0]
+        input_dim = checkpoint["embedding.0.weight"].shape[1]
+        num_classes = checkpoint["head.3.bias"].shape[0]
+    else:
+        hidden_dim = ENN_PARAMS["hidden_dim"]
+        input_dim = meta.get("input_dim")
+        num_classes = meta.get("num_classes", ENN_PARAMS["num_classes"])
+
+    if checkpoint is None and input_dim is None:
+        try:
+            input_dim = int(_load_scaler().n_features_in_)
+        except (FileNotFoundError, AttributeError):
+            input_dim = ENN_PARAMS["input_dim"]
 
     model = EvidentialNetwork(
-        input_dim=ENN_PARAMS["input_dim"],
+        input_dim=int(input_dim),
         num_classes=num_classes,
-        hidden_dim=ENN_PARAMS["hidden_dim"],
+        hidden_dim=hidden_dim,
         dropout=CFG.ENN_DROPOUT,
     ).to(DEVICE)
 
-    # Try loading best weights first, fallback to final epoch weights
-    for path in [_best_weights_path(), CFG.MODEL_ENN_PATH]:
-        if os.path.exists(path):
-            model.load_state_dict(torch.load(path, map_location=DEVICE))
-            break
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint)
 
     model.eval()
     return model

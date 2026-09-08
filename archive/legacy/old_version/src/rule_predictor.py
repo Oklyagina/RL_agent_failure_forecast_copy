@@ -4,30 +4,28 @@ import ast
 import datetime
 import glob
 import os
-import sys
 import textwrap
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
-# Ensure project root is on the path so curriculumagent and src/ imports work
-_SRC_DIR  = os.path.dirname(os.path.abspath(__file__))
-_ROOT_DIR = os.path.dirname(_SRC_DIR)
-for _p in [_ROOT_DIR, _SRC_DIR]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
-
 # Project imports
 try:
-    from config import CFG
-    from utils import compute_grid_stats
-    from training_enn import get_uncertainty
-    from collect_data import get_features_with_history
+    from .config import CFG
+    from .utils import compute_grid_stats
+    from .training_enn import get_uncertainty
+    from .collect_data import get_features_with_history
 except ImportError:
-    CFG = None
-    compute_grid_stats = None
-    get_uncertainty = None
-    get_features_with_history = None
+    try:
+        from config import CFG
+        from utils import compute_grid_stats
+        from training_enn import get_uncertainty
+        from collect_data import get_features_with_history
+    except ImportError:
+        CFG = None
+        compute_grid_stats = None
+        get_uncertainty = None
+        get_features_with_history = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,6 +281,7 @@ def _run_forecast(
     get_features_with_history_fn: Callable,
     get_uncertainty_fn: Callable,
     compute_grid_stats_fn: Callable,
+    action_space: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Replicates the forecast block from analyze_disconnection_effect:
@@ -302,10 +301,11 @@ def _run_forecast(
         "aleatoric_gen_p_mean":  float("nan"),
         "fcast_grid_stats":      {},
     }
+    enn_input_dim = int(getattr(model_enn, "input_dim", cfg.ENN_INPUT_DIM))
 
     # 1. Epistemic uncertainty at t=0
     try:
-        obs_vect = obs.to_vect()[:cfg.ENN_INPUT_DIM].reshape(1, -1)
+        obs_vect = obs.to_vect()[:enn_input_dim].reshape(1, -1)
         out["epistemic_before"] = float(get_uncertainty_fn(model_enn, obs_vect))
     except Exception as e:
         print(f"[WARN] rule_predictor: epistemic_before failed: {e}")
@@ -341,13 +341,18 @@ def _run_forecast(
             }}),
         ]
 
-        sim_obs, _, _, _ = obs_copy.simulate(obs._obs_env._helper_action_env({}))
+        if action_space is not None:
+            do_nothing = action_space({})
+        else:
+            do_nothing = obs._obs_env._helper_action_env({})
+
+        sim_obs, _, _, _ = obs_copy.simulate(do_nothing)
 
         # 4. Grid statistics at t+12
         out["fcast_grid_stats"] = compute_grid_stats_fn(sim_obs)
 
         # 5. Epistemic uncertainty at t+12
-        sim_vect = sim_obs.to_vect()[:cfg.ENN_INPUT_DIM].reshape(1, -1)
+        sim_vect = sim_obs.to_vect()[:enn_input_dim].reshape(1, -1)
         out["epistemic_after"] = float(get_uncertainty_fn(model_enn, sim_vect))
 
     except Exception as e:
@@ -410,6 +415,7 @@ class RulePredictor:
         compute_grid_stats_fn: Optional[Callable] = None,
         get_uncertainty_fn: Optional[Callable] = None,
         get_features_with_history_fn: Optional[Callable] = None,
+        action_space: Optional[Any] = None,
         observations_array: Optional[List[Any]] = None,
     ):
         self.rules_dir        = rules_dir
@@ -422,6 +428,7 @@ class RulePredictor:
         self._compute_grid_stats         = compute_grid_stats_fn or compute_grid_stats
         self._get_uncertainty            = get_uncertainty_fn or get_uncertainty
         self._get_features_with_history  = get_features_with_history_fn or get_features_with_history
+        self._action_space               = action_space
 
         # Shared reference to the caller's observation list — stays in sync automatically
         self.observations_array: List[Any] = observations_array if observations_array is not None else []
@@ -545,6 +552,7 @@ class RulePredictor:
                 get_features_with_history_fn=self._get_features_with_history,
                 get_uncertainty_fn=self._get_uncertainty,
                 compute_grid_stats_fn=self._compute_grid_stats,
+                action_space=self._action_space,
             )
             fgs = fc["fcast_grid_stats"]
             features.update({

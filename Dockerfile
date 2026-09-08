@@ -19,7 +19,7 @@ RUN git clone https://github.com/AI4REALNET/grid2op-scenario.git /tmp/grid2op-sc
     && cp -r /tmp/grid2op-scenario/ai4realnet_small /root/data_grid2op/ai4realnet_small \
     && rm -rf /tmp/grid2op-scenario
 
-# NOTE: the API uses the same project_config.py settings as run_pipeline.py.
+# NOTE: the API uses project_config.py for shared settings.
 # Runtime environment variables override .env, and .env overrides defaults.
 
 # Python dependencies

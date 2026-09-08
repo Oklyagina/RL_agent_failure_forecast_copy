@@ -171,7 +171,6 @@ def _find_agent_dir() -> Path:
     candidates = [
         ASSETS_DIR / ENV_NAME,
         ASSETS_DIR / "network36",
-        ROOT / "src" / "models" / "network36",
     ]
     checked = []
     for candidate in candidates:
@@ -186,7 +185,7 @@ def _find_agent_dir() -> Path:
         checked_paths=checked,
         hint="Expected model/ and actions/ with a non-empty TensorFlow "
              "SavedModel under assets/<ENV_NAME>/, assets/network36/, or "
-             "src/models/network36/.",
+             "another active agent directory.",
     )
 
 

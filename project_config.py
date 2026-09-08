@@ -10,7 +10,7 @@ DEFAULTS = {
 
 #============= General defaults =================#
     "ENV_NAME": "ai4realnet_small",
-    "ENV_LOCATION": r"C:\Users",
+    "ENV_LOCATION": "environment",
     "AGENT_NAME": "curriculum",
     "ASSETS_DIR": "assets",
     "ARTIFACTS_DIR": "artifacts",

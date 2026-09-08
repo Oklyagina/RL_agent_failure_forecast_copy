@@ -54,7 +54,6 @@ def _candidate_agent_dirs() -> list[Path]:
     preferred = [
         ASSETS_DIR / ENV_NAME,
         ASSETS_DIR / "network36",
-        ROOT / "src" / "models" / "network36",
     ]
     base = ROOT / "curriculumagent"
     discovered = [base, *sorted(x for x in base.rglob("*") if x.is_dir())]
@@ -81,8 +80,7 @@ def make_curriculum_agent(env):
     raise FileNotFoundError(
         "no valid folder with model/ and actions/ found. Expected a "
         f"non-empty TensorFlow SavedModel under assets/{ENV_NAME}/, "
-        "assets/network36/ or "
-        f"src/models/network36/.{hint}")
+        f"assets/network36/ or another active agent directory.{hint}")
 
 
 def make_expert_agent(env):

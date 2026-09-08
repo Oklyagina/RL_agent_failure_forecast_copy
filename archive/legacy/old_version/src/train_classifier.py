@@ -11,7 +11,10 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import confusion_matrix
 
 # Local imports
-from config import CFG, TRAIN_MODE, PREDICT_PROBA_MODE
+try:
+    from .config import CFG, TRAIN_MODE, PREDICT_PROBA_MODE
+except ImportError:
+    from config import CFG, TRAIN_MODE, PREDICT_PROBA_MODE
 
 # ==============================================================================
 # DYNAMIC LINE MAPPING
@@ -217,10 +220,6 @@ if __name__ == "__main__":
         final_model.fit(X_train, y_train)
 
         # --- SAVE ARTIFACTS ---
-        model_path = os.path.join(models_dir, CFG.MODEL_CLASSIFIER_PATH)
-        joblib.dump(final_model, model_path)
-
-        # Optionally overwrite the generic path from config so other scripts find it easily
         joblib.dump(final_model, CFG.MODEL_CLASSIFIER_PATH)
 
         save_best_metadata(models_dir, config_name, final_params, best_threshold)

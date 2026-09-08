@@ -71,10 +71,9 @@ percentiles inside `kpis`:
    description is a plain serialisation — the uncertainty percentiles are added
    on top either way.
 
-2. **Environment / Grid2Op alignment.** The API now uses the same
-   `project_config.py` settings as `run_pipeline.py`: environment variables
-   override `.env`, and `.env` overrides the defaults. Configure `ENV_NAME` and
-   `ENV_LOCATION` so they resolve to the Grid2Op scenario directory:
+2. **Environment / Grid2Op alignment.** The API uses `project_config.py`:
+   environment variables override `.env`, and `.env` overrides the defaults.
+   Configure `ENV_NAME` and `ENV_LOCATION` so they resolve to the Grid2Op scenario directory:
    `<ENV_LOCATION>/<ENV_NAME>`. The `Dockerfile` sets these keys to
    `ai4realnet_small` under `/root/data_grid2op`, matching the scenario copied
    during the image build.

@@ -1,24 +1,31 @@
 import argparse
-import os
-import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+try:
+    from .config import CFG, OUTPUT_DIR_LLM, ROOT
+except ImportError:
+    from config import CFG, OUTPUT_DIR_LLM, ROOT
 
 import grid2op
 from curriculumagent.baseline.baseline import CurriculumAgent
 from lightsim2grid import LightSimBackend
 
-from config import CFG, OUTPUT_DIR_LLM, ENN_PARAMS
-from rule_predictor import RulePredictor
+try:
+    from .rule_predictor import RulePredictor
+except ImportError:
+    from rule_predictor import RulePredictor
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-EPISODE_SEED: int = 50
-RESULTS_DIR: str  = os.path.join(OUTPUT_DIR_LLM, "temp_0.8")
-HORIZON: int      = 12   # steps = 1 hour at 5 min resolution
+EPISODE_SEED: int = getattr(CFG, "LLM_RULES_EPISODE", getattr(CFG, "PROBA_TEST_EPISODE_ID", 50))
+_rules_dir = Path(getattr(CFG, "LLM_RULES_DIR", Path(OUTPUT_DIR_LLM) / "temp_0.8"))
+if not _rules_dir.is_absolute():
+    _rules_dir = ROOT / _rules_dir
+RESULTS_DIR: str = str(_rules_dir)
+HORIZON: int = 12   # steps = 1 hour at 5 min resolution
 
 from grid2op.Action import PowerlineSetAction
 from grid2op.Opponent import RandomLineOpponent
@@ -40,16 +47,23 @@ OPP_KWARGS: Dict[str, Any] = {
 def _load_models() -> Tuple[Any, Any, Any]:
     import joblib
     import torch
-    from enn_models import EvidentialNetwork
+    try:
+        from .enn_models import EvidentialNetwork
+    except ImportError:
+        from enn_models import EvidentialNetwork
 
     mp = joblib.load(CFG.MODEL_MEAN_PATH)
     ma = joblib.load(CFG.MODEL_ALEATORIC_PATH)
 
     checkpoint = torch.load(CFG.MODEL_ENN_PATH, map_location="cpu")
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        checkpoint = checkpoint["state_dict"]
     hidden_dim = checkpoint["embedding.0.weight"].shape[0]
+    input_dim = checkpoint["embedding.0.weight"].shape[1]
+    num_classes = checkpoint["head.3.bias"].shape[0]
     me = EvidentialNetwork(
-        input_dim=ENN_PARAMS["input_dim"],
-        num_classes=CFG.ENN_TOP_K,
+        input_dim=input_dim,
+        num_classes=num_classes,
         hidden_dim=hidden_dim,
         dropout=CFG.ENN_DROPOUT,
     )
@@ -108,9 +122,14 @@ def run_episode(use_attack: bool) -> None:
         print("[WARN] CurriculumAgent not loaded — using do-nothing fallback.")
 
     # Import project functions explicitly so RulePredictor has them
-    from utils import compute_grid_stats
-    from training_enn import get_uncertainty
-    from collect_data import get_features_with_history
+    try:
+        from .utils import compute_grid_stats
+        from .training_enn import get_uncertainty
+        from .collect_data import get_features_with_history
+    except ImportError:
+        from utils import compute_grid_stats
+        from training_enn import get_uncertainty
+        from collect_data import get_features_with_history
 
     # Build predictor
     observations_array: List[Any] = []

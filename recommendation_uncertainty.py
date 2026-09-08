@@ -18,7 +18,8 @@ per-action score; any other action is located in the set to obtain its index, wh
 mapped to the ENN's (remapped top-K) label via class_mapping.
 
 Two steps:
-  1) build the calibration ONCE from the ENN training data (see calibrate_uncertainty.py);
+  1) train/export the ENN bundle with training/train_enn.py, which writes the
+     percentile calibration next to the model artifacts;
   2) at run time, call assess_recommendation(obs, agent, enn, calibration) per recommendation.
 
 Per state, the ENN gives a Dirichlet over its K topology actions:

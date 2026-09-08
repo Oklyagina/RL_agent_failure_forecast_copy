@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
-from pathlib import Path
 import joblib
 import optuna
 import numpy as np
@@ -17,13 +15,13 @@ from sklearn.multioutput import MultiOutputRegressor
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_squared_error
 
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
 # Local imports
-from config import CFG, TRAIN_MODE
-from utils import append_to_npy
+try:
+    from .config import CFG, TRAIN_MODE
+    from .utils import append_to_npy
+except ImportError:
+    from config import CFG, TRAIN_MODE
+    from utils import append_to_npy
 from curriculumagent.baseline.baseline import CurriculumAgent
 
 

@@ -7,20 +7,13 @@ the final dataset for the downstream Gradient Boosting classifier.
 """
 
 import os
-import sys
 import datetime
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 from typing import List, Any, Dict
-from pathlib import Path
 from tqdm import tqdm
-
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
-if PROJECT_ROOT not in sys.path:
-    sys.path.append(PROJECT_ROOT)
 
 import grid2op
 from grid2op.Action import PowerlineSetAction
@@ -30,12 +23,22 @@ from lightsim2grid import LightSimBackend
 from grid2op.Reward import L2RPNReward
 
 # Local Imports
-from config import CFG, DEVICE, TRAIN_MODE, TEST_SINGLE_EPISODE
-from training_enn import get_uncertainty, load_trained_enn, _scaler_path
-from utils import get_features, compute_grid_stats
+try:
+    from .config import CFG, DEVICE, TRAIN_MODE, TEST_SINGLE_EPISODE
+    from .training_enn import get_uncertainty, load_trained_enn, _scaler_path
+    from .utils import get_features, compute_grid_stats
+except ImportError:
+    from config import CFG, DEVICE, TRAIN_MODE, TEST_SINGLE_EPISODE
+    from training_enn import get_uncertainty, load_trained_enn, _scaler_path
+    from utils import get_features, compute_grid_stats
 from curriculumagent.baseline.baseline import CurriculumAgent
 
 VERBOSE = os.environ.get("RUN_PIPELINE_VERBOSE", "1") == "1"
+
+
+def _model_input_dim(model: Any) -> int:
+    """Return the loaded ENN width instead of relying on a grid-specific default."""
+    return int(getattr(model, "input_dim", CFG.ENN_INPUT_DIM))
 
 
 # =============================================================================
@@ -151,7 +154,8 @@ def analyze_disconnection_effect(
     # Epistemic Uncertainty at t=0                                    #
     # ------------------------------------------------------------------ #
     try:
-        obs_vect = obs.to_vect()[:CFG.ENN_INPUT_DIM].reshape(1, -1)
+        input_dim = _model_input_dim(model_enn)
+        obs_vect = obs.to_vect()[:input_dim].reshape(1, -1)
         unc_epistemic_before = float(get_uncertainty(model_enn, obs_vect))
     except Exception as e:
         print(f"[ERROR] ENN Epistemic Calculation (Before): {e}")
@@ -196,7 +200,7 @@ def analyze_disconnection_effect(
         sim_obs_forecast, _, _, _ = obs_copy.simulate(do_nothing)
 
         fcast_grid_stats = compute_grid_stats(sim_obs_forecast)
-        sim_vect = sim_obs_forecast.to_vect()[:CFG.ENN_INPUT_DIM].reshape(1, -1)
+        sim_vect = sim_obs_forecast.to_vect()[:input_dim].reshape(1, -1)
         unc_epistemic_after = float(get_uncertainty(model_enn, sim_vect))
 
     except Exception as e:
@@ -385,7 +389,7 @@ def run_simulation_phase(
 
             if obs.current_step > 12 and obs.current_step % 20 == 0:
                 # Dimension sanity check to prevent tensor shape crashes if grid topology varies
-                if len(obs.to_vect()) == CFG.ENN_INPUT_DIM:
+                if len(obs.to_vect()) == _model_input_dim(model_enn):
                     df = analyze_disconnection_effect(
                         env, model_predict, model_aleatoric, model_enn,
                         obs, observations_array, ep, agent, scaler
