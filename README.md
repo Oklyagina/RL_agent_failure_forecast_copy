@@ -99,7 +99,7 @@ environment/ai4realnet_small/
 
 The active workflow expects a pre-trained CurriculumAgent package for the
 `ai4realnet_small` Grid2Op environment. This package is distributed through the
-project's GitHub Releases and should be unarchived under:
+project's GitHub Releases and should be placed under:
 
 ```text
 assets/ai4realnet_small/
@@ -194,8 +194,9 @@ Train and export the ENN bundle:
 python training/train_enn.py --agent-name curriculum
 ```
 
-For a different agent, add its constructor in `training/collect_rollouts.py`.
-The only required interface is `agent.act(obs, reward, done)`.
+For a different agent, configure `AGENT_FACTORY=module:function`. The factory
+receives the Grid2Op environment and must return an object exposing
+`agent.act(obs, reward, done)`.
 
 More training details are in `training/TRAINING.md`.
 
@@ -216,6 +217,8 @@ More training details are in `training/TRAINING.md`.
 |   |-- train_curriculumagent.py
 |   `-- TRAINING.md
 |-- src/
+|   |-- agent_runtime.py
+|   |-- enn_data.py
 |   `-- enn_models.py
 |-- tests/
 |   |-- validate_module.py

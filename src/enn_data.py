@@ -154,6 +154,7 @@ def collect_policy_rollouts(
     episodes: int,
     seed: int = 0,
     max_steps: Optional[int] = None,
+    progress_callback: Optional[Callable[[int, int, int], None]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Run ``agent`` and return observations, integer labels, and action vectors."""
     if episodes <= 0:
@@ -188,6 +189,8 @@ def collect_policy_rollouts(
             action_rows.append(np.asarray(action.to_vect(), dtype=np.float32))
             obs, reward, done, _ = env.step(action)
             step += 1
+        if progress_callback is not None:
+            progress_callback(episode, step, len(obs_rows))
 
     if not obs_rows:
         raise RuntimeError("Agent rollout collection produced no observation/action pairs.")

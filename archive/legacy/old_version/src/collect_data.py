@@ -7,13 +7,20 @@ the final dataset for the downstream Gradient Boosting classifier.
 """
 
 import os
+import sys
 import datetime
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 from typing import List, Any, Dict
+from pathlib import Path
 from tqdm import tqdm
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
 
 import grid2op
 from grid2op.Action import PowerlineSetAction
@@ -22,23 +29,50 @@ from grid2op.Exceptions import Grid2OpException
 from lightsim2grid import LightSimBackend
 from grid2op.Reward import L2RPNReward
 
-# Local Imports
+# Local imports.  Support both ``python src/collect_data.py`` and package-mode
+# imports such as ``from src.failure_probability import ...``.
 try:
     from .config import CFG, DEVICE, TRAIN_MODE, TEST_SINGLE_EPISODE
     from .training_enn import get_uncertainty, load_trained_enn, _scaler_path
     from .utils import get_features, compute_grid_stats
-except ImportError:
+    from .agent_runtime import build_agent, call_agent
+except ImportError:  # pragma: no cover - direct script execution
     from config import CFG, DEVICE, TRAIN_MODE, TEST_SINGLE_EPISODE
     from training_enn import get_uncertainty, load_trained_enn, _scaler_path
     from utils import get_features, compute_grid_stats
-from curriculumagent.baseline.baseline import CurriculumAgent
+    from agent_runtime import build_agent, call_agent
 
 VERBOSE = os.environ.get("RUN_PIPELINE_VERBOSE", "1") == "1"
 
 
+def _sync_cfg_from_env(env) -> None:
+    """Populate legacy shape/bound fields from the actual Grid2Op environment."""
+    CFG.NO_LOADS = int(getattr(env, "n_load", CFG.NO_LOADS))
+    CFG.NO_GENS = int(getattr(env, "n_gen", CFG.NO_GENS))
+    CFG.NO_LINES = int(getattr(env, "n_line", CFG.NO_LINES))
+    if hasattr(env, "gen_pmax"):
+        CFG.GEN_MAX = np.asarray(env.gen_pmax, dtype=float).copy()
+    elif len(np.asarray(CFG.GEN_MAX).reshape(-1)) != CFG.NO_GENS:
+        CFG.GEN_MAX = np.full(CFG.NO_GENS, np.inf, dtype=float)
+    if hasattr(env, "gen_pmin"):
+        CFG.GEN_MIN = np.asarray(env.gen_pmin, dtype=float).copy()
+    elif len(np.asarray(CFG.GEN_MIN).reshape(-1)) != CFG.NO_GENS:
+        CFG.GEN_MIN = np.full(CFG.NO_GENS, -np.inf, dtype=float)
+
+
 def _model_input_dim(model: Any) -> int:
-    """Return the loaded ENN width instead of relying on a grid-specific default."""
+    """Return the trained ENN width instead of relying on a grid-specific constant."""
     return int(getattr(model, "input_dim", CFG.ENN_INPUT_DIM))
+
+
+def _build_configured_agent(env):
+    """Load any configured policy; custom policies use CFG.AGENT_FACTORY."""
+    _sync_cfg_from_env(env)
+    return build_agent(
+        env,
+        factory_spec=getattr(CFG, "AGENT_FACTORY", None) or None,
+        agent_path=None if getattr(CFG, "AGENT_FACTORY", None) else CFG.AGENT_PATH,
+    )
 
 
 # =============================================================================
@@ -145,7 +179,7 @@ def analyze_disconnection_effect(
       1. Forecast state at t+12 using mean & aleatoric models.
          Injects predicted values into an env.copy() to obtain a real powerflow
          at t+12 -> yields grid stats and epistemic_after.
-      2. Advances 12 real steps in an env.copy() using the CurriculumAgent.
+      2. Advances 12 real steps in an env.copy() using the configured policy.
          At t+12, tests the disconnection of each critical line -> logs failure/success.
     """
     results = []
@@ -220,7 +254,7 @@ def analyze_disconnection_effect(
 
     for _ in range(12):
         try:
-            a = agent.act(sim_obs_t12, reward_agent, done_agent)
+            a = call_agent(agent, sim_obs_t12, reward_agent, done_agent)
         except Exception:
             a = agent_env.action_space({})
 
@@ -303,12 +337,7 @@ def run_single_episode_test(
     print(f"\n[TEST] Running Single Episode Test. ID: {episode_id}")
 
     env = grid2op.make(CFG.ENV_NAME, reward_class=L2RPNReward, backend=LightSimBackend())
-    agent = CurriculumAgent(env.action_space, env.observation_space, name="CA")
-
-    try:
-        agent.load(CFG.AGENT_PATH)
-    except Exception:
-        print("[WARNING] Agent could not be loaded, using random/do-nothing strategy.")
+    agent = _build_configured_agent(env)
 
     obs = env.reset(seed=episode_id)
     done = False
@@ -329,7 +358,7 @@ def run_single_episode_test(
             tqdm.write(f"[TEST] Episode {episode_id} | Step {obs.current_step}")
         observations_array.append(obs)
 
-        action = agent.act(obs, 0.0, done)
+        action = call_agent(agent, obs, 0.0, done)
 
         if obs.current_step > 12 and obs.current_step % 20 == 0:
             df = analyze_disconnection_effect(
@@ -368,12 +397,7 @@ def run_simulation_phase(
     print(f"\n>>> STARTING PHASE: {phase_name} (Episodes {ep_start} to {ep_end})")
 
     env = grid2op.make(CFG.ENV_NAME, backend=LightSimBackend(), **env_params)
-    agent = CurriculumAgent(env.action_space, env.observation_space, name="CA")
-
-    try:
-        agent.load(CFG.AGENT_PATH)
-    except Exception:
-        print("[WARNING] CurriculumAgent not loaded. Proceeding with fallback.")
+    agent = _build_configured_agent(env)
 
     for ep in tqdm(range(ep_start, ep_end), desc=f"{phase_name} episodes", unit="episode"):
         obs = env.reset(seed=ep)
@@ -383,7 +407,7 @@ def run_simulation_phase(
         while not done:
             observations_array.append(obs)
             try:
-                action = agent.act(obs, 0.0, done)
+                action = call_agent(agent, obs, 0.0, done)
             except Exception:
                 action = env.action_space({})
 
