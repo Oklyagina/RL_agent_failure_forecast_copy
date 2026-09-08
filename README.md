@@ -1,519 +1,474 @@
-# Forecast RL Agent Failure
+# Grid2Op Agent Failure Forecasting and Evidential Uncertainty
 
-This repository implements a framework to **quantify and predict the realiability of pre-trained Reinforcement Learning (RL) agents** used fot real-time congestion management in power grids.
+This repository provides uncertainty estimation and contingency-risk prediction for Grid2Op control policies.
 
-Assessing the reliability of AI-assisted decision support systems under unseen operating conditions is critical. This project anticipates unreliable AI recommendations and provides early warnings to human operators.
+It exposes two complementary signals:
 
-The pipeline integrates **Uncertainty Quantification (UQ)** to support risk-aware decision making by separating uncertainty into two components:
-  - **Aleatoric Uncertainty:** The uncertainty of the forecasted values (predictive variance). It captures the inherent stochastic variability and forecast errors of load and generation, estimated by modeling the residuals of the primary Forecaster (HistGradientBoosting).
-  - **Epistemic Uncertainty:** The uncertainty associated with the RL agent's decisions when facing out-of-distribution or unseen grid states, computed using an **Evidential Neural Network (ENN)**.
+1. **Epistemic uncertainty for an agent recommendation**, estimated with an Evidential Neural Network (ENN) trained by behavior cloning.
+2. **Probability of failure for a requested line disconnection**, estimated with a supervised classifier using the current grid state, forecast-derived variables, aleatoric uncertainty, and ENN epistemic uncertainty.
 
+The ENN training pipeline supports both pre-generated tutor datasets and direct policy rollouts. If tutor data is unavailable, the configured Grid2Op agent is executed to collect the observation/action pairs required for ENN training.
 
-
-These indicators are integrated into a **failure prediction model** that estimates the probability of RL agent failure under future contigencies (disconnection of lines).
-
-Finally, a **Dual LLM Architecture** takes the outputs of the predictive classifiers and synthesizes robust, symbolic Python rules (`best_rule.py`). This translates complex, black-box uncertainty metrics into intepretable, human-readable operational guidelines, ensuring the AI assistant's boundaries are transparent and safe.
-
----
-
-## Supported Environments
-
-- **Network 36** (`l2rpn_icaps_2021_small`)
-- **AI4REALNET small** (`ai4realnet_small`)
-
----
-
-## Project Structure
+## Repository structure
 
 ```text
-grid_security_project/
-|
-├── .env.example                         # Example settings for refactored scripts
-├── .env                                 # Local settings, not committed
-├── project_config.py                    # Shared .env/environment configuration
-├── recommendation_uncertainty.py        # ENN uncertainty module
-|
-├── assets/
-│   ├── ai4realnet_small/                # Refactored CurriculumAgent policy package
-│   │   ├── model/
-│   │   └── actions/
-|
-├── artifacts/
-│   └── <ENV_NAME>/<agent>/              # Generated rollout and ENN artifacts
-│       ├── rollouts/
-│       └── model/
-|
-├── environment/
-│   └── ai4realnet_small/                # Local Grid2Op scenario files
-|
-├── app/
-│   ├── main.py                          # FastAPI InteractiveAI recommendation endpoint
-│   └── API.md                           # API contract and deployment notes
-|
-├── training/
-│   ├── collect_rollouts.py              # Refactored rollout collection
-│   ├── train_enn.py                     # Refactored ENN training/export pipeline
-│   ├── train_curriculumagent.py         # CurriculumAgent training entrypoint
-│   └── TRAINING.md                      # ENN training guide
-|
-├── src/
-│   ├── collect_data.py                  # Simulation and dataset generation
-│   ├── config.py                        # Pipeline configuration and execution flags
-│   ├── dual_llm.py                      # Dual LLM: generator and critic
-│   ├── enn_models.py                    # ENN architectures
-│   ├── rule_predictor.py                # Rule inference and natural-language translation
-│   ├── test_rule_predictor.py           # Live rule inference and natural-language translation
-│   ├── train_classifier.py              # Classifier training and inference
-│   ├── train_forecast.py                # Forecaster training
-│   ├── training_enn.py                  # Original ENN training pipeline
-│   └── utils.py                         # Feature extraction and grid statistics
-|
-├── run_pipeline.py                      # Main entry point for the failure-forecast pipeline
-├── run_example.py                       # Refactored ENN uncertainty example
-├── Dockerfile                           # InteractiveAI API container
-├── requirements.txt                     # Python dependencies
+app/
+  main.py                     FastAPI recommendation service
+  API.md                      API documentation
+
+src/
+  agent_runtime.py            Generic Grid2Op policy loading and invocation
+  collect_data.py             Failure-label dataset generation
+  config.py                   Model/training configuration
+  enn_data.py                 ENN tutor/rollout dataset resolution
+  enn_models.py               Evidential neural network and losses
+  failure_probability.py      Observation + line -> P(failure)
+  pipeline_artifacts.py       Artifact validation and metadata helpers
+  rule_predictor.py           Symbolic-rule inference utilities
+  train_classifier.py         Failure classifier training
+  train_forecast.py           Forecast and aleatoric-uncertainty training
+  training_enn.py             ENN training and artifact export
+  utils.py                    Shared utilities
+
+training/
+  collect_rollouts.py         Standalone policy rollout collector
+  train_curriculumagent.py    CurriculumAgent training entry point
+  train_enn.py                ENN training entry point
+  TRAINING.md                 Additional training notes
+
+tests/
+  test_api.py
+  test_enn_training_fallback.py
+  test_new_components.py
+  validate_module.py
+
+project_config.py             Project-level paths and runtime configuration
+recommendation_uncertainty.py Public ENN uncertainty KPI API
+run_pipeline.py               End-to-end training/artifact pipeline
+run_example.py                Live recommendation example
 ```
 
-## Installation
+## Requirements
 
-### 1. Clone the Repository
-```
-git clone <repository_url>
-```
+The pinned dependencies target Python 3.9 or 3.10 because several training dependencies do not provide compatible wheels for newer Python versions.
 
-### 2. Set up Conda environment and install dependencies
-This project requires **Python 3.9 or 3.10**. The bundled CurriculumAgent SavedModel was exported with Keras 2.12, so keep the pinned `tensorflow==2.12.1`. Grid2Op is pinned to `1.9.8`.
+Install the environment with:
 
 ```bash
-conda create -n enn_uq python=3.10 -y
-conda activate enn_uq
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-### 3. Set up .env file
+The project uses Grid2Op `1.9.8` and LightSim2Grid `0.10.3` to keep the environment/action representation consistent with the expected simulator stack.
 
-Copy the example .env file before running CurriculumAgent/ENN scripts.
-Then adjust the values for your desired experiment and machine.
+## Configuration
+
+Copy the environment template:
 
 ```bash
 cp .env.example .env
 ```
-Or, on Windows PowerShell:
 
-```powershell
-Copy-Item .env.example .env
-```
+Set the Grid2Op environment, agent, artifact paths, and training parameters in `.env`.
 
-### 4. Agent Setup
-The pre-trained agent downloadable archive is available at project github page under the last release.
-For the CurriculumAgent/ENN workflow, ensure the pre-trained agent package is available under:
+A generic external agent can be configured with:
 
-```text
-assets/<ENV_NAME>/model/
-assets/<ENV_NAME>/actions/
-```
-
-With the default `.env`, this is:
-
-```text
-assets/ai4realnet_small/model/
-assets/ai4realnet_small/actions/
-```
-
-The rollout loader also checks the legacy-compatible locations `assets/network36/` and `src/models/network36/`.
-
-### Configuration
-There are two configuration entrypoints in the current repository.
-
-The original failure-forecast pipeline is controlled via `src/config.py`. **You do not need to modify the logic scripts directly**.
-
-The refactored CurriculumAgent/ENN scripts (`training/collect_rollouts.py`, `training/train_enn.py`, `training/train_curriculumagent.py`, and `run_example.py`) read shared defaults from `.env` through `project_config.py`. Environment variables override `.env`, and `.env` overrides the defaults in `project_config.py`.
-
-The main `.env` settings are:
-
-```text
+```dotenv
 ENV_NAME=ai4realnet_small
-ENV_LOCATION=C:\Users\
-AGENT_NAME=curriculum
-ASSETS_DIR=assets
-ARTIFACTS_DIR=artifacts
-CURRICULUM_ITERATIONS=3
-CURRICULUM_JOBS=1
+ENV_LOCATION=/path/to/grid2op/data
+AGENT_NAME=my_agent
+AGENT_FACTORY=my_package.my_agent:make_agent
+```
+
+`AGENT_FACTORY` must use the form:
+
+```text
+package.module:function
+```
+
+The factory receives the already-created Grid2Op environment and returns an object exposing `act(...)`:
+
+```python
+def make_agent(env):
+    return MyGrid2OpAgent(env.action_space)
+```
+
+`src.agent_runtime.call_agent` supports common Grid2Op agent signatures including:
+
+```python
+act(obs)
+act(obs, reward, done)
+act(obs, reward=reward, done=done)
+```
+
+If `AGENT_FACTORY` is empty, the bundled CurriculumAgent-compatible asset loader is used.
+
+## ENN training data
+
+The ENN models the configured policy by learning the policy's action distribution from observation/action pairs.
+
+`src.enn_data.load_or_collect_enn_data` supports three data-source modes:
+
+- `auto`: use tutor splits when all required files are available; otherwise collect policy rollouts.
+- `tutor`: require the configured tutor train/validation/test files.
+- `rollout`: always execute the configured policy and construct the ENN dataset from rollouts.
+
+### Automatic rollout path
+
+When policy rollouts are used, the collector:
+
+1. creates the configured Grid2Op environment;
+2. creates the configured policy;
+3. executes the policy for the configured number of episodes;
+4. stores `obs.to_vect()` and the corresponding `action.to_vect()`;
+5. deduplicates action vectors in stable first-observed order;
+6. converts action vectors to class labels;
+7. creates train, validation, and test splits.
+
+Typical configuration:
+
+```dotenv
 ROLLOUT_EPISODES=50
+ENN_ROLLOUT_MAX_STEPS=0
 ENN_EPOCHS=100
-ENN_ANNEAL_EPOCHS=10
 ENN_BATCH_SIZE=512
 ENN_LR=1e-3
 ENN_VAL_FRAC=0.1
-EXAMPLE_N_STEPS=5
-SEED=0
 ```
 
-#### Select Environment
-For the CurriculumAgent/ENN scripts, set `ENV_NAME` and `ENV_LOCATION` in `.env`. `ENV_LOCATION` should point to the directory containing the Grid2Op environment folder, so `project_config.py` resolves the environment as:
+`ENN_ROLLOUT_MAX_STEPS=0` means that no explicit per-episode rollout cap is applied.
+
+Programmatic training:
+
+```python
+from src.training_enn import train_enn
+
+# Tutor data when available, otherwise direct agent rollouts.
+model = train_enn(data_source="auto")
+
+# Always collect supervision from the configured policy.
+model = train_enn(data_source="rollout")
+
+# Require tutor files.
+model = train_enn(data_source="tutor")
+```
+
+The rollout dataset contains:
 
 ```text
-<ENV_LOCATION>/<ENV_NAME>
+observations.npy
+actions.npy
+labels.npy
+train.npz
+validation.npz
+test.npz
 ```
 
-On Windows, the first Grid2Op dataset download/cache setup may require running PowerShell as Administrator. 
-If Grid2Op reports missing files such as `config.py` or `grid_layout.json`, rerun the command from an Administrator shell.
+At least two distinct policy actions are required for meaningful ENN training. The collector raises an error if the collected policy behavior contains only one action class.
 
-### 5. Pre-trained Models
+## Epistemic uncertainty KPI
 
-The forecaster models are too large to be stored directly in this repository.
-These files are generated by the training pipeline: 
-- `src/train_forecast.py` creates the main forecaster, `src/train_classifier.py` 
-- trains/uses the failure classifier inputs, and `src/training_enn.py` trains the original ENN model. 
+The public uncertainty API is implemented in `recommendation_uncertainty.py`.
 
-If the release artifacts are not available, launch the training pipeline with `TRAIN_MODE = True` in `src/config.py` and run `python run_pipeline.py`.
-
-`run_pipeline.py` is resumable. Before training it validates each forecast,
-ENN, analysis-data, and classifier artifact under
-`artifacts/<ENV_NAME>/<AGENT_NAME>/`. Valid artifacts are reused; missing,
-incompatible, or dependency-stale stages are rebuilt. Each completed stage has
-a `*.provenance.json` sidecar recording the `ENV_NAME` and `AGENT_NAME` that
-produced it. Existing artifacts without a sidecar are adopted once only after
-structural and dimension checks pass.
-
-The forecast script can also run an individual stage when troubleshooting:
-
-```bash
-python src/train_forecast.py --stage data
-python src/train_forecast.py --stage mean
-python src/train_forecast.py --stage aleatoric
-```
-
-
-The pre-trained models are strored as attachments in the GitHub Releases section.
-
-1. Go to the https://github.com/AI4REALNET/RL_agent_failure_forecast/releases/tag/v1.0-models
-   of this repository.
-2. Download the following files from release `v1.0-models`:
-   - `HBGB_36.pkl` -> place in `forecasts/`
-   - `HBGB_36_aleatoric.pkl` -> place in `models/`
-   - `enn_36.pth` -> place in `models/`
-
-
-For the refactored ENN workflow, generated rollout data is written by default to:
+For a Dirichlet ENN with `K` retained action classes and total Dirichlet strength `S`, evidential vacuity is:
 
 ```text
-artifacts/<ENV_NAME>/<agent>/rollouts/
+u = K / S
 ```
 
-and trained ENN artifacts are written to:
+The public percentage is:
 
 ```text
-artifacts/<ENV_NAME>/<agent>/model/
+epistemic_uncertainty_pct = 100 * clip(u, 0, 1)
 ```
 
-The ENN training exports `enn_<agent>.pth`, `scaler_params.json`, `enn_meta.json`, and `enn_pctile_calib.npz`.
+The result also contains a percentile calibrated against the reference ENN uncertainty distribution:
 
-#### Usage & Execution Modes
-Use the main script to run the pipeline. The behaviour depends on the flags set in ```src/config.py```.
-
-##### 1. Training Pipeline
-Use this mode to train the Forecasters, collect simulation data, and train the final Classifier.
-1. **Config**: Set `TRAIN_MODE = True` in `src/config.py`.
-2. **Run**:
-    ```
-   python run_pipeline.py
-   ```
-3. **Outcome**: All models wil be trained and saved in the `models/` directory.
-
-##### 2. Testing & Inference
-If you have trained models, you can use the following modes to test the system.
-
-A. **Single Episode Simulation**
-Use this to analyse a specific episode (seed) from start to finish. It simulates the agent interacting with the grid and records how the uncertainty metrics behave over time.
-1. *Config*:
-```python
-TRAIN_MODE = False
-TEST_SINGLE_EPISODE = True
-EPISODE_ID_TO_TEST = 50 # The seed of the episode
+```text
+epistemic_uncertainty_total_pctile in [0, 100]
 ```
-2. *Run*: python run_pipeline.py
-3. *Outcome*: Generates a CSV trace of that specific episode in `data/`.
 
-B. **Single Observation Inference (Probabilities)**
-Use this to predict the failure probability for **one specific grid state** (Observation). This mode **does not** run a physical simulation (no disconnection). It purely calculates risk based on the model's knowledge.
-1. *Config*:
-```python
-TRAIN_MODE = False
-TEST_SINGLE_EPISODE = FALSE
-PREDICT_PROBA_MODE = True
+When the recommended action can be mapped to an ENN class, an action-conditional percentile is also returned:
 
-# Define which state to fetch from the environment
-PROBA_TEST_EPISODE_ID = 50
-PROBA_TEST_STEP = 50
+```text
+epistemic_uncertainty_action_pctile
 ```
-2. *Run*: python run_pipeline.py
-3. *Outcome*: Generates a CSV trace of that specific episode in `data/`.
 
-C. **LLM Rule Inference (Natural-Language Explanations)**
-Use this mode to apply the symbolic rules generated by the Dual LLM to a live simulation episode. For each monitored line, at every analysis step the system runs the forecast pipeline internally, evaluates the corresponding rule, and prints a human-readable explanation of the prediction.
+### Uncertainty and confidence bands
 
-1. *Config*:
-```python
-TRAIN_MODE          = False
-TEST_SINGLE_EPISODE = False
-PREDICT_PROBA_MODE  = False
-LLM_RULE_MODE       = True
+The calibrated total percentile is mapped to three bands:
 
-# Path to the folder containing the generated rules
-LLM_RULES_DIR     = "llm_rules_results/temp_0.5"
-
-# Episode seed to simulate
-LLM_RULES_EPISODE = 50
-```
-2. *Run*: `python run_pipeline.py`
-3. *Outcome*: For each monitored line and analysis step, prints the binary prediction (`OK` or `FAILURE PREDICTED`) together with a plain-English explanation sentence. At startup, all available rule sentences are also printed for use as operational guidelines.
+| Calibrated percentile | Uncertainty | Confidence |
+|---:|---|---|
+| `< 33.33` | `low` | `high` |
+| `33.33 - < 66.67` | `medium` | `medium` |
+| `>= 66.67` | `high` | `low` |
 
 Example output:
-```
-  [41_48_131]
-  Following a contingency on line 41_48_131, the RL agent is predicted to fail
-  to provide a recommendation that solves a problem if the maximum
-  line loading (rho) at t is >= 0.82, or if the forecasted maximum line loading
-  (rho) at t+12 is >= 0.66 while the epistemic uncertainty at t is >= 0.77 and
-  the forecasted total active power load at t+12 is <= 643 MW.
 
-  --- Step 40 ---
-    Line 41_48_131    -> FAILURE PREDICTED
-      Following a contingency on line 41_48_131, ...
-    Line 34_35_110    -> OK
+```python
+{
+    "epistemic_uncertainty_pct": 57.9,
+    "epistemic_uncertainty_total_pctile": 4.6,
+    "epistemic_uncertainty_action_pctile": 12.3,
+    "epistemic_uncertainty_level": "low",
+    "epistemic_confidence_level": "high",
+}
 ```
 
-#### Critical Lines
-The system automatically monitors specific critical lines defined in CFG.
+The `high` / `medium` / `low` value is a categorical confidence band. It is not a frequentist confidence interval with a specified coverage probability.
 
-D. **Live Episode Rule Test**
+### Scoring a recommendation
 
-Use `src/test_rule_predictor.py` to run a live episode with the CurriculumAgent and verify the symbolic rules in real time. For each monitored line at every step, the system:
+Use the action already selected by the policy:
 
-1. Applies the rule to predict failure 1 hour ahead.
-2. If failure is predicted, simulates the actual line disconnection to confirm whether the grid would really fail.
-3. Only prints an alert if both the rule **and** the simulation agree on failure.
+```python
+from recommendation_uncertainty import assess_recommendation
 
-At the end of the episode it reports the step at which the agent failed and whether any rule issued a confirmed warning in the 12 steps (1 hour) before the actual failure.
+action = agent.act(obs, reward, done)
+info = assess_recommendation(
+    obs,
+    agent,
+    enn,
+    calibration,
+    action=action,
+)
+```
 
-**Run (normal episode):**
+Passing the selected action is important for stochastic policies because the uncertainty score must correspond to the exact recommendation returned to the caller.
+
+## Failure probability for a line disconnection
+
+The public component is `src.failure_probability.FailureProbabilityPredictor`.
+
+It accepts a Grid2Op observation and a line identifier and returns the classifier estimate of:
+
+```text
+P(failure = 1 | observation, requested line disconnection)
+```
+
+Load the trained pipeline artifacts with:
+
+```python
+from src.failure_probability import FailureProbabilityPredictor
+
+predictor = FailureProbabilityPredictor.from_pipeline()
+
+probability = predictor.predict_proba(obs, "62_58_180")
+```
+
+`predict_proba` returns a float in `[0, 1]`.
+
+For a structured result:
+
+```python
+result = predictor.predict(obs, "62_58_180")
+```
+
+Example:
+
+```python
+{
+    "line": "62_58_180",
+    "failure_probability": 0.27,
+    "failure_probability_pct": 27.0,
+    "threshold": 0.41,
+    "predicted_failure": False,
+}
+```
+
+An integer line id is accepted when the observation exposes `name_line`.
+
+### Failure target
+
+The classifier target is generated by `src/collect_data.py`.
+
+For each sample, the environment is advanced according to the configured policy, the requested line contingency is applied, and `failure=1` is assigned when the contingency terminates the Grid2Op episode according to the collection procedure.
+
+### Supported line domain
+
+Line identity is treated as a categorical feature. The predictor rejects lines that were absent from classifier training instead of extrapolating an arbitrary encoded category.
+
+To support an additional contingency line:
+
+1. include the line during data collection;
+2. regenerate the classifier dataset;
+3. retrain the classifier.
+
+### Feature contract
+
+The classifier uses the feature order stored in `classifier_metadata.json`. The feature set includes current-state grid statistics, forecast statistics, aleatoric uncertainty, and ENN epistemic uncertainty.
+
+`FailureProbabilityPredictor.from_pipeline()` loads the trained dependencies and constructs the required feature vector from the Grid2Op observation/history.
+
+For dependency injection or unit testing:
+
+```python
+predictor = FailureProbabilityPredictor.from_artifacts(...)
+```
+
+The returned value is a model-estimated probability. For safety-critical probability interpretation, evaluate calibration on an independent held-out environment distribution using metrics such as Brier score and reliability diagrams, and apply an explicit probability calibrator if required.
+
+## End-to-end training pipeline
+
+Run:
+
 ```bash
-python src/test_rule_predictor.py
+python run_pipeline.py
 ```
 
-**Run (with adversarial HeavyAttack_1 line attacks):**
+The runner validates existing artifacts before reuse. ENN artifacts are checked for internally consistent model dimensions, scaler parameters, calibration arrays, action mappings, and metadata. Classifier metadata is checked for feature ordering, line mappings, and the selected decision threshold.
+
+When ENN training is required and tutor data is unavailable, the pipeline collects the required policy rollouts automatically.
+
+## Model artifacts
+
+The primary artifact directory is:
+
+```text
+artifacts/<environment>/<agent>/model/
+```
+
+The ENN/classifier bundle includes files such as:
+
+```text
+enn_36.pth
+enn_<agent>.pth
+enn_best_<environment>.pth
+scaler_<environment>_enn.pkl
+scaler_params.json
+enn_meta_<environment>.json
+enn_meta.json
+actions.npy
+enn_pctile_calib.npz
+final_classifier_36.pkl
+classifier_metadata.json
+```
+
+Some filenames retain `_36` to preserve compatibility with existing scripts. Model dimensions are validated against the configured environment and metadata rather than inferred from the filename.
+
+Treat the following ENN files as one model contract:
+
+- ENN checkpoint;
+- scaler/scaler parameters;
+- ENN metadata;
+- `actions.npy`;
+- ENN percentile calibration.
+
+Treat `final_classifier_36.pkl` and `classifier_metadata.json` as one classifier contract.
+
+## Standalone rollout collection
+
+Policy behavior can be collected without running the full training pipeline:
+
 ```bash
-python src/test_rule_predictor.py --attack
+python training/collect_rollouts.py \
+  --agent-factory my_package.my_agent:make_agent \
+  --episodes 50 \
+  --out-dir artifacts/my_rollouts
 ```
 
-Example output:
-```
-═════════════════════════════════════════════════════════════════
-  Scenario: Normal  |  seed=50
-═════════════════════════════════════════════════════════════════
-
-[INFO] Lines monitored: ['34_35_110', '41_48_131', ...]
-[INFO] Episode started. Running...
-
-  [step   100] running...
-  [step   200] running...
-
-  Step  247 | [41_48_131] FAILURE PREDICTED
-  Following a contingency on line 41_48_131, the RL agent is predicted
-  to fail if the maximum line loading (rho) at t is >= 0.74 while the
-  epistemic uncertainty at t is >= 0.79.
-
-─────────────────────────────────────────────────────────────────
-  Agent failed at step 259.
-
-  Did the rule warn in the 12 steps before failure?
-
-  Line                  Warned?   Warning steps
-  ────────────────────  ────────  ─────────────────────────
-  34_35_110             NO        —
-  41_48_131             YES       [247, 251]
-  43_44_125             NO        —
-```
-
-The episode seed and rules directory can be configured at the top of `src/test_rule_predictor.py` via `EPISODE_SEED` and `RESULTS_DIR`.
-
-##### 3. Refactored ENN Uncertainty Workflow
-
-The standard refactored workflow is: start from a trained CurriculumAgent, collect rollouts, train the ENN, then run the example.
+Use:
 
 ```bash
-python training/collect_rollouts.py
-python training/train_enn.py
+python training/collect_rollouts.py --help
+```
+
+for the complete command-line interface.
+
+## Inference example
+
+Run a live recommendation example with:
+
+```bash
 python run_example.py
 ```
 
-The scripts read their defaults from `.env` through `project_config.py`. For another agent, pass `--agent expert` to collection and `--agent-name expert` to training after plugging in the ExpertAgent constructor in `training/collect_rollouts.py`.
+The output includes the policy recommendation and ENN uncertainty KPI.
 
-`run_example.py` prefers trained artifacts under `artifacts/`, then falls back to legacy compatible locations such as `models_*` folders, `assets/network36/`, and `src/models/network36/`. It prints the resolved paths before running the live example.
+## FastAPI service
 
-##### 4. Agent API (InteractiveAI integration)
-
-`app/main.py` exposes the CurriculumAgent as an InteractiveAI agent API with FastAPI:
+Start the API with:
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-The endpoint is `POST /api/v1/recommendation`, and `/health` reports the active Grid2Op environment. The API reads `GRID2OP_ENV` from the environment, defaulting to `l2rpn_icaps_2021_small` in `app/main.py`.
+The recommendation response exposes the uncertainty values under `kpis`, including:
 
-The Docker container uses `python:3.10-slim`, installs the pinned requirements, copies the repository, and starts uvicorn on port 8000:
+```text
+epistemic_uncertainty_pct
+epistemic_uncertainty_total_pctile
+epistemic_uncertainty_action_pctile
+epistemic_uncertainty_level
+epistemic_confidence_level
+```
+
+See `app/API.md` for endpoint details.
+
+## Testing
+
+Run the repository regression suite with:
 
 ```bash
-docker build -t curriculum-agent-api .
-docker run -p 8000:8000 curriculum-agent-api
+python -m compileall -q .
+pytest -q
 ```
 
-The `Dockerfile` sets `GRID2OP_ENV=ai4realnet_small` and copies the `ai4realnet_small` scenario from `grid2op-scenario`. It currently runs `pip install .`, so add a packaging file or remove that line before relying on the image build. See `app/API.md` for the endpoint contract and deployment notes.
+The synthetic tests cover:
 
-## Methodology
+- ENN training when tutor files are absent;
+- policy-rollout dataset generation;
+- uncertainty percentage and confidence/uncertainty bands;
+- failure-probability inference and line-domain validation;
+- FastAPI recommendation output.
 
-This work proposes a **failure probability forecasting framework** that combines
-**power grid forecasting**, **uncertainty quantification**, and **risk classification**
-to anticipate cascading failures caused by line disconnections.
+A live Grid2Op integration test additionally requires the target Grid2Op dataset and the pinned Grid2Op/LightSim dependency stack.
 
-The methodology is structured into four main stages.
+## Main Python interfaces
 
----
-
-### 1. Uncertainty Decomposition
-
-The framework explicitly separates uncertainty into **aleatoric** and **epistemic**
-components, each capturing different sources of risk.
-
-#### Aleatoric Uncertainty (Data Uncertainty)
-
-Aleatoric uncertainty captures the **stochastic variability** inherent to load and
-generation dynamics.
-
-- A **multi-output time-series forecaster** (HistGradientBoosting) predicts active and
-  reactive power injections for all loads and generators.
-- Forecasts are generated for a **1-hour horizon** (12 timesteps ahead).
-- Squared residuals between ground-truth values and mean forecasts are computed.
-- A secondary regression model is trained on these squared residuals to estimate
-  the **forecast variance**, which is used as a proxy for aleatoric uncertainty.
-
-This process allows the framework to quantify how unpredictable future operating
-conditions are, independently of the agent's knowledge.
-
----
-
-#### Epistemic Uncertainty (Model Uncertainty)
-
-Epistemic uncertainty reflects the **lack of knowledge of the agent** about the current
-grid state and is used as an indicator of **out-of-distribution (OOD)** situations.
-
-- An **Evidential Neural Network (ENN)** is trained via **knowledge distillation** to
-  replicate the policy of a Senior (expert) agent.
-- Instead of producing softmax probabilities, the ENN outputs the parameters
-  of a **Dirichlet distribution** over the action space.
-- Model ignorance is computed analytically as:
-
-u = K / sum(alpha_i)
-
-where `K` is the number of actions and `alpha_i` are the Dirichlet parameters.
-
-High epistemic uncertainty indicates that the agent is operating in rarely observed or
-unknown grid conditions.
-
----
-
-### 2. Forecasting Future Grid States
-
-To anticipate failures before they occur, the framework predicts **future grid states**.
-
-- Load and generation forecasts are injected into the power grid model.
-- A power flow simulation is executed to obtain the **forecasted grid state**
-  one hour ahead.
-- These future states are combined with aleatoric uncertainty estimates, capturing
-  intrinsic forecast variability.
-
----
-
-### 3. Contingency Analysis
-
-For each candidate critical line:
-
-- A **what-if disconnection** is simulated on the forecasted grid state.
-- The system evaluates whether the grid remains stable or reaches a failure condition
-  one hour after the contingency.
-- This process generates labeled data linking grid conditions, uncertainties, and
-  line disconnections to observed failures.
-
----
-
-### 4. Risk Classification
-
-A final **binary classifier** is trained to predict cascading failures **before action
-execution**.
-
-**Inputs:**
-- Current grid state indicators (e.g., load-generation balance, thermal stress).
-- Epistemic uncertainty (confidence in the current state).
-- Aleatoric uncertainty (forecast variability).
-- Identifier of the disconnected transmission line.
-
-**Output:**
-- `0` - Stable operation expected.
-- `1` - Failure predicted (alarm triggered).
-
----
-
-### 5. LLM-Guided Symbolic Rule Generation (Dual LLM)
-
-To convert the black-box classifier outputs into interpretable operational guidelines, a **Dual LLM Architecture** (Generator-Evaluator) processes the data. The system automatically iterates over multiple critical lines and explores various LLM temperature settings (hyperparameter search) to find the optimal balance between logical strictness and creative problem-solving.
-
-- **Dynamic Rule Synthesis:** The generator LLM writes explicit, symbolic Python rules (`best_rule.py`) for each targeted transmission line based on thresholds of grid statistics and uncertainty metrics.
-- **Evaluation & Refinement:** An evaluator LLM critiques the generated rules against false-alarm and oversight metrics. Changes and logical justifications are systematically logged (`best_feedback.txt`, `best_justification.txt`).
-- **Iterative Tracking:** The framework iteratively tests seeds and records performance metrics across different temperature folders, ensuring convergence on the safest and most accurate operational rule for every monitored line.
-
----
-
-### 6. Rule Translation (Natural-Language Explanations)
-
-To make the symbolic rules accessible to human operators, `src/rule_predictor.py` automatically translates each `best_rule.py` into a plain-English sentence that describes the conditions under which the RL agent is predicted to fail.
-
-The translation is performed by parsing the Python rule as an Abstract Syntax Tree (AST) and mapping each condition to a human-readable description of the corresponding grid feature. Each distinct failure path within the rule becomes an "or if" clause, and multiple AND conditions within the same path are joined with "while ... and".
-
-For example, the following rule:
+### Build a policy
 
 ```python
-def rule(x):
-    if x["max_line_rho"] >= 0.65:
-        if x["epistemic_before"] >= 0.7891:
-            if x["aleatoric_gen_p_mean"] <= 0.3434:
-                return 1
-            else:
-                return 0
-        else:
-            return 0
-    else:
-        if x["fcast_sum_load_q"] >= 155.5429:
-            if x["aleatoric_gen_p_mean"] <= 0.3434:
-                return 1
-            else:
-                return 0
-        else:
-            return 0
+from src.agent_runtime import build_agent
+
+agent = build_agent(env, factory_spec="my_package.agent:make_agent")
 ```
 
-is automatically translated to:
+### Resolve ENN data
 
-> *Following a contingency on line 34_35_110, the RL agent is predicted to fail if the maximum line loading at t is >= 0.65 while the epistemic uncertainty is <= 0.79 and the mean aleatoric generation uncertainty is <= 0.34, or if the forecasted reactive load at t+12 is >= 155.54 MVAR and the mean aleatoric generation uncertainty is <= 0.34*.
+```python
+from src.enn_data import load_or_collect_enn_data
 
-In LLM Rule Inference mode, the system also evaluates each rule against the current grid state in real time: it runs the forecast pipeline internally (computing t+12 features from the live observation), applies the rule, and reports the prediction alongside the explanation sentence.
+bundle = load_or_collect_enn_data(CFG, source="auto")
+```
 
----
+### Compute epistemic uncertainty
 
-### Final Objective
+```python
+from recommendation_uncertainty import assess_recommendation
 
-The ultimate goal of this framework is to provide **real-time confidence levels**
-that allow:
+info = assess_recommendation(obs, agent, enn, calibration, action=action)
+```
 
-- Validation of autonomous agent decisions.
-- Prevention of unsafe operations in critical power grid environments through transparent, human-readable guidelines.
+### Compute line-disconnection failure probability
+
+```python
+from src.failure_probability import FailureProbabilityPredictor
+
+predictor = FailureProbabilityPredictor.from_pipeline()
+p_failure = predictor.predict_proba(obs, line)
+```
+
+## Artifact integrity
+
+When moving or deploying trained models:
+
+- keep ENN weights, scaler, metadata, action set, and calibration files together;
+- keep classifier metadata beside the classifier model;
+- do not replace `actions.npy` independently of the ENN checkpoint and class mapping;
+- regenerate model artifacts when switching to an incompatible Grid2Op environment;
+- retrain the classifier when adding previously unseen contingency lines.
+
+## License
+
+See `LICENSE`.

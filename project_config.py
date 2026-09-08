@@ -10,8 +10,9 @@ DEFAULTS = {
 
 #============= General defaults =================#
     "ENV_NAME": "ai4realnet_small",
-    "ENV_LOCATION": r"C:\Users",
+    "ENV_LOCATION": ".",
     "AGENT_NAME": "curriculum",
+    "AGENT_FACTORY": "",
     "ASSETS_DIR": "assets",
     "ARTIFACTS_DIR": "artifacts",
 
@@ -22,6 +23,7 @@ DEFAULTS = {
     "CURRICULUM_TUTOR_BEST_ACTION_THRESHOLD": "0.999",
     "CURRICULUM_TUTOR_MIN_UNIQUE_ROWS": "100",
     "ROLLOUT_EPISODES": "50",
+    "ENN_ROLLOUT_MAX_STEPS": "0",
 
 #============= ENN defaults =================#
     "ENN_EPOCHS": "100",
@@ -29,6 +31,7 @@ DEFAULTS = {
     "ENN_BATCH_SIZE": "512",
     "ENN_LR": "1e-3",
     "ENN_VAL_FRAC": "0.1",
+    "CLASSIFIER_OPTUNA_TRIALS": "100",
     "EXAMPLE_N_STEPS": "5",
     "SEED": "0",
 }
@@ -74,6 +77,7 @@ ENV_NAME = get_config("ENV_NAME")
 ENV_LOCATION = get_path("ENV_LOCATION")
 ENV_DIR = ENV_LOCATION / ENV_NAME
 AGENT_NAME = get_config("AGENT_NAME")
+AGENT_FACTORY = get_config("AGENT_FACTORY")
 ASSETS_DIR = get_path("ASSETS_DIR")
 ARTIFACTS_DIR = get_path("ARTIFACTS_DIR")
 
@@ -84,6 +88,7 @@ CURRICULUM_TUTOR_DO_NOTHING_THRESHOLD = get_float("CURRICULUM_TUTOR_DO_NOTHING_T
 CURRICULUM_TUTOR_BEST_ACTION_THRESHOLD = get_float("CURRICULUM_TUTOR_BEST_ACTION_THRESHOLD")
 CURRICULUM_TUTOR_MIN_UNIQUE_ROWS = get_int("CURRICULUM_TUTOR_MIN_UNIQUE_ROWS")
 ROLLOUT_EPISODES = get_int("ROLLOUT_EPISODES")
+ENN_ROLLOUT_MAX_STEPS = get_int("ENN_ROLLOUT_MAX_STEPS")
 
 #============= ENN config =================#
 ENN_EPOCHS = get_int("ENN_EPOCHS")
@@ -91,5 +96,6 @@ ENN_ANNEAL_EPOCHS = get_int("ENN_ANNEAL_EPOCHS")
 ENN_BATCH_SIZE = get_int("ENN_BATCH_SIZE")
 ENN_LR = get_float("ENN_LR")
 ENN_VAL_FRAC = get_float("ENN_VAL_FRAC")
+CLASSIFIER_OPTUNA_TRIALS = get_int("CLASSIFIER_OPTUNA_TRIALS")
 EXAMPLE_N_STEPS = get_int("EXAMPLE_N_STEPS")
 SEED = get_int("SEED")
