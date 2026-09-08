@@ -5,8 +5,8 @@ to the AI4REALNET AI-agent template. It returns recommendations in the
 InteractiveAI dictionary format and adds the two ENN epistemic-uncertainty
 percentiles into the `kpis` field, alongside `efficiency_of_the_reco`.
 
-Files: `app/main.py` (the API), `app/__init__.py`, `setup.py` (root, so the
-Docker build's `pip install .` works), `Dockerfile`.
+Files: `app/main.py` (the API), `app/__init__.py`, `project_config.py` (shared
+`.env`/environment configuration), `Dockerfile`.
 
 ## Endpoint
 
@@ -71,12 +71,9 @@ percentiles inside `kpis`:
    description is a plain serialisation — the uncertainty percentiles are added
    on top either way.
 
-2. **Environment / Grid2Op alignment.** The `Dockerfile` sets up
-   `ai4realnet_small` (the same scenario the simulator and the ExpertAgent
-   container use) and defaults `GRID2OP_ENV` to it. But the CurriculumAgent was
-   trained on `l2rpn_icaps_2021_small` — if it does not run natively on
-   `ai4realnet_small` (this is the observation shape mismatch that was fixed on
-   first runs), set `GRID2OP_ENV=l2rpn_icaps_2021_small`, or keep whatever that
-   fix established as the correct environment. Local runs (`run_example.py`,
-   tests) fall back to `l2rpn_icaps_2021_small`, which Grid2Op downloads
-   automatically.
+2. **Environment / Grid2Op alignment.** The API uses `project_config.py`:
+   environment variables override `.env`, and `.env` overrides the defaults.
+   Configure `ENV_NAME` and `ENV_LOCATION` so they resolve to the Grid2Op scenario directory:
+   `<ENV_LOCATION>/<ENV_NAME>`. The `Dockerfile` sets these keys to
+   `ai4realnet_small` under `/root/data_grid2op`, matching the scenario copied
+   during the image build.

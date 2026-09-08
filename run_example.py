@@ -41,7 +41,7 @@ N_STEPS = EXAMPLE_N_STEPS
 SEED = CONFIG_SEED
 # ----------------------------------------------------------------------------
 
-_SKIP_DIRS = {".git", "__pycache__", "tests", "curriculumagent"}
+_SKIP_DIRS = {".git", "__pycache__", "tests", "curriculumagent", "archive"}
 
 
 def _rel_parts(path: Path) -> tuple[str, ...]:
@@ -55,19 +55,22 @@ def _artifact_rank(path: Path) -> int:
     parts = _rel_parts(path)
     if parts and parts[0] == "artifacts":
         return 0
-    if path.name.startswith("models_"):
-        return 1
     if path == ROOT:
         return 99
-    return 2
+    return 1
+
+
+def _is_skipped_path(path: Path) -> bool:
+    parts = _rel_parts(path)
+    return bool(_SKIP_DIRS & set(parts)) or any(part.startswith("models_") for part in parts)
 
 
 def find_artifact_set():
     """Locate scaler_params.json + enn_meta.json (+ calibration .npz).
 
     Priority: (1) CONFIG overrides; (2) artifacts/ folders produced by
-    training/train_enn.py; (3) legacy models_* folders; (4) other fallback
-    folders. The calibration .npz must sit next to the selected metadata.
+    training/train_enn.py; (3) other active fallback folders. The calibration
+    .npz must sit next to the selected metadata.
 
     The scaler is CREATED AT ENN TRAINING TIME -- if nothing is found, the
     pipeline must be trained first (see TRAINING.md)."""
@@ -83,7 +86,7 @@ def find_artifact_set():
             d for d in {p.parent for p in ROOT.rglob("enn_meta.json")}
             if (d / "scaler_params.json").is_file()
             and d != configured_dir
-            and not (_SKIP_DIRS & set(_rel_parts(d)))
+            and not _is_skipped_path(d)
         )
         if not cands:
             sys.exit(
@@ -119,8 +122,7 @@ def find_artifact_set():
 
 def _walk_files(suffixes):
     for p in ROOT.rglob("*"):
-        if p.is_file() and p.suffix in suffixes \
-                and not (_SKIP_DIRS & set(p.relative_to(ROOT).parts[:-1])):
+        if p.is_file() and p.suffix in suffixes and not _is_skipped_path(p):
             yield p
 
 
@@ -133,8 +135,8 @@ def find_enn_weights(prefer_dir: Path | None = None) -> Path:
                                   "enn" not in p.name.lower(), str(p)))
     if not cands:
         sys.exit("[error] no .pth/.pt ENN weights found in the repository. "
-                 "Commit the trained ENN (e.g. src/models/enn_36.pth) or set "
-                 "ENN_WEIGHTS in the CONFIG block.")
+                 "Commit the trained ENN under artifacts/ or set ENN_WEIGHTS "
+                 "in the CONFIG block.")
     print(f"       auto: ENN weights -> {cands[0].relative_to(ROOT)}"
           + (f"  (candidates: {len(cands)})" if len(cands) > 1 else ""))
     return cands[0]
@@ -203,7 +205,7 @@ def import_evidential_network():
 
 
 def find_agent_dir() -> Path:
-    """Locate legacy bundled policy assets (model/ + actions/).
+    """Locate configured bundled policy assets (model/ + actions/).
 
     Custom policies configured with ``AGENT_FACTORY`` do not use this helper.
     """
@@ -212,7 +214,6 @@ def find_agent_dir() -> Path:
     preferred = [
         ASSETS_DIR / ENV_NAME,
         ASSETS_DIR / "network36",
-        ROOT / "src" / "models" / "network36",
     ]
     base = ROOT / "curriculumagent"
     invalid = []
@@ -230,7 +231,7 @@ def find_agent_dir() -> Path:
     sys.exit("[error] no valid folder with model/ and actions/ subfolders "
              "found. Expected a non-empty TensorFlow SavedModel under "
              f"assets/{ENV_NAME}/, assets/network36/ or "
-             "src/models/network36/. Set AGENT_DIR in "
+             "another configured active agent directory. Set AGENT_DIR in "
              f"the CONFIG block to override.{hint}")
 
 

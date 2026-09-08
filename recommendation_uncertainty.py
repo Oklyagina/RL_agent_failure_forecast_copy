@@ -12,6 +12,9 @@ This module exposes both:
 The categorical confidence is intentionally called a *level/band*, not a
 statistical confidence interval: high/medium/low are qualitative categories,
 not coverage intervals around an estimator.
+
+Calibration files are produced by the active refactored trainer
+(`training/train_enn.py`) and loaded from the selected artifact bundle.
 """
 from __future__ import annotations
 
