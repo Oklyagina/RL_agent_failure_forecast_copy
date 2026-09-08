@@ -21,6 +21,7 @@ The original `run_pipeline.py` failure-forecast workflow has been archived in
 - [Installation](#installation)
 - [Active Workflow](#active-workflow)
 - [Supported Grid2Op Environment](#supported-grid2op-environment)
+- [Curriculum agent](#curriculum-agent)
 - [Configuration](#configuration)
 - [ENN Training](#enn-training)
 - [Project Structure](#project-structure)
@@ -93,6 +94,41 @@ With the default `.env.example`, the committed local scenario is:
 ```text
 environment/ai4realnet_small/
 ```
+
+### Curriculum Agent
+
+The active workflow expects a pre-trained CurriculumAgent package for the
+`ai4realnet_small` Grid2Op environment. This package is distributed through the
+project's GitHub Releases and should be unarchived under:
+
+```text
+assets/ai4realnet_small/
+|-- model/
+`-- actions/
+```
+
+The `model/` directory contains the trained agent model, and `actions/`
+contains the discrete action set used by the agent. The rollout, ENN training,
+example, and API scripts all expect this package to be available before they
+can collect agent behavior or produce recommendations.
+
+If the released agent artifact is not available, or if the agent needs to be
+trained again for a changed environment or action space, retrain it with:
+
+```bash
+python training/train_curriculumagent.py
+```
+
+That script builds the Grid2Op environment from `.env` / `project_config.py`,
+initializes `CurriculumAgent`, and runs its full Teacher -> Tutor -> Junior ->
+Senior training pipeline. The trained package is saved back to:
+
+```text
+assets/<ENV_NAME>/
+```
+
+With the default configuration, this resolves to `assets/ai4realnet_small/`.
+
 
 ## Configuration
 Create a local `.env` file:

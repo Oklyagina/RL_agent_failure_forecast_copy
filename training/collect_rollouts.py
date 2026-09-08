@@ -21,11 +21,13 @@ Then point training/train_enn.py at out_dir.
 """
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 import numpy as np
 import grid2op
 from lightsim2grid import LightSimBackend
+from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -33,6 +35,12 @@ if str(ROOT) not in sys.path:
 
 from project_config import (AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR, ENV_DIR,
                             ENV_NAME, ROLLOUT_EPISODES, SEED)
+
+
+def configure_logging() -> None:
+    """Keep rollout collection output focused on warnings and progress."""
+    logging.basicConfig(level=logging.WARNING, force=True)
+    logging.getLogger().setLevel(logging.WARNING)
 
 
 def default_rollout_dir(agent_name: str) -> Path:
@@ -71,7 +79,7 @@ def make_curriculum_agent(env):
             if not _has_valid_saved_model(d):
                 invalid.append(d)
                 continue
-            print(f"agent dir: {d.relative_to(ROOT)}")
+            tqdm.write(f"agent dir: {d.relative_to(ROOT)}")
             return make_agent(env, str(d))
     hint = ""
     if invalid:
@@ -97,14 +105,20 @@ AGENTS = {"curriculum": make_curriculum_agent, "expert": make_expert_agent}
 def collect(agent_name: str, episodes: int, out_dir: Path, seed: int = 0,
             max_steps: int | None = None) -> None:
 
-    print()
+    configure_logging()
 
     env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
     env.seed(seed)
     agent = AGENTS[agent_name](env)
 
     obs_rows, act_rows = [], []
-    for ep in range(episodes):
+    progress = tqdm(
+        range(episodes),
+        desc="Collecting rollouts",
+        unit="episode",
+        dynamic_ncols=True,
+    )
+    for ep in progress:
         obs = env.reset()
         reward, done, t = env.reward_range[0], False, 0
         while not done and (max_steps is None or t < max_steps):
@@ -113,8 +127,11 @@ def collect(agent_name: str, episodes: int, out_dir: Path, seed: int = 0,
             act_rows.append(action.to_vect().astype(np.float32))
             obs, reward, done, _ = env.step(action)
             t += 1
-        print(f"episode {ep + 1}/{episodes}: {t} steps "
-              f"(total pairs: {len(obs_rows)})")
+        progress.set_postfix(
+            last_steps=t,
+            total_pairs=len(obs_rows),
+            refresh=False,
+        )
 
     X = np.stack(obs_rows)                       # [N, obs_dim]
     A = np.stack(act_rows)                       # [N, act_dim]
