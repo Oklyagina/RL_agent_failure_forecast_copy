@@ -1,8 +1,7 @@
 """
 tests/test_api.py -- validates the agent API (app/main.py) end-to-end with a
 synthetic ENN and fake Grid2Op objects, no trained weights or real environment
-needed. Confirms the InteractiveAI output shape and that the two uncertainty
-percentiles land inside "kpis".
+needed. Confirms the InteractiveAI output shape and all uncertainty KPI fields.
 
     python tests/test_api.py
 """
@@ -53,7 +52,7 @@ class FakeAgent:
 ACTIONS = rng.randn(K, ACT)
 
 
-def main():
+def test_api_contract():
     enn = EvidentialNetwork(OBS, K).eval()
     scaler = StandardScaler().fit(rng.randn(300, OBS))
     tot, act = build_calibration(
@@ -74,8 +73,12 @@ def main():
         assert key in r, f"missing {key}"
     k = r["kpis"]
     assert "efficiency_of_the_reco" in k
+    assert "epistemic_uncertainty_pct" in k
     assert "epistemic_uncertainty_total_pctile" in k
     assert "epistemic_uncertainty_action_pctile" in k
+    assert k["epistemic_uncertainty_level"] in {"low", "medium", "high"}
+    assert k["epistemic_confidence_level"] in {"low", "medium", "high"}
+    assert 0.0 <= k["epistemic_uncertainty_pct"] <= 100.0
     assert 0.0 <= k["epistemic_uncertainty_total_pctile"] <= 100.0
     assert json.dumps(recos)
 
@@ -87,6 +90,10 @@ def main():
         is not None
 
     print("test_api: PASSED")
+
+
+def main():
+    test_api_contract()
 
 
 if __name__ == "__main__":

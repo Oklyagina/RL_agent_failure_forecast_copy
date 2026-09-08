@@ -5,7 +5,7 @@ auto-discovers the ENN weights, the curated action set, the ENN architecture
 module and the agent binaries, so no paths need to be edited. Every guess is
 printed; anything can still be overridden in CONFIG below.
 
-Pipeline: Grid2Op environment -> CurriculumAgent (curriculumagent/) ->
+Pipeline: Grid2Op environment -> configured policy ->
 trained ENN + training scaler (rebuilt from artifacts/, plain JSON) ->
 percentile calibration -> assess_recommendation per step -> output,
 including the recommendations list in the InteractiveAI format ("kpis").
@@ -22,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-from project_config import (AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR, ENV_DIR,
+from project_config import (AGENT_FACTORY, AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR, ENV_DIR,
                             ENV_NAME, EXAMPLE_N_STEPS,
                             SEED as CONFIG_SEED)
 
@@ -203,8 +203,10 @@ def import_evidential_network():
 
 
 def find_agent_dir() -> Path:
-    """The CurriculumAgent entrypoint make_agent(env, path) expects `path`
-    to contain model/ and actions/ subfolders."""
+    """Locate legacy bundled policy assets (model/ + actions/).
+
+    Custom policies configured with ``AGENT_FACTORY`` do not use this helper.
+    """
     if AGENT_DIR:
         return Path(AGENT_DIR)
     preferred = [
@@ -260,35 +262,45 @@ def load_enn(weights: Path, meta: dict, device: str = "cpu"):
     and load the trained weights -- the `enn` for assess_recommendation."""
     import torch
     EvidentialNetwork = import_evidential_network()
-    enn = EvidentialNetwork(input_dim=int(meta["input_dim"]),
-                            num_classes=int(meta["num_classes"]))
-    enn.load_state_dict(torch.load(weights, map_location=device))
-    enn.eval()
+    enn = EvidentialNetwork(
+        input_dim=int(meta["input_dim"]),
+        num_classes=int(meta["num_classes"]),
+        hidden_dim=int(meta.get("hidden_dim", 256)),
+        dropout=float(meta.get("dropout", 0.05)),
+    )
+    state = torch.load(weights, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    enn.load_state_dict(state)
+    enn.to(device).eval()
     return enn
 
 
-def load_agent(env, agent_dir: Path):
-    """CurriculumAgent official entrypoint (curriculumagent 1.x):
-    make_agent(env, this_directory_path) with model/ and actions/ inside."""
-    from curriculumagent.submission.my_agent import make_agent
-    return make_agent(env, str(agent_dir))
+def load_agent(env, agent_dir: Path | None = None):
+    """Load the configured policy; custom agents use AGENT_FACTORY."""
+    from src.agent_runtime import build_agent
+    return build_agent(
+        env, factory_spec=AGENT_FACTORY or None,
+        agent_path=agent_dir if not AGENT_FACTORY else None,
+    )
 
 
 def to_interactiveai(action, info: dict) -> dict:
     """One recommendation in the InteractiveAI format: percentiles inside
     "kpis", alongside efficiency_of_the_reco (filled by the platform)."""
     return {
-        "title": "Topological recommendation (CurriculumAgent)",
+        "title": f"Topological recommendation ({AGENT_NAME})",
         "description": str(action),
         "use_case": "PowerGrid",
         "agent_type": 2,
         "actions": [action.as_serializable_dict()],
         "kpis": {
             "efficiency_of_the_reco": None,
-            "epistemic_uncertainty_total_pctile":
-                info["epistemic_uncertainty_total_pctile"],
-            "epistemic_uncertainty_action_pctile":
-                info["epistemic_uncertainty_action_pctile"],
+            "epistemic_uncertainty_pct": info["epistemic_uncertainty_pct"],
+            "epistemic_uncertainty_total_pctile": info["epistemic_uncertainty_total_pctile"],
+            "epistemic_uncertainty_action_pctile": info["epistemic_uncertainty_action_pctile"],
+            "epistemic_uncertainty_level": info["epistemic_uncertainty_level"],
+            "epistemic_confidence_level": info["epistemic_confidence_level"],
         },
     }
 
@@ -305,7 +317,7 @@ def main() -> None:
     meta = json.loads(meta_json.read_text())
     weights = find_enn_weights(prefer_dir=meta_json.parent)
     actions_path = find_actions_npy(meta)
-    agent_dir = find_agent_dir()
+    agent_dir = None if AGENT_FACTORY else find_agent_dir()
 
     # 1. Environment -----------------------------------------------------------
     env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
@@ -316,7 +328,7 @@ def main() -> None:
 
     # 2. Agent -----------------------------------------------------------------
     agent = load_agent(env, agent_dir)
-    print(f"[2/4] CurriculumAgent loaded")
+    print(f"[2/4] Policy agent loaded ({AGENT_NAME})")
 
     # 3. ENN + scaler + calibration --------------------------------------------
     enn = load_enn(weights, meta)
@@ -334,8 +346,9 @@ def main() -> None:
     reward, done = env.reward_range[0], False
     recommendations = []
     for t in range(N_STEPS):
-        action = agent.act(obs, reward, done)
-        info = assess_recommendation(obs, agent, enn, calibration)
+        from src.agent_runtime import call_agent
+        action = call_agent(agent, obs, reward=reward, done=done)
+        info = assess_recommendation(obs, agent, enn, calibration, action=action)
         print(f"  step {t}: chosen_action_id={info['chosen_action_id']}  "
               f"total_pctile={info['epistemic_uncertainty_total_pctile']}  "
               f"action_pctile={info['epistemic_uncertainty_action_pctile']}")

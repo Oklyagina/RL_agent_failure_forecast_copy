@@ -1,7 +1,4 @@
 import os
-import sys
-from pathlib import Path
-
 import torch
 import numpy as np
 from typing import List, Dict, Any
@@ -9,47 +6,16 @@ from typing import List, Dict, Any
 # ==============================================================================
 # GLOBAL SETTINGS (Module Level)
 # ==============================================================================
-ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = ROOT / "src"
-for path in (ROOT, SRC_DIR):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
-
-from project_config import (
-    AGENT_NAME,
-    ARTIFACTS_DIR,
-    ASSETS_DIR,
-    ENV_DIR,
-    ENV_NAME as PROJECT_ENV_NAME,
-)
-
-os.environ.setdefault("GRID2OP_DATA_PATH", str(ENV_DIR.parent))
-
-PIPELINE_DIR = ARTIFACTS_DIR / PROJECT_ENV_NAME / AGENT_NAME
-PIPELINE_DATA_DIR = PIPELINE_DIR / "data"
-PIPELINE_MODEL_DIR = PIPELINE_DIR / "model"
-
-
-def _resolve_agent_path() -> Path:
-    agent_path = ASSETS_DIR / PROJECT_ENV_NAME
-    if (agent_path / "model").is_dir() and (agent_path / "actions").is_dir():
-        return agent_path
-    for candidate in (ASSETS_DIR / "network36", ROOT / "src" / "models" / "network36"):
-        if (candidate / "model").is_dir() and (candidate / "actions").is_dir():
-            return candidate
-    return agent_path
-
-
-BASE_DIR = str(ROOT)
-DATA_DIR = str(PIPELINE_DATA_DIR)
-MODELS_DIR = str(PIPELINE_MODEL_DIR)
-MODELS_FORECASTER = str(PIPELINE_MODEL_DIR)
-AGENT_DIR = str(ASSETS_DIR)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+MODELS_FORECASTER = os.path.join(BASE_DIR, "forecasts")
+AGENT_DIR = os.path.join(BASE_DIR, "agents")
 ENN_DATA_DIR = os.path.join(MODELS_DIR, "enn_data")
-OUTPUT_DIR_LLM = str(ROOT / "llm_rule_results")
+OUTPUT_DIR_LLM = os.path.join(BASE_DIR, "llm_rule_results")
 
 # Create directories automatically
-for d in [DATA_DIR, MODELS_DIR, ENN_DATA_DIR]:
+for d in [DATA_DIR, MODELS_DIR, MODELS_FORECASTER, AGENT_DIR, ENN_DATA_DIR]:
     os.makedirs(d, exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -58,7 +24,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TRAIN_MODE = True
 TEST_SINGLE_EPISODE = False
 PREDICT_PROBA_MODE = False
-LLM_RULE_MODE = False
 
 
 # ==============================================================================
@@ -68,7 +33,7 @@ class CFG:
     """Consolidated configuration for the 36-bus environment."""
 
     # Environment Metadata
-    ENV_NAME = str(ENV_DIR)
+    ENV_NAME = "l2rpn_icaps_2021_small"
     NO_LOADS = 37
     NO_GENS = 22
     NO_LINES = 59
@@ -111,7 +76,7 @@ class CFG:
     MODEL_ALEATORIC_PATH = os.path.join(MODELS_DIR, "HBGB_36_aleatoric.pkl")
     MODEL_ENN_PATH = os.path.join(MODELS_DIR, "enn_36.pth")
     MODEL_CLASSIFIER_PATH = os.path.join(MODELS_DIR, "final_classifier_36.pkl")
-    AGENT_PATH = str(_resolve_agent_path())
+    AGENT_PATH = os.path.join(AGENT_DIR, "network36")
 
     X_TRAIN_PATH = os.path.join(DATA_DIR, "X_train_36.npy")
     Y_TRAIN_PATH = os.path.join(DATA_DIR, "y_train_36.npy")
@@ -124,14 +89,6 @@ class CFG:
     TRAIN_FILE = os.path.join(TUTOR_DIR, "test_train.npz")
     VAL_FILE = os.path.join(TUTOR_DIR, "test_val.npz")
     TEST_FILE = os.path.join(TUTOR_DIR, "test_test.npz")
-
-    # LLM symbolic rule inference
-    LLM_RULE_MODE = False
-    # Set LLM_RULES_DIR to the folder containing line_*/best_rule.py files.
-    # Leave it as None to let run_pipeline.py auto-detect dual_llm.py outputs.
-    LLM_RULES_DIR = None
-    LLM_RULES_EPISODE = 50
-    LLM_ENN_BUNDLE = "refactored"
 
 
 # Helper for Model Initialization

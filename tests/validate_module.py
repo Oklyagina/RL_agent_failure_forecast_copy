@@ -5,6 +5,8 @@ import json
 import numpy as np
 import torch
 from sklearn.preprocessing import StandardScaler
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from enn_models_synthetic import EvidentialNetwork
 import sys, pathlib
@@ -36,18 +38,21 @@ class FakeAgent:
 
 # --- curated action set + meta + scaler (as export_artifacts.py produces) ----
 actions = rng.randn(K, ACT_DIM).round(3)
-np.save("actions.npy", actions)
+_tmp = TemporaryDirectory()
+WORK = Path(_tmp.name)
+np.save(WORK / "actions.npy", actions)
 
 meta = {"input_dim": OBS_DIM, "num_classes": K, "n_curated_actions": K,
         "class_mapping": {str(k): k for k in range(K)}}
-json.dump(meta, open("enn_meta.json", "w"))
+(WORK / "enn_meta.json").write_text(json.dumps(meta), encoding="utf-8")
 
 X_train = rng.randn(500, OBS_DIM)
 scaler = StandardScaler().fit(X_train)
-json.dump({"type": "StandardScaler", "mean": scaler.mean_.tolist(),
-           "scale": scaler.scale_.tolist(), "var": scaler.var_.tolist(),
-           "n_features_in": int(scaler.n_features_in_)},
-          open("scaler_params.json", "w"))
+(WORK / "scaler_params.json").write_text(json.dumps({
+    "type": "StandardScaler", "mean": scaler.mean_.tolist(),
+    "scale": scaler.scale_.tolist(), "var": scaler.var_.tolist(),
+    "n_features_in": int(scaler.n_features_in_),
+}), encoding="utf-8")
 
 # --- scaler_from_json (same function as run_example.py) ----------------------
 def scaler_from_json(path):
@@ -61,13 +66,13 @@ def scaler_from_json(path):
 enn = EvidentialNetwork(OBS_DIM, K); enn.eval()
 X_scaled = scaler.transform(X_train).astype(np.float32)
 total_ref, action_ref = build_calibration(enn, X_scaled)
-save_calibration("calib.npz", total_ref, action_ref)
+save_calibration(WORK / "calib.npz", total_ref, action_ref)
 
 calibration = load_calibration(
-    "calib.npz",
-    scaler=scaler_from_json("scaler_params.json"),
-    action_set="actions.npy",
-    class_mapping="enn_meta.json",
+    WORK / "calib.npz",
+    scaler=scaler_from_json(WORK / "scaler_params.json"),
+    action_set=WORK / "actions.npy",
+    class_mapping=WORK / "enn_meta.json",
 )
 print("refs:", len(calibration.total_ref), "states | class_mapping keys are",
       type(next(iter(calibration.class_mapping))).__name__)
@@ -80,9 +85,12 @@ agent = FakeAgent(FakeAction(actions[7]))
 info = assess_recommendation(obs, agent, enn, calibration)
 print("\n[1] curated action :", info)
 ok &= info["chosen_action_id"] == 7
+ok &= 0.0 <= info["epistemic_uncertainty_pct"] <= 100.0
 ok &= 0.0 <= info["epistemic_uncertainty_total_pctile"] <= 100.0
 ok &= info["epistemic_uncertainty_action_pctile"] is not None
 ok &= 0.0 <= info["epistemic_uncertainty_action_pctile"] <= 100.0
+ok &= info["epistemic_uncertainty_level"] in {"low", "medium", "high"}
+ok &= info["epistemic_confidence_level"] in {"low", "medium", "high"}
 
 # --- case 2: do-nothing (not in the set) -------------------------------------
 agent_dn = FakeAgent(FakeAction(np.zeros(ACT_DIM)))
@@ -111,10 +119,16 @@ def to_interactiveai(action, info):
     return {"title": "Topological recommendation", "use_case": "PowerGrid",
             "agent_type": 2, "actions": [action.as_serializable_dict()],
             "kpis": {"efficiency_of_the_reco": None,
+                     "epistemic_uncertainty_pct":
+                         info["epistemic_uncertainty_pct"],
                      "epistemic_uncertainty_total_pctile":
                          info["epistemic_uncertainty_total_pctile"],
                      "epistemic_uncertainty_action_pctile":
-                         info["epistemic_uncertainty_action_pctile"]}}
+                         info["epistemic_uncertainty_action_pctile"],
+                     "epistemic_uncertainty_level":
+                         info["epistemic_uncertainty_level"],
+                     "epistemic_confidence_level":
+                         info["epistemic_confidence_level"]}}
 rec = to_interactiveai(agent.action, info)
 ok &= json.dumps(rec) is not None      # serialisable
 print("[4] InteractiveAI kpis:", rec["kpis"])

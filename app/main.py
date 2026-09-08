@@ -373,12 +373,18 @@ def _base_reco_dict(action, obs) -> dict:
 
 
 def _merge_uncertainty(reco: dict, info: dict) -> dict:
-    """Add the two ENN epistemic-uncertainty percentiles into kpis."""
+    """Add ENN epistemic-uncertainty KPIs into kpis."""
     reco.setdefault("kpis", {})
+    reco["kpis"]["epistemic_uncertainty_pct"] = \
+        info["epistemic_uncertainty_pct"]
     reco["kpis"]["epistemic_uncertainty_total_pctile"] = \
         info["epistemic_uncertainty_total_pctile"]
     reco["kpis"]["epistemic_uncertainty_action_pctile"] = \
         info["epistemic_uncertainty_action_pctile"]
+    reco["kpis"]["epistemic_uncertainty_level"] = \
+        info["epistemic_uncertainty_level"]
+    reco["kpis"]["epistemic_confidence_level"] = \
+        info["epistemic_confidence_level"]
     return reco
 
 

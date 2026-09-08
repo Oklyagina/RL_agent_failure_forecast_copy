@@ -30,8 +30,8 @@ def collect_tutor_experience_one_chronic(
         enable_logging: bool = True,
         subset: Optional[Union[bool, str]] = False,
         TutorAgent: BaseAgent = GeneralTutor,
-        tutor_kwargs: Optional[dict] = {},
-        env_kwargs: Optional[dict] = {}
+        tutor_kwargs: Optional[dict] = None,
+        env_kwargs: Optional[dict] = None
 ):
     """Collect tutor experience of one chronic.
 
@@ -55,17 +55,19 @@ def collect_tutor_experience_one_chronic(
     if enable_logging:
         logging.basicConfig(level=logging.INFO)
 
+    env_kwargs = env_kwargs or {}
+
     try:
         # if lightsim2grid is available, use it.
         from lightsim2grid import LightSimBackend
 
         backend = LightSimBackend()
-        env = grid2op.make(dataset=env_name_path, backend=backend,**env_kwargs)
+        env = grid2op.make(dataset=env_name_path, backend=backend, **env_kwargs)
     except ImportError:  # noqa
-        env = grid2op.make(dataset=env_name_path,**env_kwargs)
+        env = grid2op.make(dataset=env_name_path, **env_kwargs)
         logging.warning("Not using lightsim2grid! Operation will be slow!")
 
-    if seed:
+    if seed is not None:
         env.seed(seed)
 
     env.set_id(chronics_id)
@@ -93,8 +95,8 @@ def collect_tutor_experience_one_chronic(
     while not done:
         action, idx = tutor.act_with_id(obs)
 
-        if isinstance(action,np.ndarray):
-            action:grid2op.Action.BaseAction = tutor.action_space.from_vect(action)
+        if isinstance(action, np.ndarray):
+            action: grid2op.Action.BaseAction = tutor.action_space.from_vect(action)
 
         if action.as_dict()!={} and (idx != -1):
 
@@ -121,6 +123,17 @@ def collect_tutor_experience_one_chronic(
 
     logging.info(f"game over at step-{step}")
 
+    if not records:
+        threshold = getattr(tutor, "do_nothing_threshold", None)
+        threshold_hint = (
+            f" rho did not reach the tutor action threshold {threshold} often enough,"
+            if threshold is not None else ""
+        )
+        raise ValueError(
+            f"Tutor produced no actionable records for chronic {chronics_id}."
+            f"{threshold_hint} or no action from the reduced action set improved the state."
+        )
+
     records = np.vstack(records)
 
     return records
@@ -136,8 +149,8 @@ def generate_tutor_experience(
         subset: Optional[Union[bool, str]] = False,
         seed: Optional[int] = None,
         TutorAgent: BaseAgent = GeneralTutor,
-        tutor_kwargs: Optional[dict] = {},
-        env_kwargs: Optional[dict] = {},
+        tutor_kwargs: Optional[dict] = None,
+        env_kwargs: Optional[dict] = None,
 ):
     """Method to run the Tutor in parallel.
 
@@ -169,6 +182,9 @@ def generate_tutor_experience(
         jobs = os.cpu_count()
 
     tasks = []
+    rng = random.Random(seed)
+    tutor_kwargs = tutor_kwargs or {}
+    env_kwargs = env_kwargs or {}
 
     # Make sure we can initialize the environment
     # This also makes sure that the environment actually exits or gets downloaded
@@ -177,19 +193,43 @@ def generate_tutor_experience(
     if chronics_path is None:
         raise ValueError(f"Can't determine chronics path of given environment {env_name_path}")
 
-    if num_chronics is None:
-        num_chronics = len(os.listdir(chronics_path))
+    available_chronics = len(os.listdir(chronics_path))
+    if available_chronics <= 0:
+        raise ValueError(f"No chronics found at {chronics_path}")
 
-    if num_sample:
-        if num_sample <= num_chronics:
-            sampled_chronics = random.sample(range(num_chronics), num_sample)
+    requested_chronics = available_chronics if num_chronics is None else int(num_chronics)
+    if requested_chronics <= 0:
+        raise ValueError(f"num_chronics must be positive, got {num_chronics}")
+
+    candidate_count = min(requested_chronics, available_chronics)
+    candidate_ids = list(range(candidate_count))
+
+    if num_sample is not None:
+        sample_count = int(num_sample)
+        if sample_count <= 0:
+            raise ValueError(f"num_sample must be positive, got {num_sample}")
+        if sample_count <= candidate_count:
+            sampled_chronics = rng.sample(candidate_ids, sample_count)
         else:
-            sampled_chronics = random.choices(np.arange(num_chronics), k=num_sample)
+            sampled_chronics = rng.choices(candidate_ids, k=sample_count)
+    elif requested_chronics <= available_chronics:
+        sampled_chronics = candidate_ids
     else:
-        sampled_chronics = np.arange(num_chronics)
+        sampled_chronics = rng.choices(candidate_ids, k=requested_chronics)
 
-    for chronic_id in sampled_chronics:
-        tasks.append((action_paths, chronic_id, env_name_path, seed, True, subset, TutorAgent, tutor_kwargs,env_kwargs))
+    for task_id, chronic_id in enumerate(sampled_chronics):
+        task_seed = None if seed is None else seed + task_id
+        tasks.append((
+            action_paths,
+            chronic_id,
+            env_name_path,
+            task_seed,
+            True,
+            subset,
+            TutorAgent,
+            tutor_kwargs,
+            env_kwargs,
+        ))
     if jobs == 1:
         # This makes debugging easier since we don't fork into multiple processes
         logging.info(f"The following {len(tasks)} tasks will executed sequentially: {tasks}")
@@ -221,6 +261,7 @@ def prepare_dataset(
         dataset_name: str,
         extend: bool = False,
         seed: Optional[int] = 42,
+        min_unique_rows: int = 10,
 ):
     """Prepare/process the training data given by the tutor. The data is seperated into
     training, validation and test dataset, saved at the target_path.
@@ -231,6 +272,7 @@ def prepare_dataset(
         dataset_name: Name of the dataset which gets used to create the files.
         extend: Whether to extend the existing training data instead of creating a new dataset.
         seed: The random seed for shuffling the samples.
+        min_unique_rows: Minimum unique rows required before writing train, validation and test splits.
 
     Returns:
         None.
@@ -246,7 +288,12 @@ def prepare_dataset(
 
     if not extend:
         logging.info(f"Creating final dataset at directory {target_path}")
-        make_dataset(target_path=target_path, dataset_name=dataset_name, npy_files=npy_files)
+        make_dataset(
+            target_path=target_path,
+            dataset_name=dataset_name,
+            npy_files=npy_files,
+            min_unique_rows=min_unique_rows,
+        )
         logging.info("Done")
     else:
         train_file_path = target_path / f"{dataset_name}_train.npz"
@@ -285,6 +332,7 @@ def create_dataset(
         data: np.ndarray,
         dataset_name: Optional[str] = "Junior",
         chosen: Optional[Union[bool, list]] = False,
+        min_unique_rows: int = 10,
 ):
     """Given all samples data, select the right features and labels and split the dataset up.
     Save the dataset in three different files at target_path.
@@ -300,6 +348,18 @@ def create_dataset(
     target path.
 
     """
+    if data.ndim != 2 or data.shape[1] < 2:
+        raise ValueError(
+            f"Tutor dataset must be a 2-D array with action id plus state columns; got shape {data.shape}"
+        )
+
+    if data.shape[0] < min_unique_rows:
+        raise ValueError(
+            f"Tutor dataset has only {data.shape[0]} unique rows after deduplication; "
+            f"at least {min_unique_rows} are required. Collect more/stressful chronics "
+            "or lower the tutor do_nothing_threshold."
+        )
+
     # Shuffle actions
     np.random.shuffle(data)
 
@@ -311,15 +371,22 @@ def create_dataset(
 
     # Dataset partition
     num_sampling = data.shape[0]
-    train_size = num_sampling * 8 // 10
-    # validate_size = num_sampling // 10
-    test_size = num_sampling // 10
+    validate_size = max(1, num_sampling // 10)
+    test_size = max(1, num_sampling // 10)
+    train_size = num_sampling - validate_size - test_size
+    if train_size <= 0:
+        raise ValueError(
+            f"Tutor dataset with {num_sampling} rows cannot be split into non-empty "
+            "train/validation/test partitions."
+        )
     # s for state, feature; a for action, label.
 
     # Check whether the input is a Tuple ID or not. If yes
     s_train, a_train = data[:train_size, 1:], data[:train_size, :1].astype(int)
-    s_validate, a_validate = data[train_size:-test_size, 1:], data[train_size:-test_size, :1].astype(int)
-    s_test, a_test = data[-test_size:, 1:], data[-test_size:, :1].astype(int)
+    validation_end = train_size + validate_size
+    s_validate = data[train_size:validation_end, 1:]
+    a_validate = data[train_size:validation_end, :1].astype(int)
+    s_test, a_test = data[validation_end:, 1:], data[validation_end:, :1].astype(int)
 
     logging.info(f"TrainSet Size: {len(s_train)}")
     logging.info(f"ValidationSet Size: {len(s_validate)}")
@@ -370,13 +437,19 @@ def load_dataset(
 
 
 def make_dataset(
-        target_path: Path, dataset_name: str, npy_files: List[Path]):
+        target_path: Path,
+        dataset_name: str,
+        npy_files: List[Path],
+        min_unique_rows: int = 10,
+):
     """Join all experience into one file and then execute the create_dataset.
 
     Args:
         target_path: Path, where to write the new experience.
         dataset_name: Name of the files.
         npy_files: list of np.ndarrays.
+        min_unique_rows: Minimum unique rows required before writing train,
+            validation and test splits.
 
     Returns:
         None.
@@ -386,7 +459,12 @@ def make_dataset(
     experience = merge_dataset(npy_files)
 
     logging.info("Splitting data...")
-    create_dataset(target_path=target_path, dataset_name=dataset_name, data=experience)
+    create_dataset(
+        target_path=target_path,
+        dataset_name=dataset_name,
+        data=experience,
+        min_unique_rows=min_unique_rows,
+    )
 
 
 def extend_dataset(npy_files: List[Path], train_file_path: Path) -> object:
