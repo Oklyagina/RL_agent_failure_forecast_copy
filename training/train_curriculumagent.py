@@ -16,12 +16,12 @@ import loguru
 import ray
 from lightsim2grid import LightSimBackend
 from curriculumagent.baseline import CurriculumAgent
-import warnings
 from project_config import (ASSETS_DIR, CURRICULUM_ITERATIONS,
                             CURRICULUM_JOBS,
                             CURRICULUM_TUTOR_BEST_ACTION_THRESHOLD,
                             CURRICULUM_TUTOR_DO_NOTHING_THRESHOLD,
-                            CURRICULUM_TUTOR_MIN_UNIQUE_ROWS, ENV_DIR,
+                            CURRICULUM_TUTOR_MIN_UNIQUE_ROWS,
+                            configure_grid2op_warnings, ENV_DIR,
                             ENV_NAME)
 
 VERBOSE = False
@@ -44,6 +44,7 @@ TRAINING_NOISE_FILTER = _TrainingNoiseFilter()
 
 
 def configure_warnings() -> None:
+    configure_grid2op_warnings()
     warning_categories = [DeprecationWarning]
     try:
         from ray.rllib.utils.deprecation import RayDeprecationWarning
@@ -52,23 +53,6 @@ def configure_warnings() -> None:
     except Exception:
         pass
 
-    warnings.filterwarnings(
-        "ignore",
-        message=r"You are using a legacy grid2op version, please upgrade grid2op\.",
-        category=UserWarning,
-        module=r"lightsim2grid\.lightSimBackend",
-    )
-    warnings.filterwarnings(
-        "ignore",
-        message=r"There were some Nan in the pp_net\.trafo\[\"tap_step_degree\"\], they have been replaced by 0",
-        category=UserWarning,
-    )
-    warnings.filterwarnings(
-        "ignore",
-        message=r"We found either some slack coefficient to be < 0\. or they were all 0\.We set them all to 1\.0 to avoid such issues",
-        category=UserWarning,
-        module=r"lightsim2grid\.gridmodel\.from_pandapower\._aux_add_slack",
-    )
     warnings.filterwarnings(
         "ignore",
         message=r"The custom dictionary did not have the correct keys\. Using default model\.",

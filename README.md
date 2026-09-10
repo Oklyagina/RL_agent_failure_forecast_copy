@@ -245,7 +245,7 @@ Docker:
 
 ```bash
 docker build -t curriculum-agent-api .
-docker run -p 8000:8000 curriculum-agent-api
+docker run --env-file .env -p 8000:8000 curriculum-agent-api
 ```
 
 Endpoint:

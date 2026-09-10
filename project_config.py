@@ -1,6 +1,7 @@
 """Shared project configuration loaded from .env and environment variables."""
 
 import os
+import warnings
 from pathlib import Path
 
 
@@ -71,6 +72,28 @@ def get_path(name: str) -> Path:
     if path.is_absolute():
         return path
     return ROOT / path
+
+
+def configure_grid2op_warnings() -> None:
+    """Suppress known non-actionable Grid2Op/lightsim2grid compatibility warnings."""
+    warnings.filterwarnings(
+        "ignore",
+        message=r"You are using a legacy grid2op version, please upgrade grid2op\.",
+        category=UserWarning,
+        module=r"lightsim2grid\.lightSimBackend",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"There were some Nan in the pp_net\.trafo\[\"tap_step_degree\"\], they have been replaced by 0",
+        category=UserWarning,
+        module=r"lightsim2grid\.gridmodel\.from_pandapower\._aux_add_trafo",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"We found either some slack coefficient to be < 0\. or they were all 0\.We set them all to 1\.0 to avoid such issues",
+        category=UserWarning,
+        module=r"lightsim2grid\.gridmodel\.from_pandapower\._aux_add_slack",
+    )
 
 
 #============= General config =================#

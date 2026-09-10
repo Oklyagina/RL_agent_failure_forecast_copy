@@ -22,7 +22,7 @@ GET  /health
 
 ```bash
 docker build -t curriculum-agent-api .
-docker run -p 8000:8000 curriculum-agent-api
+docker run --env-file .env -p 8000:8000 curriculum-agent-api
 ```
 
 Locally (without Docker):
@@ -74,6 +74,6 @@ percentiles inside `kpis`:
 2. **Environment / Grid2Op alignment.** The API uses `project_config.py`:
    environment variables override `.env`, and `.env` overrides the defaults.
    Configure `ENV_NAME` and `ENV_LOCATION` so they resolve to the Grid2Op scenario directory:
-   `<ENV_LOCATION>/<ENV_NAME>`. The `Dockerfile` sets these keys to
-   `ai4realnet_small` under `/root/data_grid2op`, matching the scenario copied
-   during the image build.
+   `<ENV_LOCATION>/<ENV_NAME>`. The container uses the same project-relative
+   layout as `run_example.py`; pass the existing `.env` at runtime with
+   `--env-file .env`, or provide equivalent environment variables another way.
