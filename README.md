@@ -260,9 +260,10 @@ POST /api/v1/recommendation
 GET  /health
 ```
 
-The API returns InteractiveAI recommendation dictionaries with ENN uncertainty
-KPIs:
+The API returns main-project recommendation dictionaries. ENN uncertainty KPIs
+are included under `kpis`:
 
+- `uncertainty`
 - `epistemic_uncertainty_total_pctile`
 - `epistemic_uncertainty_action_pctile`
 

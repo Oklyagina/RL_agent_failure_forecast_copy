@@ -1,7 +1,7 @@
 """
 tests/test_api.py -- validates the agent API (app/main.py) end-to-end with a
 synthetic ENN and fake Grid2Op objects, no trained weights or real environment
-needed. Confirms the InteractiveAI output shape and all uncertainty KPI fields.
+needed. Confirms the recommendation output shape and all uncertainty KPI fields.
 
     python tests/test_api.py
 """
@@ -71,23 +71,42 @@ def test_api_contract():
     for key in ("title", "description", "use_case", "agent_type",
                 "actions", "kpis"):
         assert key in r, f"missing {key}"
+    assert "data" not in r
+    assert r["use_case"] == "PowerGrid"
     k = r["kpis"]
     assert "efficiency_of_the_reco" in k
+    assert "uncertainty" in k
     assert "epistemic_uncertainty_pct" in k
     assert "epistemic_uncertainty_total_pctile" in k
     assert "epistemic_uncertainty_action_pctile" in k
     assert k["epistemic_uncertainty_level"] in {"low", "medium", "high"}
     assert k["epistemic_confidence_level"] in {"low", "medium", "high"}
+    assert k["uncertainty"] == k["epistemic_uncertainty_pct"]
+    assert 0.0 <= k["uncertainty"] <= 100.0
     assert 0.0 <= k["epistemic_uncertainty_pct"] <= 100.0
     assert 0.0 <= k["epistemic_uncertainty_total_pctile"] <= 100.0
     assert json.dumps(recos)
 
     from fastapi.testclient import TestClient
     client = TestClient(M.app)
-    resp = client.post("/api/v1/recommendation", json={"context": context})
+    resp = client.post(
+        "/api/v1/recommendation",
+        json={"event": {"id": "evt-1"}, "context": context},
+    )
     assert resp.status_code == 200, resp.text
-    assert resp.json()[0]["kpis"]["epistemic_uncertainty_total_pctile"] \
-        is not None
+    payload = resp.json()[0]
+    for key in ("title", "description", "use_case", "agent_type",
+                "actions", "kpis"):
+        assert key in payload, f"missing response field {key}"
+    assert "data" not in payload
+    assert "criticality" not in payload
+    assert "start_date" not in payload
+    assert payload["use_case"] == "PowerGrid"
+    assert payload["actions"]
+    assert payload["agent_type"] == 2
+    assert payload["kpis"]["uncertainty"] == \
+        payload["kpis"]["epistemic_uncertainty_pct"]
+    assert payload["kpis"]["epistemic_uncertainty_total_pctile"] is not None
 
     print("test_api: PASSED")
 

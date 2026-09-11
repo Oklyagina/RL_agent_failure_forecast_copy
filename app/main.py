@@ -2,10 +2,9 @@
 app/main.py -- FastAPI wrapper exposing the CurriculumAgent as an InteractiveAI
 agent API, following the AI4REALNET AI-agent template.
 
-Each recommendation is returned in the InteractiveAI dictionary format
-(title / description / use_case / agent_type / actions / kpis), and the two
-ENN epistemic-uncertainty percentiles are added to the "kpis" field, alongside
-"efficiency_of_the_reco".
+Internally, each recommendation is built in the InteractiveAI dictionary format
+(title / description / use_case / agent_type / actions / kpis). The public API
+returns that recommendation list directly for the main project.
 
 Endpoint (same contract as the template):
     POST /api/v1/recommendation
@@ -387,7 +386,9 @@ def _base_reco_dict(action, obs) -> dict:
 
 def _merge_uncertainty(reco: dict, info: dict) -> dict:
     """Add ENN epistemic-uncertainty KPIs into kpis."""
+    reco["use_case"] = "PowerGrid"
     reco.setdefault("kpis", {})
+    reco["kpis"]["uncertainty"] = info["epistemic_uncertainty_pct"]
     reco["kpis"]["epistemic_uncertainty_pct"] = \
         info["epistemic_uncertainty_pct"]
     reco["kpis"]["epistemic_uncertainty_total_pctile"] = \
