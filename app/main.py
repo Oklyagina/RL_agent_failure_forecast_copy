@@ -22,7 +22,6 @@ scenario. The API uses .env/environment configuration from project_config.py
 """
 import json
 import logging
-import os
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -36,14 +35,19 @@ app = FastAPI(title="CurriculumAgent + ENN uncertainty API")
 logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC_DIR = ROOT / "src"
-for path in (ROOT, SRC_DIR):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from project_config import AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR, ENV_DIR, ENV_NAME
-
-os.environ.setdefault("GRID2OP_DATA_PATH", str(ENV_DIR.parent))
+from project_config import (
+    AGENT_FACTORY,
+    AGENT_NAME,
+    ARTIFACTS_DIR,
+    ASSETS_DIR,
+    configure_grid2op_warnings,
+    ENV_DIR,
+    ENV_NAME,
+    ROOT as PROJECT_ROOT,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -128,7 +132,7 @@ class ApiRuntimeError(Exception):
 
 def _display_path(path: Path) -> str:
     try:
-        return path.resolve().relative_to(ROOT).as_posix()
+        return path.resolve().relative_to(PROJECT_ROOT).as_posix()
     except ValueError:
         return str(path.resolve())
 
@@ -156,32 +160,21 @@ def _read_json(path: Path, stage: str) -> Dict[str, Any]:
         ) from exc
 
 
-def _has_valid_saved_model(agent_dir: Path) -> bool:
-    model_dir = agent_dir / "model"
-    variables_dir = model_dir / "variables"
-    required_files = [
-        model_dir / "saved_model.pb",
-        variables_dir / "variables.index",
-        variables_dir / "variables.data-00000-of-00001",
-    ]
-    return all(p.is_file() and p.stat().st_size > 0 for p in required_files)
-
-
 def _find_agent_dir() -> Path:
-    candidates = [
-        ASSETS_DIR / ENV_NAME,
-        ASSETS_DIR / "network36",
-    ]
-    checked = []
-    for candidate in candidates:
-        checked.append(_display_path(candidate))
-        if (candidate / "model").is_dir() and (candidate / "actions").is_dir():
-            if _has_valid_saved_model(candidate):
-                return candidate
+    import run_example as rx
+
+    try:
+        return rx.find_agent_dir()
+    except SystemExit as exc:
+        checked = [
+            _display_path(ASSETS_DIR / ENV_NAME),
+            _display_path(ASSETS_DIR / "network36"),
+        ]
+        message = str(exc) or "No valid CurriculumAgent directory was found."
     raise ApiConfigurationError(
         error="artifact_missing",
         stage="find_agent_dir",
-        message="No valid CurriculumAgent directory was found.",
+        message=message,
         checked_paths=checked,
         hint="Expected model/ and actions/ with a non-empty TensorFlow "
              "SavedModel under assets/<ENV_NAME>/, assets/network36/, or "
@@ -190,19 +183,37 @@ def _find_agent_dir() -> Path:
 
 
 def _api_artifact_paths() -> Dict[str, Path]:
-    """Select one consistent API artifact bundle.
+    """Select artifacts with the same discovery path used by run_example.py."""
+    import run_example as rx
 
-    The API intentionally selects the refactored ENN outputs as one consistent
-    bundle so checkpoint, metadata, scaler, calibration, and actions match.
-    """
-    model_dir = ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "model"
-    rollouts_dir = ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "rollouts"
+    try:
+        scaler_json, meta_json, npz = rx.find_artifact_set()
+        meta = _read_json(meta_json, "read_metadata")
+        weights = rx.find_enn_weights(prefer_dir=meta_json.parent)
+        actions = rx.find_actions_npy(meta)
+    except SystemExit as exc:
+        model_dir = ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "model"
+        raise ApiConfigurationError(
+            error="artifact_missing",
+            stage="select_artifacts",
+            message=str(exc) or "No complete ENN artifact bundle was found.",
+            selected_paths={
+                "metadata": _file_info(model_dir / "enn_meta.json"),
+                "weights": _file_info(model_dir / f"enn_{AGENT_NAME}.pth"),
+                "scaler": _file_info(model_dir / "scaler_params.json"),
+                "calibration": _file_info(model_dir / "enn_pctile_calib.npz"),
+            },
+            hint="Use the same refactored ENN artifacts discovered by "
+                 "run_example.py, or configure the shared .env/project_config.py "
+                 "paths so artifacts/<ENV_NAME>/<AGENT_NAME>/ is available.",
+        ) from exc
+
     return {
-        "metadata": model_dir / "enn_meta.json",
-        "weights": model_dir / f"enn_{AGENT_NAME}.pth",
-        "scaler": model_dir / "scaler_params.json",
-        "calibration": model_dir / "enn_pctile_calib.npz",
-        "actions": rollouts_dir / "actions.npy",
+        "metadata": meta_json,
+        "weights": weights,
+        "scaler": scaler_json,
+        "calibration": npz,
+        "actions": actions,
     }
 
 
@@ -298,9 +309,11 @@ def _validate_api_artifacts() -> Dict[str, Any]:
 # --------------------------------------------------------------------------- #
 @lru_cache(maxsize=1)
 def get_services():
+    configure_grid2op_warnings()
+
     import grid2op
     from lightsim2grid import LightSimBackend
-    import run_example as rx                    # reuse the auto-discovery
+    import run_example as rx
     from recommendation_uncertainty import load_calibration
 
     env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
@@ -312,7 +325,7 @@ def get_services():
     npz = paths["calibration"]
     weights = paths["weights"]
     actions_path = paths["actions"]
-    agent_dir = _find_agent_dir()
+    agent_dir = None if AGENT_FACTORY else _find_agent_dir()
 
     agent = rx.load_agent(env, agent_dir)
     try:
@@ -528,7 +541,6 @@ def health():
 
 @app.get("/diagnostics")
 def diagnostics():
-    paths = _api_artifact_paths()
     result: Dict[str, Any] = {
         "env": {
             "ENV_NAME": ENV_NAME,
@@ -537,12 +549,13 @@ def diagnostics():
             "ARTIFACTS_DIR": _display_path(ARTIFACTS_DIR),
             "ASSETS_DIR": _display_path(ASSETS_DIR),
         },
-        "selected_artifacts": {
-            name: _file_info(path) for name, path in paths.items()
-        },
     }
 
     try:
+        paths = _api_artifact_paths()
+        result["selected_artifacts"] = {
+            name: _file_info(path) for name, path in paths.items()
+        }
         bundle = _validate_api_artifacts()
         result["metadata"] = {
             "input_dim": bundle["metadata"].get("input_dim"),
@@ -560,6 +573,9 @@ def diagnostics():
         }
         result["artifact_validation"] = {"ok": True}
     except ApiConfigurationError as exc:
+        selected_paths = exc.details.get("selected_paths")
+        if selected_paths is not None:
+            result["selected_artifacts"] = selected_paths
         result["artifact_validation"] = {
             "ok": False,
             "detail": exc.to_detail(),
