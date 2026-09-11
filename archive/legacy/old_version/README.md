@@ -34,6 +34,16 @@ The original pipeline is configured through:
 src/config.py
 ```
 
+A legacy environment-variable template is also provided:
+
+```text
+.env_legacy.example
+```
+
+Copy its relevant values into the repository root `.env` only when you need to
+run the archived workflow. The old execution-mode flags still live in
+`src/config.py`.
+
 ## Archived Structure
 
 ```text

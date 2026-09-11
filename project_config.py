@@ -1,6 +1,7 @@
 """Shared project configuration loaded from .env and environment variables."""
 
 import os
+import warnings
 from pathlib import Path
 
 
@@ -31,6 +32,8 @@ DEFAULTS = {
     "ENN_ANNEAL_EPOCHS": "10",
     "ENN_BATCH_SIZE": "512",
     "ENN_LR": "1e-3",
+    "ENN_HIDDEN_DIM": "256",
+    "ENN_DROPOUT": "0.05",
     "ENN_VAL_FRAC": "0.1",
     "CLASSIFIER_OPTUNA_TRIALS": "100",
     "EXAMPLE_N_STEPS": "5",
@@ -73,6 +76,28 @@ def get_path(name: str) -> Path:
     return ROOT / path
 
 
+def configure_grid2op_warnings() -> None:
+    """Suppress known non-actionable Grid2Op/lightsim2grid compatibility warnings."""
+    warnings.filterwarnings(
+        "ignore",
+        message=r"You are using a legacy grid2op version, please upgrade grid2op\.",
+        category=UserWarning,
+        module=r"lightsim2grid\.lightSimBackend",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"There were some Nan in the pp_net\.trafo\[\"tap_step_degree\"\], they have been replaced by 0",
+        category=UserWarning,
+        module=r"lightsim2grid\.gridmodel\.from_pandapower\._aux_add_trafo",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"We found either some slack coefficient to be < 0\. or they were all 0\.We set them all to 1\.0 to avoid such issues",
+        category=UserWarning,
+        module=r"lightsim2grid\.gridmodel\.from_pandapower\._aux_add_slack",
+    )
+
+
 #============= General config =================#
 ENV_NAME = get_config("ENV_NAME")
 ENV_LOCATION = get_path("ENV_LOCATION")
@@ -96,6 +121,8 @@ ENN_EPOCHS = get_int("ENN_EPOCHS")
 ENN_ANNEAL_EPOCHS = get_int("ENN_ANNEAL_EPOCHS")
 ENN_BATCH_SIZE = get_int("ENN_BATCH_SIZE")
 ENN_LR = get_float("ENN_LR")
+ENN_HIDDEN_DIM = get_int("ENN_HIDDEN_DIM")
+ENN_DROPOUT = get_float("ENN_DROPOUT")
 ENN_VAL_FRAC = get_float("ENN_VAL_FRAC")
 CLASSIFIER_OPTUNA_TRIALS = get_int("CLASSIFIER_OPTUNA_TRIALS")
 EXAMPLE_N_STEPS = get_int("EXAMPLE_N_STEPS")

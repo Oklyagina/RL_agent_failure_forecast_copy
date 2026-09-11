@@ -23,6 +23,7 @@ if str(ROOT) not in sys.path:
 from project_config import (
     AGENT_FACTORY, AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR, ENV_DIR, ENV_NAME,
     ENN_ROLLOUT_MAX_STEPS, ROLLOUT_EPISODES, SEED,
+    configure_grid2op_warnings,
 )
 from src.agent_runtime import build_agent
 from src.enn_data import collect_policy_rollouts, save_rollout_bundle
@@ -61,6 +62,7 @@ def collect(
     agent_factory_spec: str | None = None,
 ) -> None:
     configure_logging()
+    configure_grid2op_warnings()
     env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
     progress = tqdm(
         total=episodes,

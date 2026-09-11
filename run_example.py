@@ -22,7 +22,8 @@ from pathlib import Path
 
 import numpy as np
 
-from project_config import (AGENT_FACTORY, AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR, ENV_DIR,
+from project_config import (AGENT_FACTORY, AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR,
+                            configure_grid2op_warnings, ENV_DIR,
                             ENV_NAME, EXAMPLE_N_STEPS,
                             SEED as CONFIG_SEED)
 
@@ -308,6 +309,8 @@ def to_interactiveai(action, info: dict) -> dict:
 
 
 def main() -> None:
+    configure_grid2op_warnings()
+
     import grid2op
     from lightsim2grid import LightSimBackend
     from recommendation_uncertainty import (load_calibration,

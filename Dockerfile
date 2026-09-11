@@ -12,13 +12,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential git \
     && rm -rf /var/lib/apt/lists/*
 
-# InteractiveAI environment data: same scenario as the simulator and the
-# ExpertAgent container (ai4realnet_small, from the grid2op-scenario repo).
-RUN git clone https://github.com/AI4REALNET/grid2op-scenario.git /tmp/grid2op-scenario \
-    && mkdir -p /root/data_grid2op \
-    && cp -r /tmp/grid2op-scenario/ai4realnet_small /root/data_grid2op/ai4realnet_small \
-    && rm -rf /tmp/grid2op-scenario
-
 # NOTE: the API uses project_config.py for shared settings.
 # Runtime environment variables override .env, and .env overrides defaults.
 
@@ -31,6 +24,4 @@ COPY . .
 
 EXPOSE 8000
 
-ENV ENV_NAME=ai4realnet_small
-ENV ENV_LOCATION=/root/data_grid2op
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
