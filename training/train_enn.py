@@ -29,7 +29,8 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from src.enn_models import EvidentialNetwork
 from project_config import (AGENT_NAME, ARTIFACTS_DIR, ENN_ANNEAL_EPOCHS,
-                            ENN_BATCH_SIZE, ENN_EPOCHS, ENN_LR,
+                            ENN_BATCH_SIZE, ENN_DROPOUT, ENN_EPOCHS,
+                            ENN_HIDDEN_DIM, ENN_LR,
                             ENN_VAL_FRAC, ENV_NAME, SEED)
 
 
@@ -95,6 +96,8 @@ def main() -> None:
     ap.add_argument("--anneal-epochs", type=int, default=ENN_ANNEAL_EPOCHS)
     ap.add_argument("--batch-size", type=int, default=ENN_BATCH_SIZE)
     ap.add_argument("--lr", type=float, default=ENN_LR)
+    ap.add_argument("--hidden-dim", type=int, default=ENN_HIDDEN_DIM)
+    ap.add_argument("--dropout", type=float, default=ENN_DROPOUT)
     ap.add_argument("--val-frac", type=float, default=ENN_VAL_FRAC)
     ap.add_argument("--seed", type=int, default=SEED)
     args = ap.parse_args()
@@ -102,6 +105,10 @@ def main() -> None:
         args.data_dir = default_rollout_dir(args.agent_name)
     if args.out_dir is None:
         args.out_dir = default_model_dir(args.agent_name)
+    if args.hidden_dim < 2:
+        raise ValueError(f"hidden-dim must be at least 2, got {args.hidden_dim}")
+    if not 0.0 <= args.dropout < 1.0:
+        raise ValueError(f"dropout must be in [0, 1), got {args.dropout}")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -131,7 +138,9 @@ def main() -> None:
 
     # 3. Train -----------------------------------------------------------------
     enn = EvidentialNetwork(input_dim=X.shape[1],
-                            num_classes=num_classes).to(device)
+                            num_classes=num_classes,
+                            hidden_dim=args.hidden_dim,
+                            dropout=args.dropout).to(device)
     opt = torch.optim.Adam(enn.parameters(), lr=args.lr)
     best_va, best_state = float("inf"), None
     for epoch in range(1, args.epochs + 1):
@@ -176,6 +185,8 @@ def main() -> None:
     (args.out_dir / "enn_meta.json").write_text(json.dumps({
         "input_dim": int(X.shape[1]),
         "num_classes": num_classes,
+        "hidden_dim": int(args.hidden_dim),
+        "dropout": float(args.dropout),
         "n_curated_actions": num_classes,
         "environment": ENV_NAME,
         "grid2op_version": "1.9.8",
