@@ -205,6 +205,52 @@ receives the Grid2Op environment and must return an object exposing
 
 More training details are in `training/TRAINING.md`.
 
+## Failure Dataset CSV
+
+To create a simple CSV for future failure-prediction experiments, run:
+
+```bash
+python training/collect_failure_dataset.py
+```
+
+By default, this runs the configured Grid2Op agent and writes:
+
+```text
+artifacts/<ENV_NAME>/<AGENT_NAME>/failure_dataset/failure_dataset.csv
+```
+
+Each row is one timestep before the agent acts. The row contains identifiers
+such as episode and step, useful Grid2Op observation values such as `rho`,
+loads, generation, line status, topology, cooldowns, and a `failure` target.
+
+The current temporary target rule is deliberately simple:
+
+```text
+failure = 1 when Grid2Op stops before the natural max_step
+failure = 0 otherwise
+```
+
+This rule lives in `src/failure_dataset.py` as `map_failure_label(...)` so it
+can be changed later without rewriting the CSV pipeline.
+
+The existing ENN rollout files can help with inspection and replay, but their
+`labels.npy` file is not a failure label. It stores the action class selected
+by the agent. For this reason the normal mode runs the environment again and
+labels each row from the result of `env.step(...)`.
+
+Useful optional commands:
+
+```bash
+python training/collect_failure_dataset.py --episodes 10
+python training/collect_failure_dataset.py --max-steps 100
+python training/collect_failure_dataset.py --progress-every 5
+python training/collect_failure_dataset.py --mode auto
+```
+
+Use `--mode auto` only when you want the script to try reusing saved rollout
+actions first and fall back to a normal fresh run if they do not exactly match
+the current environment.
+
 ## Project Structure
 
 ```text
@@ -218,6 +264,7 @@ More training details are in `training/TRAINING.md`.
 |   `-- API.md
 |-- training/
 |   |-- collect_rollouts.py
+|   |-- collect_failure_dataset.py
 |   |-- train_enn.py
 |   |-- train_curriculumagent.py
 |   `-- TRAINING.md
