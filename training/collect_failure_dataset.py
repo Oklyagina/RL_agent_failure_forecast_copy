@@ -37,6 +37,29 @@ except ImportError:  # pragma: no cover - project requirements include loguru
         logger = _FallbackLogger()
 
     loguru = _FallbackLoguru()
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - project requirements include tqdm
+    class tqdm:
+        def __init__(self, total=None, desc=None, unit=None, dynamic_ncols=True):
+            del unit, dynamic_ncols
+            self.total = total
+            self.count = 0
+            self.desc = desc or "progress"
+            print(f"{self.desc}: 0/{self.total or '?'}")
+
+        def update(self, n=1):
+            self.count += n
+            print(f"\r{self.desc}: {self.count}/{self.total or '?'}", end="")
+
+        def set_postfix(self, **kwargs):
+            del kwargs
+
+        def write(self, message):
+            print(f"\n{message}")
+
+        def close(self):
+            print()
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -98,49 +121,43 @@ def make_env():
     return grid2op.make(str(ENV_DIR), backend=LightSimBackend())
 
 
-def log_progress(event: str, payload: dict) -> None:
-    if event == "episode_start":
-        loguru.logger.info(
-            "Starting episode {episode}/{last_episode}",
-            episode=payload["episode"] + 1,
-            last_episode=payload["episodes"],
-        )
-    elif event == "episode_ready":
-        loguru.logger.info(
-            "Episode {episode} ready | chronic={chronic} | grid step={step}/{max_step}",
-            episode=payload["episode"] + 1,
-            chronic=payload.get("chronic_name"),
-            step=payload.get("grid2op_current_step"),
-            max_step=payload.get("grid2op_max_step"),
-        )
-    elif event == "step_start":
-        loguru.logger.info(
-            "Collecting row {sample_index} | episode={episode} step={step} "
-            "| grid step={grid_step} | max_rho={max_rho}",
-            sample_index=payload["sample_index"],
-            episode=payload["episode"] + 1,
-            step=payload["step"],
-            grid_step=payload.get("grid2op_current_step"),
-            max_rho=payload.get("max_rho"),
-        )
-    elif event == "failure":
-        loguru.logger.info(
-            "Failure label=1 at row {sample_index} | episode={episode} step={step} "
-            "| grid step={grid_step}/{max_step}",
-            sample_index=payload["sample_index"],
-            episode=payload["episode"] + 1,
-            step=payload["step"],
-            grid_step=payload.get("grid2op_current_step"),
-            max_step=payload.get("grid2op_max_step"),
-        )
-    elif event == "episode_end":
-        loguru.logger.info(
-            "Finished episode {episode} | steps={steps} | total rows={total_rows} | done={done}",
-            episode=payload["episode"] + 1,
-            steps=payload["steps"],
-            total_rows=payload["total_rows"],
-            done=payload["done"],
-        )
+class RolloutProgress:
+    """Show compact per-episode step progress with tqdm."""
+
+    def __init__(self, *, max_steps: int | None):
+        self.max_steps = max_steps
+        self.bar = None
+        self.episodes = None
+
+    def close(self) -> None:
+        if self.bar is not None:
+            self.bar.close()
+            self.bar = None
+
+    def __call__(self, event: str, payload: dict) -> None:
+        if event == "episode_start":
+            self.episodes = payload.get("episodes")
+        elif event == "episode_ready":
+            self.close()
+            total = self.max_steps or payload.get("grid2op_max_step")
+            episode = payload["episode"] + 1
+            if self.episodes:
+                desc = f"episode {episode}/{self.episodes}"
+            else:
+                desc = f"episode {episode}"
+            self.bar = tqdm(total=total, desc=desc, unit="step", dynamic_ncols=True)
+        elif event == "step_done":
+            if self.bar is not None:
+                self.bar.update(1)
+                self.bar.set_postfix(step=payload.get("step"), rows=payload.get("total_rows"), refresh=False)
+        elif event == "failure":
+            if self.bar is not None:
+                self.bar.write(
+                    f"failure=1 at episode {payload['episode'] + 1}, "
+                    f"step {payload['step']}"
+                )
+        elif event == "episode_end":
+            self.close()
 
 
 def collect(
@@ -153,23 +170,20 @@ def collect(
     output_path: Path,
     mode: str,
     agent_factory_spec: str | None,
-    progress_every: int,
 ) -> None:
     configure_logging()
     configure_grid2op_warnings()
 
     if max_steps is not None and max_steps <= 0:
         max_steps = None
-    if progress_every <= 0:
-        progress_every = 25
-
     artifacts_ready = rollout_artifacts_available(rollout_dir)
-    loguru.logger.info("Starting failure dataset collection")
-    loguru.logger.info("Environment: {env_name} at {env_dir}", env_name=ENV_NAME, env_dir=ENV_DIR)
-    loguru.logger.info("Agent: {agent_name}", agent_name=agent_name)
-    loguru.logger.info("Mode: {mode}", mode=mode)
-    loguru.logger.info("Episodes: {episodes} | max_steps: {max_steps}", episodes=episodes, max_steps=max_steps)
-    loguru.logger.info("Rollout artifacts: {status} at {path}", status="found" if artifacts_ready else "not found", path=rollout_dir)
+    loguru.logger.info(
+        "Starting failure dataset collection | env={env_name} | agent={agent_name} | mode={mode} | episodes={episodes}",
+        env_name=ENV_NAME,
+        agent_name=agent_name,
+        mode=mode,
+        episodes=episodes,
+    )
     loguru.logger.info("CSV output: {path}", path=output_path)
     if mode in {"replay", "features-only"} and not artifacts_ready:
         raise FileNotFoundError(
@@ -180,9 +194,7 @@ def collect(
         loguru.logger.info("Exporting saved rollout observations only; no failure labels will be created")
         env = make_env()
         try:
-            loguru.logger.info("Grid2Op environment created")
             example_obs = env.reset()
-            loguru.logger.info("Example observation loaded for semantic feature names")
             rows = iter_artifact_feature_rows(rollout_dir, example_obs)
             loguru.logger.info("Writing CSV...")
             written = write_failure_dataset_csv(rows, output_path)
@@ -195,9 +207,8 @@ def collect(
         )
         return
 
-    loguru.logger.info("Creating Grid2Op environment...")
     env = make_env()
-    loguru.logger.info("Grid2Op environment created")
+    progress = RolloutProgress(max_steps=max_steps)
     try:
         if mode in {"auto", "replay"} and artifacts_ready:
             try:
@@ -208,8 +219,7 @@ def collect(
                     episodes=episodes,
                     seed=seed,
                     max_steps=max_steps,
-                    progress_callback=log_progress,
-                    progress_every=progress_every,
+                    progress_callback=progress,
                 )
                 loguru.logger.info("Replay collection finished; writing CSV...")
                 written = write_failure_dataset_csv(rows, output_path)
@@ -222,10 +232,10 @@ def collect(
                     "Artifact replay was not aligned; falling back to fresh collection: {error}",
                     error=exc,
                 )
+                progress.close()
                 env.close()
-                loguru.logger.info("Recreating Grid2Op environment for fresh collection...")
                 env = make_env()
-                loguru.logger.info("Grid2Op environment recreated")
+                progress = RolloutProgress(max_steps=max_steps)
 
         spec = agent_factory_spec or AGENT_FACTORY or None
         if spec:
@@ -245,14 +255,13 @@ def collect(
             episodes=episodes,
             seed=seed,
             max_steps=max_steps,
-            progress_callback=log_progress,
-            progress_every=progress_every,
+            progress_callback=progress,
         )
         loguru.logger.info("Fresh collection finished; writing CSV...")
         written = write_failure_dataset_csv(rows, output_path)
         loguru.logger.success("Wrote {written} fresh-labeled rows to {path}", written=written, path=output_path)
     finally:
-        loguru.logger.info("Closing Grid2Op environment")
+        progress.close()
         env.close()
 
 
@@ -284,13 +293,6 @@ def main() -> None:
         default=None,
         help="CSV path. By default it is written under artifacts/<env>/<agent>/failure_dataset/.",
     )
-    basic.add_argument(
-        "--progress-every",
-        type=int,
-        default=25,
-        help="Print step progress every N steps inside each episode.",
-    )
-
     advanced = parser.add_argument_group("advanced options")
     advanced.add_argument("--agent-name", default=AGENT_NAME)
     advanced.add_argument(
@@ -323,7 +325,6 @@ def main() -> None:
         output_path=output_path,
         mode=args.mode,
         agent_factory_spec=args.agent_factory,
-        progress_every=args.progress_every,
     )
 
 

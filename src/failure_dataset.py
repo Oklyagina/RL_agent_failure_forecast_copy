@@ -243,6 +243,16 @@ def collect_fresh_failure_rows(
             reward = next_reward
             step += 1
             sample_index += 1
+            if progress_callback is not None:
+                progress_callback(
+                    "step_done",
+                    {
+                        "episode": episode,
+                        "step": step,
+                        "sample_index": sample_index,
+                        "total_rows": len(rows),
+                    },
+                )
         if progress_callback is not None:
             progress_callback(
                 "episode_end",
@@ -357,6 +367,16 @@ def collect_replayed_failure_rows(
             reward = next_reward
             step += 1
             sample_index += 1
+            if progress_callback is not None:
+                progress_callback(
+                    "step_done",
+                    {
+                        "episode": episode,
+                        "step": step,
+                        "sample_index": sample_index,
+                        "total_rows": len(rows),
+                    },
+                )
         if progress_callback is not None:
             progress_callback(
                 "episode_end",

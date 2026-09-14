@@ -243,7 +243,6 @@ Useful optional commands:
 ```bash
 python training/collect_failure_dataset.py --episodes 10
 python training/collect_failure_dataset.py --max-steps 100
-python training/collect_failure_dataset.py --progress-every 5
 python training/collect_failure_dataset.py --mode auto
 ```
 
