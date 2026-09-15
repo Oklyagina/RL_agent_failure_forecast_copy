@@ -45,7 +45,10 @@ pip install -r requirements.txt
 ## Active Workflow
 
 The pre-trained artifacts and assets are stored in the release (currently - in the pre-release).
+Check [Configuration](#configuration) Section to set up the .env file.
+
 Download the .zip archives, unpack them into the root folder and run:
+
 ```bash
 python run_example.py
 ```
