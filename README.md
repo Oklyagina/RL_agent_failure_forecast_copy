@@ -44,8 +44,15 @@ pip install -r requirements.txt
 
 ## Active Workflow
 
+The pre-trained artifacts and assets are stored in the release (currently - in the pre-release).
+Download the .zip archives, unpack them into the root folder and run:
 ```bash
-python training/collect_rollouts.py
+python run_example.py
+```
+
+To train everything from scratch, use:
+```bash
+python training/collect_rollouts.py 
 python training/train_enn.py
 python run_example.py
 ```
