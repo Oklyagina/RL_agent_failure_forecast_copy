@@ -44,8 +44,18 @@ pip install -r requirements.txt
 
 ## Active Workflow
 
+The pre-trained artifacts and assets are stored in the release (currently - in the pre-release).
+Check [Configuration](#configuration) Section to set up the .env file.
+
+Download the .zip archives, unpack them into the root folder and run:
+
 ```bash
-python training/collect_rollouts.py
+python run_example.py
+```
+
+To train everything from scratch, use:
+```bash
+python training/collect_rollouts.py 
 python training/train_enn.py
 python run_example.py
 ```
@@ -152,10 +162,10 @@ Main settings:
 ENV_NAME=ai4realnet_small
 ENV_LOCATION=environment
 AGENT_NAME=curriculum
-AGENT_FACTORY=
 ASSETS_DIR=assets
 ARTIFACTS_DIR=artifacts
 ROLLOUT_EPISODES=50
+
 ENN_ROLLOUT_MAX_STEPS=0
 ENN_EPOCHS=100
 ENN_ANNEAL_EPOCHS=10
@@ -164,6 +174,7 @@ ENN_LR=1e-3
 ENN_VAL_FRAC=0.1
 EXAMPLE_N_STEPS=5
 SEED=0
+
 CURRICULUM_ITERATIONS=50
 CURRICULUM_JOBS=1
 CURRICULUM_TUTOR_DO_NOTHING_THRESHOLD=0.85
