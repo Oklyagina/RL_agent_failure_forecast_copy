@@ -26,6 +26,7 @@ The original `run_pipeline.py` failure-forecast workflow has been archived in
 - [ENN Training](#enn-training)
 - [Project Structure](#project-structure)
 - [API](#api)
+- [Docker Instructions](DOCKER.md)
 - [Tests](#tests)
 - [Legacy Workflow](#legacy-workflow)
 
@@ -252,6 +253,9 @@ Docker:
 docker build -t curriculum-agent-api .
 docker run --env-file .env -p 8000:8000 curriculum-agent-api
 ```
+
+See [Docker Instructions](DOCKER.md) for detailed container usage, diagnostics,
+and Swagger testing steps.
 
 Endpoint:
 

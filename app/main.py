@@ -56,6 +56,14 @@ class RecommendationRequest(BaseModel):
     event: Optional[Dict[str, Any]] = None
     context: Dict[str, Any]
 
+    class Config:
+        schema_extra = {
+            "example": {
+                "event": {},
+                "context": {},
+            }
+        }
+
 
 # --------------------------------------------------------------------------- #
 #  API errors
