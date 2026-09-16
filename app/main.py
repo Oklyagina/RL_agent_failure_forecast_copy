@@ -56,6 +56,14 @@ class RecommendationRequest(BaseModel):
     event: Optional[Dict[str, Any]] = None
     context: Dict[str, Any]
 
+    class Config:
+        schema_extra = {
+            "example": {
+                "event": {},
+                "context": {},
+            }
+        }
+
 
 # --------------------------------------------------------------------------- #
 #  API errors
@@ -352,7 +360,7 @@ def get_services():
 # --------------------------------------------------------------------------- #
 #  Recommendation formatting
 # --------------------------------------------------------------------------- #
-def _base_reco_dict(action, obs) -> dict:
+def _base_reco_dict(action, obs, env=None) -> dict:
     """Base InteractiveAI recommendation dict for one action.
 
     Prefer the ExpertAgent-side helper get_parade_info(action, obs) -- which
@@ -371,14 +379,27 @@ def _base_reco_dict(action, obs) -> dict:
         except Exception:
             continue
     if get_parade_info is not None:
-        d = get_parade_info(action, obs)
-        return d[0] if isinstance(d, list) else d
+        d = get_parade_info(action, obs, env=env)
+        d = d[0] if isinstance(d, list) else d
+        if d.get("title"):
+            return d
+        logger.warning("Parade formatter returned an empty recommendation title; using fallback formatter.")
+    return _fallback_reco_dict(action)
+
+
+def _fallback_reco_dict(action) -> dict:
+    if hasattr(action, "as_serializable_dict"):
+        payload = action.as_serializable_dict()
+    elif hasattr(action, "to_json"):
+        payload = action.to_json()
+    else:
+        payload = str(action)
     return {
         "title": "Topological recommendation (CurriculumAgent)",
         "description": str(action),
         "use_case": "PowerGrid",
         "agent_type": 2,
-        "actions": [action.as_serializable_dict()],
+        "actions": [payload],
         "kpis": {"type_of_the_reco": "Topological",
                  "efficiency_of_the_reco": None},
     }
@@ -484,7 +505,9 @@ def build_recommendations(context: dict) -> List[dict]:
         ) from exc
 
     try:
-        info = assess_recommendation(obs, agent, enn, calibration)
+        info = assess_recommendation(
+            obs, agent, enn, calibration, action=action
+        )
     except Exception as exc:
         raise ApiRuntimeError(
             stage="assess_recommendation",
@@ -494,7 +517,7 @@ def build_recommendations(context: dict) -> List[dict]:
         ) from exc
 
     try:
-        reco = _merge_uncertainty(_base_reco_dict(action, obs), info)
+        reco = _merge_uncertainty(_base_reco_dict(action, obs, env), info)
     except Exception as exc:
         raise ApiRuntimeError(
             stage="format_recommendation",

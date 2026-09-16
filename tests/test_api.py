@@ -29,8 +29,37 @@ OBS, K, ACT = 40, 20, 25
 class FakeAction:
     def __init__(self, v): self.v = np.asarray(v, float)
     def to_vect(self): return self.v
+    def to_json(self): return {"_set_topo_vect": self.v.tolist()}
     def as_serializable_dict(self): return {"_set_topo_vect": self.v.tolist()}
+    def impact_on_objects(self):
+        return {
+            "force_line": {
+                "changed": False,
+                "reconnections": {"count": 0, "powerlines": []},
+                "disconnections": {"count": 0, "powerlines": []},
+            },
+            "switch_line": {
+                "changed": False,
+                "count": 0,
+                "powerlines": [],
+            },
+            "topology": {
+                "bus_switch": [],
+                "assigned_bus": [{
+                    "bus": 1,
+                    "object_type": "line",
+                    "object_id": 11,
+                    "substation": 3,
+                }],
+                "disconnect_bus": [],
+            },
+        }
     def __str__(self): return "Assign bus 1 to line id 11 (example)"
+
+
+class FakeSimulatedObs:
+    def __init__(self):
+        self.rho = np.asarray([0.23, 0.87, 0.42], dtype="float32")
 
 
 class FakeObs:
@@ -39,6 +68,8 @@ class FakeObs:
     def from_vect(self, v):
         self.v = np.asarray(v, "float32")
         return self
+    def simulate(self, action, time_step=1):
+        return FakeSimulatedObs(), 0.0, False, {}
 
 
 class FakeEnv:
@@ -46,7 +77,11 @@ class FakeEnv:
 
 
 class FakeAgent:
-    def act(self, o, reward=None, done=False): return FakeAction(ACTIONS[7])
+    def __init__(self):
+        self.calls = 0
+    def act(self, o, reward=None, done=False):
+        self.calls += 1
+        return FakeAction(ACTIONS[7])
 
 
 ACTIONS = rng.randn(K, ACT)
@@ -60,8 +95,9 @@ def test_api_contract():
     calib = Calibration(tot, act, scaler=scaler, action_set=ACTIONS,
                         class_mapping={str(k): k for k in range(K)})
 
+    fake_agent = FakeAgent()
     M.get_services.cache_clear()
-    M.get_services = lambda: (FakeEnv(), FakeAgent(), enn, calib)
+    M.get_services = lambda: (FakeEnv(), fake_agent, enn, calib)
 
     context = {"observation": rng.randn(OBS).tolist()}
     recos = M.build_recommendations(context)
@@ -75,6 +111,8 @@ def test_api_contract():
     assert r["use_case"] == "PowerGrid"
     k = r["kpis"]
     assert "efficiency_of_the_reco" in k
+    assert k["efficiency_of_the_reco"] == np.float32(0.87).item()
+    assert fake_agent.calls == 1
     assert "uncertainty" in k
     assert "epistemic_uncertainty_pct" in k
     assert "epistemic_uncertainty_total_pctile" in k
@@ -104,9 +142,11 @@ def test_api_contract():
     assert payload["use_case"] == "PowerGrid"
     assert payload["actions"]
     assert payload["agent_type"] == 2
+    assert payload["kpis"]["efficiency_of_the_reco"] == np.float32(0.87).item()
     assert payload["kpis"]["uncertainty"] == \
         payload["kpis"]["epistemic_uncertainty_pct"]
     assert payload["kpis"]["epistemic_uncertainty_total_pctile"] is not None
+    assert fake_agent.calls == 2
 
     print("test_api: PASSED")
 
