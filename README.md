@@ -26,6 +26,7 @@ The original `run_pipeline.py` failure-forecast workflow has been archived in
 - [ENN Training](#enn-training)
 - [Project Structure](#project-structure)
 - [API](#api)
+- [Docker Instructions](DOCKER.md)
 - [Tests](#tests)
 - [Legacy Workflow](#legacy-workflow)
 
@@ -264,6 +265,9 @@ docker build -t curriculum-agent-api .
 docker run --env-file .env -p 8000:8000 curriculum-agent-api
 ```
 
+See [Docker Instructions](DOCKER.md) for detailed container usage, diagnostics,
+and Swagger testing steps.
+
 Endpoint:
 
 ```text
@@ -271,9 +275,10 @@ POST /api/v1/recommendation
 GET  /health
 ```
 
-The API returns InteractiveAI recommendation dictionaries with ENN uncertainty
-KPIs:
+The API returns main-project recommendation dictionaries. ENN uncertainty KPIs
+are included under `kpis`:
 
+- `uncertainty`
 - `epistemic_uncertainty_total_pctile`
 - `epistemic_uncertainty_action_pctile`
 

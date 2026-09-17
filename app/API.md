@@ -1,9 +1,9 @@
 # Agent API (InteractiveAI integration)
 
 FastAPI wrapper exposing the CurriculumAgent as an InteractiveAI agent, built
-to the AI4REALNET AI-agent template. It returns recommendations in the
-InteractiveAI dictionary format and adds the two ENN epistemic-uncertainty
-percentiles into the `kpis` field, alongside `efficiency_of_the_reco`.
+to the AI4REALNET AI-agent template. It accepts the template recommendation
+request and returns the main-project recommendation list directly. The ENN
+epistemic-uncertainty KPIs are added to each recommendation's `kpis` field.
 
 Files: `app/main.py` (the API), `app/__init__.py`, `project_config.py` (shared
 `.env`/environment configuration), `Dockerfile`.
@@ -14,7 +14,7 @@ Files: `app/main.py` (the API), `app/__init__.py`, `project_config.py` (shared
 POST /api/v1/recommendation
   body: {"event": ..., "context": {..., "observation": <grid2op observation>}}
   ->   [ {"title", "description", "use_case", "agent_type",
-          "actions": [...], "kpis": {...}}, ... ]
+          "actions": [...], "kpis": {...}} ]
 GET  /health
 ```
 
@@ -39,8 +39,8 @@ curl -X POST http://localhost:8000/api/v1/recommendation \
      --data @rte_recommendation.json
 ```
 
-Output — a list of recommendation dictionaries; note the two uncertainty
-percentiles inside `kpis`:
+Output — a list of recommendation dictionaries. ENN uncertainty is exposed as
+`kpis.uncertainty` and the detailed ENN KPI fields are kept for traceability:
 
 ```json
 [
@@ -53,8 +53,12 @@ percentiles inside `kpis`:
     "kpis": {
       "type_of_the_reco": "Topological",
       "efficiency_of_the_reco": 0.8976841568946838,
+      "uncertainty": 50.0,
+      "epistemic_uncertainty_pct": 50.0,
       "epistemic_uncertainty_total_pctile": 47.8,
-      "epistemic_uncertainty_action_pctile": 3.1
+      "epistemic_uncertainty_action_pctile": 3.1,
+      "epistemic_uncertainty_level": "medium",
+      "epistemic_confidence_level": "medium"
     }
   }
 ]
