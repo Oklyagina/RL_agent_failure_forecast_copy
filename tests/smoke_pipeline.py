@@ -16,7 +16,8 @@ if str(ROOT) not in sys.path:
 from project_config import AGENT_NAME, ENV_DIR  # noqa: E402
 
 
-REQUIRED_SCENARIO_FILES = ("config.py", "grid.json", "chronics")
+REQUIRED_SCENARIO_FILES = ("config.py", "grid.json")
+REQUIRED_CHRONIC_SERIES = ("load_p", "load_q", "prod_p")
 SMOKE_LINES = "32_36_112,34_35_110"
 PREDICTION_LINE = "34_35_110"
 SMOKE_ARTIFACTS = ROOT / "artifacts" / "pipeline_smoke"
@@ -38,8 +39,33 @@ SMOKE_SETTINGS = {
 }
 
 
-def _scenario_missing(path: Path) -> list[str]:
-    return [name for name in REQUIRED_SCENARIO_FILES if not (path / name).exists()]
+def _has_series(chronic_dir: Path, series: str) -> bool:
+    return any(
+        (chronic_dir / f"{series}{suffix}").is_file()
+        for suffix in (".csv", ".csv.bz2")
+    )
+
+
+def _has_usable_chronic(path: Path) -> bool:
+    chronics_dir = path / "chronics"
+    if not chronics_dir.is_dir():
+        return False
+    return any(
+        chronic.is_dir()
+        and all(_has_series(chronic, series) for series in REQUIRED_CHRONIC_SERIES)
+        for chronic in chronics_dir.iterdir()
+    )
+
+
+def _scenario_problems(path: Path) -> list[str]:
+    problems = [
+        f"missing {name}"
+        for name in REQUIRED_SCENARIO_FILES
+        if not (path / name).is_file()
+    ]
+    if not _has_usable_chronic(path):
+        problems.append("no usable chronic directly under chronics/")
+    return problems
 
 
 def resolve_scenario() -> Path:
@@ -57,10 +83,10 @@ def resolve_scenario() -> Path:
     checked = []
     for candidate in candidates:
         candidate = candidate.resolve()
-        missing = _scenario_missing(candidate)
-        if not missing:
+        problems = _scenario_problems(candidate)
+        if not problems:
             return candidate
-        checked.append(f"{candidate} (missing: {', '.join(missing)})")
+        checked.append(f"{candidate} ({'; '.join(problems)})")
 
     raise FileNotFoundError(
         "No complete smoke-test Grid2Op scenario was found. Checked:\n  "
