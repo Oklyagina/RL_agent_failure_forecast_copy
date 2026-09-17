@@ -28,6 +28,7 @@ failure-forecast training. The older implementation remains under
 - [ENN Training](#enn-training)
 - [Project Structure](#project-structure)
 - [API](#api)
+- [Docker Instructions](DOCKER.md)
 - [Tests](#tests)
 - [Legacy Workflow](#legacy-workflow)
 
@@ -46,9 +47,18 @@ pip install -r requirements.txt
 
 ## Active Workflow
 
+The pre-trained artifacts and assets are stored in the release (currently - in the pre-release).
+Check [Configuration](#configuration) Section to set up the .env file.
+
+Download the .zip archives, unpack them into the root folder and run:
+
+```bash
+python run_example.py
+```
+
+To train everything from scratch, use:
 ```bash
 python run_pipeline.py
-python run_example.py
 ```
 
 The active workflow uses:
@@ -154,7 +164,6 @@ Main settings:
 ENV_NAME=ai4realnet_small
 ENV_LOCATION=environment
 AGENT_NAME=curriculum
-AGENT_FACTORY=
 ASSETS_DIR=assets
 ARTIFACTS_DIR=artifacts
 ROLLOUT_EPISODES=50
@@ -179,6 +188,7 @@ FAILURE_THRESHOLD=0.5
 EXAMPLE_N_STEPS=5
 
 SEED=0
+
 CURRICULUM_ITERATIONS=50
 CURRICULUM_JOBS=1
 CURRICULUM_TUTOR_DO_NOTHING_THRESHOLD=0.9
@@ -294,6 +304,9 @@ docker build -t curriculum-agent-api .
 docker run --env-file .env -p 8000:8000 curriculum-agent-api
 ```
 
+See [Docker Instructions](DOCKER.md) for detailed container usage, diagnostics,
+and Swagger testing steps.
+
 Endpoint:
 
 ```text
@@ -301,9 +314,10 @@ POST /api/v1/recommendation
 GET  /health
 ```
 
-The API returns InteractiveAI recommendation dictionaries with ENN uncertainty
-KPIs:
+The API returns main-project recommendation dictionaries. ENN uncertainty KPIs
+are included under `kpis`:
 
+- `uncertainty`
 - `epistemic_uncertainty_total_pctile`
 - `epistemic_uncertainty_action_pctile`
 
