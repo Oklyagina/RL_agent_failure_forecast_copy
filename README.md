@@ -13,8 +13,9 @@ It collects the agent's own rollout behavior, trains an Evidential Neural
 Network (ENN) on those observation/action pairs, and adds uncertainty
 percentiles to each recommendation.
 
-The original `run_pipeline.py` failure-forecast workflow has been archived in
-`archive/legacy/old_version/`.
+The active `run_pipeline.py` orchestrates rollout collection, ENN training, and
+failure-forecast training. The older implementation remains under
+`archive/legacy/old_version/` for reference.
 
 ## Quick Links
 
@@ -23,6 +24,7 @@ The original `run_pipeline.py` failure-forecast workflow has been archived in
 - [Supported Grid2Op Environment](#supported-grid2op-environment)
 - [Curriculum agent](#curriculum-agent)
 - [Configuration](#configuration)
+- [Pipeline](#pipeline)
 - [ENN Training](#enn-training)
 - [Project Structure](#project-structure)
 - [API](#api)
@@ -56,14 +58,13 @@ python run_example.py
 
 To train everything from scratch, use:
 ```bash
-python training/collect_rollouts.py 
-python training/train_enn.py
-python run_example.py
+python run_pipeline.py
 ```
 
 The active workflow uses:
 
 - `.env` and `project_config.py` for shared configuration.
+- `run_pipeline.py` to run the complete training pipeline.
 - `training/collect_rollouts.py` to collect `(observation, action)` pairs from
   a live agent.
 - `training/train_enn.py` to train and export the ENN bundle.
@@ -172,13 +173,25 @@ ENN_EPOCHS=100
 ENN_ANNEAL_EPOCHS=10
 ENN_BATCH_SIZE=512
 ENN_LR=1e-3
+ENN_HIDDEN_DIM=256
+ENN_DROPOUT=0.05
 ENN_VAL_FRAC=0.1
+
+FORECAST_EPISODES=50
+FORECAST_MAX_STEPS=0
+FORECAST_MEAN_TRIALS=20
+
+FAILURE_EPISODES=50
+FAILURE_MAX_STEPS=0
+FAILURE_SAMPLING_STRIDE=20
+FAILURE_THRESHOLD=0.5
 EXAMPLE_N_STEPS=5
+
 SEED=0
 
 CURRICULUM_ITERATIONS=50
 CURRICULUM_JOBS=1
-CURRICULUM_TUTOR_DO_NOTHING_THRESHOLD=0.85
+CURRICULUM_TUTOR_DO_NOTHING_THRESHOLD=0.9
 CURRICULUM_TUTOR_BEST_ACTION_THRESHOLD=0.999
 CURRICULUM_TUTOR_MIN_UNIQUE_ROWS=100
 ```
@@ -197,12 +210,37 @@ assets/ai4realnet_small/model/
 assets/ai4realnet_small/actions/
 ```
 
+## Pipeline
+
+Set the desired values in `.env`, then run:
+
+```bash
+python run_pipeline.py
+```
+
+Valid existing artifacts are reused automatically. To rerun a stage:
+
+```bash
+python run_pipeline.py --force-stage enn
+python run_pipeline.py --force-stage forecast --force-stage classifier
+python run_pipeline.py --force-stage all
+```
+
+Available stages are `enn-data`, `enn`, `forecast`, `failure-rows`, and
+`classifier`. Use `python run_pipeline.py --help` for the remaining run options.
+
+Run the complete pipeline with a small, isolated dataset and model:
+
+```bash
+python tests/smoke_pipeline.py
+```
+
 ## ENN Training
 
 Collect rollouts:
 
 ```bash
-python training/collect_rollouts.py --agent curriculum --episodes 50
+python training/collect_rollouts.py --agent-name curriculum --episodes 50
 ```
 
 Train and export the ENN bundle:
@@ -224,6 +262,7 @@ More training details are in `training/TRAINING.md`.
 |-- .env.example
 |-- project_config.py
 |-- recommendation_uncertainty.py
+|-- run_pipeline.py
 |-- run_example.py
 |-- app/
 |   |-- main.py
@@ -297,9 +336,8 @@ Grid2Op assets.
 
 ## Legacy Workflow
 
-The original failure-forecast pipeline, including `run_pipeline.py`,
-forecaster/classifier training, tutor-data ENN training, LLM rule generation,
-and old model/data paths, lives in:
+The older pipeline implementation, including tutor-data ENN training, LLM rule
+generation, and old model/data paths, lives in:
 
 ```text
 archive/legacy/old_version/

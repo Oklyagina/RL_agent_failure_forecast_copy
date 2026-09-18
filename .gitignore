@@ -1,0 +1,13 @@
+artifacts/
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+data_curriculum/
+data_expert/
+models_curriculum/
+models_expert/
+/actions.npy
+/calib.npz
+/enn_meta.json
+/scaler_params.json
