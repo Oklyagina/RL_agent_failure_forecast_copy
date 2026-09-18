@@ -65,10 +65,7 @@ By default, rollout bundles are written to:
 artifacts/<ENV_NAME>/<agent>/rollouts/
 |-- observations.npy
 |-- labels.npy
-|-- actions.npy
-|-- train.npz
-|-- validation.npz
-`-- test.npz
+`-- actions.npy
 ```
 
 `actions.npy` contains distinct action vectors in stable first-observed order.
@@ -76,6 +73,10 @@ artifacts/<ENV_NAME>/<agent>/rollouts/
 observation.
 
 At least two distinct policy actions are required for meaningful ENN training.
+
+When copying artifacts between machines, copy the contents into the existing
+`artifacts/` directory. Do not copy the directory itself into `artifacts/`,
+which creates an unintended `artifacts/artifacts/` tree.
 
 ## ENN Training
 

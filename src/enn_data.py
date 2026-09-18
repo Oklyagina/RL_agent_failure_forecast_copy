@@ -226,11 +226,6 @@ def save_rollout_bundle(
         "validation": (observations[va_idx], labels[va_idx]),
         "test": (observations[te_idx], labels[te_idx]),
     }
-    # Also save tutor-compatible NPZ files so older tooling can inspect/reuse them.
-    np.savez(out_dir / "train.npz", obs=splits["train"][0], act=splits["train"][1])
-    np.savez(out_dir / "validation.npz", obs=splits["validation"][0], act=splits["validation"][1])
-    np.savez(out_dir / "test.npz", obs=splits["test"][0], act=splits["test"][1])
-
     return ENNDataBundle(
         train=splits["train"],
         validation=splits["validation"],
