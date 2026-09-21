@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sys
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -140,7 +141,7 @@ def _cfg():
     )
 
 
-def test_history_features_and_forecast_injection():
+def _check_history_features_and_forecast_injection():
     obs = FakeObs(2016)
     observations = [FakeObs(i) for i in range(2017)]
     x = get_features_with_history(observations, obs)
@@ -161,7 +162,7 @@ def test_history_features_and_forecast_injection():
     assert forecast["aleatoric_gen_p_mean"] > forecast["aleatoric_load_p_mean"]
 
 
-def test_collection_labels_agent_response_blackout():
+def _check_collection_labels_agent_response_blackout():
     rows = collect_failure_forecast_rows(
         FakeEnv(),
         FakeAgent(),
@@ -178,14 +179,8 @@ def test_collection_labels_agent_response_blackout():
     assert rows[0]["line_disconnected"] == "line_bad"
 
 
-def test_classifier_metadata_and_prediction_round_trip():
-    try:
-        import joblib  # noqa: F401
-        import pandas as pd
-        import sklearn  # noqa: F401
-    except ModuleNotFoundError as exc:
-        print(f"test_classifier_metadata_and_prediction_round_trip: SKIPPED ({exc})")
-        return
+def _check_classifier_metadata_and_prediction_round_trip():
+    import pandas as pd
 
     rows = []
     for i in range(30):
@@ -221,12 +216,16 @@ def test_classifier_metadata_and_prediction_round_trip():
         assert predictor.metadata["environment"] == "fake_grid"
 
 
-def main() -> None:
-    test_history_features_and_forecast_injection()
-    test_collection_labels_agent_response_blackout()
-    test_classifier_metadata_and_prediction_round_trip()
-    print("test_failure_forecast: PASSED")
+class FailureForecastTests(unittest.TestCase):
+    def test_history_features_and_forecast_injection(self):
+        _check_history_features_and_forecast_injection()
+
+    def test_collection_labels_agent_response_blackout(self):
+        _check_collection_labels_agent_response_blackout()
+
+    def test_classifier_metadata_and_prediction_round_trip(self):
+        _check_classifier_metadata_and_prediction_round_trip()
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()
