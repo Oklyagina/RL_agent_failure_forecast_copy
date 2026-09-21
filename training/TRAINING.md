@@ -141,14 +141,12 @@ vectors.
 Run:
 
 ```bash
-python tests/validate_module.py
-python tests/test_api.py
-python tests/test_failure_forecast.py
+python -m unittest discover -s tests -v
 ```
 
-`tests/validate_module.py` checks the uncertainty module with a synthetic ENN.
-`tests/test_api.py` validates the FastAPI response shape without requiring real
-Grid2Op assets.
+The fast suite covers ENN inference and calibration, the API contract, and the
+failure-forecast classifier without requiring trained production artifacts or a
+live Grid2Op environment.
 
 A live Grid2Op validation requires the target environment dataset, active agent
 assets, trained ENN artifacts, and the pinned Grid2Op/LightSim dependency stack.

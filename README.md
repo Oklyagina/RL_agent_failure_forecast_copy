@@ -229,12 +229,6 @@ python run_pipeline.py --force-stage all
 Available stages are `enn-data`, `enn`, `forecast`, `failure-rows`, and
 `classifier`. Use `python run_pipeline.py --help` for the remaining run options.
 
-Run the complete pipeline with a small, isolated dataset and model:
-
-```bash
-python tests/smoke_pipeline.py
-```
-
 ## ENN Training
 
 Collect rollouts:
@@ -277,9 +271,9 @@ More training details are in `training/TRAINING.md`.
 |   |-- enn_data.py
 |   `-- enn_models.py
 |-- tests/
-|   |-- validate_module.py
 |   |-- test_api.py
-|   `-- synthetic fixtures
+|   |-- test_enn.py
+|   `-- test_failure_forecast.py
 |-- assets/
 |-- artifacts/
 |-- environment/
@@ -326,13 +320,13 @@ See `app/API.md` for the request/response contract and deployment notes.
 ## Tests
 
 ```bash
-python tests/validate_module.py
-python tests/test_api.py
+python -m unittest discover -s tests -v
 ```
 
-`tests/validate_module.py` checks the uncertainty module with a synthetic ENN.
-`tests/test_api.py` validates the FastAPI response shape without requiring real
-Grid2Op assets.
+The fast suite validates ENN inference and uncertainty KPIs, the FastAPI
+request/response contract, and failure-forecast classifier behavior. It uses
+synthetic inputs and temporary artifact directories, so trained weights and a
+live Grid2Op environment are not required.
 
 ## Legacy Workflow
 

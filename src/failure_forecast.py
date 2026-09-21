@@ -18,7 +18,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
-
+import pandas as pd
 import numpy as np
 
 from .agent_runtime import call_agent
@@ -871,7 +871,7 @@ class FailureForecastPredictor:
         prob = float(_failure_probability(self.model, X)[0])
         return {
             "failure_prediction": 1 if prob >= self.threshold else 0,
-            "failure_probability": prob,
+            "failure_probability": np.round(prob, 3),
         }
 
     def predict(
