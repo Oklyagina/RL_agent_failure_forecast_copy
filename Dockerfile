@@ -19,8 +19,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# API + agent binaries + module + trained artifacts (whole repo)
-COPY . .
+# Runtime Python modules only. Training scripts, tests, documentation, and
+# local development files are not needed by the recommendation service.
+COPY project_config.py recommendation_uncertainty.py run_example.py ./
+COPY app ./app
+COPY src ./src
+COPY curriculumagent ./curriculumagent
+
+# Runtime data. .dockerignore trims artifacts/ to the ENN inference bundle and
+# curated action set; rollout observations and failure-training outputs are not
+# part of the KPI-serving image.
+COPY environment ./environment
+COPY assets ./assets
+COPY artifacts ./artifacts
 
 EXPOSE 8000
 

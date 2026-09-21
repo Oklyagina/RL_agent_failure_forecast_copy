@@ -1,6 +1,9 @@
 .env
 .git
 .idea
+.codex
+.codex-finalizer
+.codex-output
 __pycache__/
 **/__pycache__/
 *.pyc
@@ -11,3 +14,22 @@ misc/
 tuning/
 archive/
 tests/
+training/
+agents/
+
+# The API needs only the trained ENN inference bundle and curated action set.
+# Keep model directories for any configured environment/agent, but omit large
+# rollout datasets, failure-forecast training products, and smoke-test outputs.
+artifacts/**/failure_forecast/
+artifacts/**/rollouts/*
+!artifacts/**/rollouts/actions.npy
+artifacts/**/*.provenance.json
+artifacts/pipeline_smoke/
+artifacts/pipeline_smoke_scenario/
+
+# Local-only repository files that are not referenced by the runtime image.
+environment.7z
+export_artifacts.py
+run_pipeline.py
+pytest.ini
+*.md

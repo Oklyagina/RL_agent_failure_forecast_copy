@@ -1,21 +1,19 @@
 # RL Agent Recommendation Uncertainty
 
-This repository now keeps the active workflow focused on agent-agnostic
-epistemic uncertainty scoring for Grid2Op recommendations.
+This repository provides agent-agnostic epistemic uncertainty scoring for
+Grid2Op recommendations. It collects an agent's rollout behavior, trains an
+Evidential Neural Network (ENN) on observation/action pairs, and adds calibrated
+uncertainty KPIs to the agent's recommendations.
 
-The current flow observes any agent that exposes:
+Compatible agents expose:
 
 ```python
 agent.act(obs, reward, done)
 ```
 
-It collects the agent's own rollout behavior, trains an Evidential Neural
-Network (ENN) on those observation/action pairs, and adds uncertainty
-percentiles to each recommendation.
-
-The active `run_pipeline.py` orchestrates rollout collection, ENN training, and
-failure-forecast training. The older implementation remains under
-`archive/legacy/old_version/` for reference.
+The active workflow is implemented by `run_pipeline.py`, `run_example.py`,
+`recommendation_uncertainty.py`, `training/`, and `app/`. The original workflow
+is preserved under `archive/legacy/old_version/`.
 
 ## Quick Links
 
@@ -32,11 +30,10 @@ failure-forecast training. The older implementation remains under
 - [Tests](#tests)
 - [Legacy Workflow](#legacy-workflow)
 
-
 ## Installation
 
-Use Python 3.9 or 3.10. Several pinned ML dependencies, especially Grid2Op,
-TensorFlow, Ray, and Torch, should not be silently upgraded.
+Use Python 3.9 or 3.10. The pinned Grid2Op, TensorFlow, Ray, and Torch versions
+do not support newer Python versions and should not be upgraded independently.
 
 ```bash
 conda create -n enn_uq python=3.10 -y
@@ -44,44 +41,42 @@ conda activate enn_uq
 pip install -r requirements.txt
 ```
 
-
 ## Active Workflow
 
-The pre-trained artifacts and assets are stored in the release (currently - in the pre-release).
-Check [Configuration](#configuration) Section to set up the .env file.
+Pre-trained agent assets and ENN artifacts are distributed separately in the
+project release archives. Extract them into the repository root so the
+following directories exist:
 
-Download the .zip archives, unpack them into the root folder and run:
+```text
+assets/<ENV_NAME>/
+artifacts/<ENV_NAME>/<AGENT_NAME>/
+environment/<ENV_NAME>
+```
+
+Create `.env` as described in [Configuration](#configuration), then run the
+end-to-end example:
 
 ```bash
 python run_example.py
 ```
 
-To train everything from scratch, use:
-```bash
-python run_pipeline.py
-```
+The workflow uses:
 
-The active workflow uses:
+- `run_pipeline.py` to run data collection and model training.
+- `training/collect_rollouts.py` and `training/train_enn.py` for ENN training.
+- `recommendation_uncertainty.py` to score an agent's selected action.
+- `app/main.py` to serve recommendations and KPIs through FastAPI.
 
-- `.env` and `project_config.py` for shared configuration.
-- `run_pipeline.py` to run the complete training pipeline.
-- `training/collect_rollouts.py` to collect `(observation, action)` pairs from
-  a live agent.
-- `training/train_enn.py` to train and export the ENN bundle.
-- `recommendation_uncertainty.py` to score recommendations.
-- `run_example.py` to run an end-to-end local example.
-- `app/main.py` to expose the recommendation API.
-
-Generated rollout and ENN artifacts are written under:
+Generated ENN data is stored under:
 
 ```text
-artifacts/<ENV_NAME>/<agent>/
+artifacts/<ENV_NAME>/<AGENT_NAME>/
 |-- rollouts/
 |   |-- observations.npy
 |   |-- labels.npy
 |   `-- actions.npy
 `-- model/
-    |-- enn_<agent>.pth
+    |-- enn_<AGENT_NAME>.pth
     |-- scaler_params.json
     |-- enn_meta.json
     `-- enn_pctile_calib.npz
@@ -89,29 +84,21 @@ artifacts/<ENV_NAME>/<agent>/
 
 ## Supported Grid2Op Environment
 
-The active configuration defaults to:
-
-```text
-ENV_NAME=ai4realnet_small # from https://github.com/ainetus/grid2op-scenario
-```
-
-The local Grid2Op scenario files are expected under:
+The default environment is `ai4realnet_small`, sourced from the
+[Grid2Op scenario repository](https://github.com/ainetus/grid2op-scenario). The
+scenario directory must resolve to:
 
 ```text
 <ENV_LOCATION>/<ENV_NAME>
 ```
 
-With the default `.env.example`, the committed local scenario is:
-
-```text
-environment/ai4realnet_small/
-```
+With the default configuration, this is
+`environment/ai4realnet_small/`.
 
 ### Curriculum Agent
 
-The active workflow expects a pre-trained CurriculumAgent package for the
-`ai4realnet_small` Grid2Op environment. This package is distributed through the
-project's GitHub Releases and should be placed under:
+The default policy is a pre-trained CurriculumAgent for
+`ai4realnet_small`. Its release archive must provide:
 
 ```text
 assets/ai4realnet_small/
@@ -119,31 +106,17 @@ assets/ai4realnet_small/
 `-- actions/
 ```
 
-The `model/` directory contains the trained agent model, and `actions/`
-contains the discrete action set used by the agent. The rollout, ENN training,
-example, and API scripts all expect this package to be available before they
-can collect agent behavior or produce recommendations.
-
-If the released agent artifact is not available, or if the agent needs to be
-trained again for a changed environment or action space, retrain it with:
+To retrain the policy for a changed environment or action space, run:
 
 ```bash
 python training/train_curriculumagent.py
 ```
 
-That script builds the Grid2Op environment from `.env` / `project_config.py`,
-initializes `CurriculumAgent`, and runs its full Teacher -> Tutor -> Junior ->
-Senior training pipeline. The trained package is saved back to:
-
-```text
-assets/<ENV_NAME>/
-```
-
-With the default configuration, this resolves to `assets/ai4realnet_small/`.
-
+The trained package is written to `assets/<ENV_NAME>/`.
 
 ## Configuration
-Create a local `.env` file:
+
+Create a local configuration file:
 
 ```bash
 cp .env.example .env
@@ -155,70 +128,32 @@ On Windows PowerShell:
 Copy-Item .env.example .env
 ```
 
-The active scripts read configuration from environment variables first, then
-`.env`, then defaults in `project_config.py`.
+Configuration precedence is: environment variables, `.env`, then defaults in
+`project_config.py`. The main path and identity settings are:
 
-Main settings:
-
-```text
+```dotenv
 ENV_NAME=ai4realnet_small
 ENV_LOCATION=environment
 AGENT_NAME=curriculum
+AGENT_FACTORY=
 ASSETS_DIR=assets
 ARTIFACTS_DIR=artifacts
-ROLLOUT_EPISODES=50
-
-ENN_ROLLOUT_MAX_STEPS=0
-ENN_EPOCHS=100
-ENN_ANNEAL_EPOCHS=10
-ENN_BATCH_SIZE=512
-ENN_LR=1e-3
-ENN_HIDDEN_DIM=256
-ENN_DROPOUT=0.05
-ENN_VAL_FRAC=0.1
-
-FORECAST_EPISODES=50
-FORECAST_MAX_STEPS=0
-FORECAST_MEAN_TRIALS=20
-
-FAILURE_EPISODES=50
-FAILURE_MAX_STEPS=0
-FAILURE_SAMPLING_STRIDE=20
-FAILURE_THRESHOLD=0.5
-EXAMPLE_N_STEPS=5
-
-SEED=0
-
-CURRICULUM_ITERATIONS=50
-CURRICULUM_JOBS=1
-CURRICULUM_TUTOR_DO_NOTHING_THRESHOLD=0.9
-CURRICULUM_TUTOR_BEST_ACTION_THRESHOLD=0.999
-CURRICULUM_TUTOR_MIN_UNIQUE_ROWS=100
 ```
 
-The active CurriculumAgent package should be available under:
-
-```text
-assets/<ENV_NAME>/model/
-assets/<ENV_NAME>/actions/
-```
-
-With the default environment name:
-
-```text
-assets/ai4realnet_small/model/
-assets/ai4realnet_small/actions/
-```
+Training parameters, episode limits, thresholds, and seeds are documented in
+`.env.example`. Relative paths are resolved from the repository root. To use a
+different policy, set `AGENT_FACTORY=module:function`; the factory receives the
+Grid2Op environment and returns an agent with an `act` method.
 
 ## Pipeline
 
-Set the desired values in `.env`, then run:
+Run the full training pipeline with the values configured in `.env`:
 
 ```bash
 python run_pipeline.py
 ```
 
-Valid existing artifacts are reused automatically. To rerun a stage:
+Valid artifacts are reused automatically. Force individual stages when needed:
 
 ```bash
 python run_pipeline.py --force-stage enn
@@ -227,118 +162,96 @@ python run_pipeline.py --force-stage all
 ```
 
 Available stages are `enn-data`, `enn`, `forecast`, `failure-rows`, and
-`classifier`. Use `python run_pipeline.py --help` for the remaining run options.
+`classifier`. Run `python run_pipeline.py --help` for all options.
 
 ## ENN Training
 
-Collect rollouts:
+To train only the uncertainty model:
 
 ```bash
 python training/collect_rollouts.py --agent-name curriculum --episodes 50
-```
-
-Train and export the ENN bundle:
-
-```bash
 python training/train_enn.py --agent-name curriculum
 ```
 
-For a different agent, configure `AGENT_FACTORY=module:function`. The factory
-receives the Grid2Op environment and must return an object exposing
-`agent.act(obs, reward, done)`.
-
-More training details are in `training/TRAINING.md`.
-
-## Project Structure
-
-```text
-.
-|-- .env.example
-|-- project_config.py
-|-- recommendation_uncertainty.py
-|-- run_pipeline.py
-|-- run_example.py
-|-- app/
-|   |-- main.py
-|   `-- API.md
-|-- training/
-|   |-- collect_rollouts.py
-|   |-- train_enn.py
-|   |-- train_curriculumagent.py
-|   `-- TRAINING.md
-|-- src/
-|   |-- agent_runtime.py
-|   |-- enn_data.py
-|   `-- enn_models.py
-|-- tests/
-|   |-- test_api.py
-|   |-- test_enn.py
-|   `-- test_failure_forecast.py
-|-- assets/
-|-- artifacts/
-|-- environment/
-|-- curriculumagent/
-`-- archive/legacy/old_version/
-```
-
+See [training/TRAINING.md](training/TRAINING.md) for artifact formats, training
+options, and failure-forecast stages.
 
 
 ## API
 
-Run locally:
+Run the API locally:
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Docker:
+Or build and run it with Docker:
 
 ```bash
 docker build -t curriculum-agent-api .
 docker run --env-file .env -p 8000:8000 curriculum-agent-api
 ```
 
-See [Docker Instructions](DOCKER.md) for detailed container usage, diagnostics,
-and Swagger testing steps.
-
-Endpoint:
+Available endpoints:
 
 ```text
-POST /api/v1/recommendation
 GET  /health
+GET  /diagnostics
+GET  /docs
+POST /api/v1/recommendation
 ```
 
-The API returns main-project recommendation dictionaries. ENN uncertainty KPIs
-are included under `kpis`:
+Before requesting a recommendation, confirm that `/diagnostics` reports
+`artifact_validation.ok: true` and `services.can_load: true`. In Swagger at
+`http://localhost:8000/docs`, execute `POST /api/v1/recommendation` with:
 
-- `uncertainty`
-- `epistemic_uncertainty_total_pctile`
-- `epistemic_uncertainty_action_pctile`
+```json
+{
+  "event": {},
+  "context": {}
+}
+```
 
-See `app/API.md` for the request/response contract and deployment notes.
+An empty context uses `env.reset()` for a smoke test. A successful response is
+a list of recommendation dictionaries containing `actions` and `kpis`. The KPI
+object includes the uncertainty percentage, total and action percentiles, and
+uncertainty/confidence levels.
+
+See [Docker Instructions](DOCKER.md) and [app/API.md](app/API.md) for operational
+details and the complete request/response contract.
 
 ## Tests
+
+Run the synthetic test suite:
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The fast suite validates ENN inference and uncertainty KPIs, the FastAPI
-request/response contract, and failure-forecast classifier behavior. It uses
-synthetic inputs and temporary artifact directories, so trained weights and a
-live Grid2Op environment are not required.
+These tests cover ENN inference, uncertainty KPIs, the FastAPI contract, and
+failure-forecast behavior without requiring trained weights or a live Grid2Op
+environment.
+
+## Project Structure
+
+```text
+.
+|-- app/                         FastAPI service and recommendation formatter
+|-- artifacts/                   Generated rollouts and trained models
+|-- assets/                      Trained policy model and action set
+|-- curriculumagent/             CurriculumAgent implementation
+|-- environment/                 Local Grid2Op scenarios
+|-- src/                         Shared agent, data, and ENN modules
+|-- tests/                       Synthetic unit and API tests
+|-- training/                    Data collection and training scripts
+|-- project_config.py            Shared environment configuration
+|-- recommendation_uncertainty.py
+|-- run_example.py
+`-- run_pipeline.py
+```
 
 ## Legacy Workflow
 
-The older pipeline implementation, including tutor-data ENN training, LLM rule
-generation, and old model/data paths, lives in:
-
-```text
-archive/legacy/old_version/
-```
-
-Its preserved documentation is:
-
-```text
-archive/legacy/old_version/README.md
-```
+The original tutor-data ENN pipeline, LLM rule generation, and its documentation
+are preserved under `archive/legacy/old_version/`. They are not used by the
+active API or training pipeline.
