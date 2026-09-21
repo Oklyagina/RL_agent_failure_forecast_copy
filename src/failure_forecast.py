@@ -871,7 +871,7 @@ class FailureForecastPredictor:
         prob = float(_failure_probability(self.model, X)[0])
         return {
             "failure_prediction": 1 if prob >= self.threshold else 0,
-            "failure_probability": prob,
+            "failure_probability": np.round(prob, 3),
         }
 
     def predict(

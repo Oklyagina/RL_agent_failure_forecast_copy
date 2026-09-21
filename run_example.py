@@ -7,7 +7,7 @@ printed; anything can still be overridden in CONFIG below.
 
 Pipeline: Grid2Op environment -> configured policy ->
 trained ENN + training scaler (rebuilt from artifacts/, plain JSON) ->
-percentile calibration -> assess_recommendation per step -> output,
+percentile calibration -> assess_recommendation -> t+12 failure prediction -> output,
 including the recommendations list in the InteractiveAI format ("kpis").
 
 Requirements: Python 3.9/3.10 + requirements.txt (see README).
@@ -24,7 +24,7 @@ import numpy as np
 
 from project_config import (AGENT_FACTORY, AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR,
                             configure_grid2op_warnings, ENV_DIR,
-                            ENV_NAME, EXAMPLE_N_STEPS,
+                            ENV_NAME,
                             SEED as CONFIG_SEED)
 
 ROOT = Path(__file__).resolve().parent
@@ -38,7 +38,7 @@ CALIBRATION_NPZ = None      # e.g. Path("artifacts/ai4realnet_small/curriculum/m
 SCALER_JSON = None          # e.g. Path("artifacts/ai4realnet_small/curriculum/model/scaler_params.json")
 ENN_META_JSON = None        # e.g. Path("artifacts/ai4realnet_small/curriculum/model/enn_meta.json")
 AGENT_DIR = None            # dir containing model/ and actions/ subfolders
-N_STEPS = EXAMPLE_N_STEPS
+N_STEPS = 13  # one hour of history plus the state being assessed
 SEED = CONFIG_SEED
 # ----------------------------------------------------------------------------
 
@@ -312,9 +312,12 @@ def main() -> None:
     configure_grid2op_warnings()
 
     import grid2op
+    import joblib
     from lightsim2grid import LightSimBackend
     from recommendation_uncertainty import (load_calibration,
                                             assess_recommendation)
+    from src.failure_forecast import (FailureForecastConfig,
+                                      FailureForecastPredictor)
 
     # 0. Auto-discovery --------------------------------------------------------
     print("[0/4] resolving artifacts:")
@@ -323,6 +326,13 @@ def main() -> None:
     weights = find_enn_weights(prefer_dir=meta_json.parent)
     actions_path = find_actions_npy(meta)
     agent_dir = None if AGENT_FACTORY else find_agent_dir()
+    failure_dir = ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "failure_forecast"
+    failure_paths = [failure_dir / "mean_forecaster.pkl",
+                     failure_dir / "aleatoric_forecaster.pkl",
+                     failure_dir / "failure_classifier.pkl"]
+    missing = [str(path) for path in failure_paths if not path.is_file()]
+    if missing:
+        sys.exit("[error] missing failure artifacts: " + ", ".join(missing))
 
     # 1. Environment -----------------------------------------------------------
     env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
@@ -343,29 +353,45 @@ def main() -> None:
         action_set=str(actions_path),
         class_mapping=str(meta_json),
     )
+    mean_model, aleatoric_model = map(joblib.load, failure_paths[:2])
+    predictor = FailureForecastPredictor.load(failure_paths[2])
+    line = next(iter(predictor.line_map))
+    failure_cfg = FailureForecastConfig.from_env(
+        env, env_name=ENV_NAME, agent_name=AGENT_NAME,
+        artifact_dir=failure_dir, lines_to_test=[line])
     print(f"[3/4] ENN ({meta['num_classes']} classes), scaler and "
-          f"calibration loaded")
+          f"calibration loaded; failure models loaded")
 
     # 4. Assess live recommendations -------------------------------------------
     print(f"[4/4] running {N_STEPS} steps:\n")
     reward, done = env.reward_range[0], False
     recommendations = []
+    observations = []
     for t in range(N_STEPS):
         from src.agent_runtime import call_agent
+        observations.append(obs)
         action = call_agent(agent, obs, reward=reward, done=done)
         info = assess_recommendation(obs, agent, enn, calibration, action=action)
         print(f"  step {t}: chosen_action_id={info['chosen_action_id']}  "
               f"total_pctile={info['epistemic_uncertainty_total_pctile']}  "
               f"action_pctile={info['epistemic_uncertainty_action_pctile']}")
         recommendations.append(to_interactiveai(action, info))
+        if t == N_STEPS - 1:
+            failure = predictor.predict(
+                env, agent, obs, observations, line,
+                mean_model, aleatoric_model, failure_cfg)
+            recommendations[-1]["kpis"].update(failure)
+            print(f"  t+12 failure on {line}: {failure}")
+            break
         obs, reward, done, _ = env.step(action)
         if done:
             obs = env.reset()
+            observations = []
             done = False
 
     print("\nRecommendations list in the InteractiveAI format "
-          "(first entry shown):")
-    print(json.dumps(recommendations[0], indent=2)[:1500])
+          "(final entry shown):")
+    print(json.dumps(recommendations[-1], indent=2)[:1500])
 
 
 if __name__ == "__main__":
