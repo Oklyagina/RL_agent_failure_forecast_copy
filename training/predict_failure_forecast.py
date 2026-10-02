@@ -96,7 +96,7 @@ def main() -> None:
             lines_to_test=[args.line],
         )
         print(predictor.predict(
-            env, agent, obs, observations, args.line,
+            env, obs, observations, args.line,
             mean_model, aleatoric_model, cfg,
         ))
     finally:

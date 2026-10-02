@@ -21,6 +21,7 @@ from src.failure_forecast import (  # noqa: E402
     FailureForecastConfig,
     FailureForecastPredictor,
     collect_failure_forecast_rows,
+    collect_forecaster_training_data,
     get_features_with_history,
     prepare_classifier_dataframe,
     run_t12_forecast,
@@ -51,7 +52,7 @@ class FakeActionSpace:
 
 
 class FakeObs:
-    def __init__(self, step=0, *, attacked=False):
+    def __init__(self, step=0, *, attacked=False, disconnected_line=None):
         self.current_step = step
         self.max_step = 100
         self.load_p = np.asarray([10.0 + step], dtype=np.float32)
@@ -59,19 +60,27 @@ class FakeObs:
         self.gen_p = np.asarray([20.0 + step], dtype=np.float32)
         self.gen_q = np.asarray([3.0], dtype=np.float32)
         self.gen_v = np.asarray([142.0], dtype=np.float32)
-        self.rho = np.asarray([0.40, 0.96 if attacked else 0.50], dtype=np.float32)
+        attacked_rho = 0.96 + 0.01 * (disconnected_line or 0)
+        self.rho = np.asarray(
+            [0.40, attacked_rho if attacked else 0.50], dtype=np.float32
+        )
         self.day = 7
         self.hour_of_day = 10
         self.minute_of_hour = 5
         self.day_of_week = 2
         self._forecasted_inj = []
         self.attacked = attacked
+        self.disconnected_line = disconnected_line
 
     def to_vect(self):
         return np.asarray([self.current_step, *self.rho], dtype=np.float32)
 
     def copy(self):
-        copied = FakeObs(self.current_step, attacked=self.attacked)
+        copied = FakeObs(
+            self.current_step,
+            attacked=self.attacked,
+            disconnected_line=self.disconnected_line,
+        )
         copied._forecasted_inj = list(self._forecasted_inj)
         return copied
 
@@ -84,7 +93,11 @@ class FakeObs:
             obs._forecasted_inj = list(self._forecasted_inj)
             return obs, 0.0, False, {"exception": []}
         if action.kind == "disconnect":
-            return FakeObs(self.current_step + 1, attacked=True), 0.0, False, {"exception": []}
+            return FakeObs(
+                self.current_step + 1,
+                attacked=True,
+                disconnected_line=action.line_id,
+            ), 0.0, False, {"exception": []}
         if action.kind == "agent":
             return FakeObs(self.current_step + 1, attacked=True), 0.0, True, {
                 "exception": [RuntimeError("blackout")]
@@ -114,21 +127,55 @@ class FakeEnv:
 
 
 class FakeAgent:
+    def __init__(self):
+        self.seen_observations = []
+
     def act(self, obs, reward=0.0, done=False):
-        del obs, reward, done
+        del reward, done
+        self.seen_observations.append(obs)
+        return FakeAction("agent")
+
+
+class ObservationOnlyAgent:
+    """A compatible non-CurriculumAgent policy with a minimal signature."""
+
+    def __init__(self):
+        self.seen_observations = []
+
+    def act(self, obs):
+        self.seen_observations.append(obs)
         return FakeAction("agent")
 
 
 class FakeMeanModel:
+    def __init__(self):
+        self.calls = 0
+
     def predict(self, rows):
         assert len(rows) == 1
+        self.calls += 1
         return np.asarray([[11.0, 4.0, 99.0]], dtype=np.float32)
 
 
 class FakeAleatoricModel:
+    def __init__(self):
+        self.calls = 0
+
     def predict(self, rows):
         assert len(rows) == 1
+        self.calls += 1
         return np.log1p(np.asarray([[1.0, 4.0, 9.0]], dtype=np.float32))
+
+
+class RecordingClassifier:
+    classes_ = np.asarray([0, 1])
+
+    def __init__(self):
+        self.rows = []
+
+    def predict_proba(self, rows):
+        self.rows.append(rows.copy())
+        return np.asarray([[0.25, 0.75]], dtype=float)
 
 
 def _cfg():
@@ -163,9 +210,10 @@ def _check_history_features_and_forecast_injection():
 
 
 def _check_collection_labels_agent_response_blackout():
+    agent = ObservationOnlyAgent()
     rows = collect_failure_forecast_rows(
         FakeEnv(),
-        FakeAgent(),
+        agent,
         FakeMeanModel(),
         FakeAleatoricModel(),
         _cfg(),
@@ -177,6 +225,48 @@ def _check_collection_labels_agent_response_blackout():
     assert rows[0]["failed"] == 1
     assert rows[0]["label_reason"] == "agent_action_blackout"
     assert rows[0]["line_disconnected"] == "line_bad"
+    assert rows[0]["fcast_max_line_rho"] == np.float32(0.97)
+    assert any(obs.attacked for obs in agent.seen_observations)
+
+
+def _check_forecaster_targets_t12():
+    X, y = collect_forecaster_training_data(
+        FakeEnv(), FakeAgent(), episodes=1, max_steps=13
+    )
+    assert X.shape == (1, 19)
+    np.testing.assert_allclose(y[0], [22.0, 14.0, 32.0])
+
+
+def _check_runtime_contingencies_share_forecast_and_use_scenario_features():
+    classifier = RecordingClassifier()
+    predictor = FailureForecastPredictor(
+        classifier,
+        {
+            "features": CLASSIFIER_FEATURES,
+            "line_map": {"ok": 0, "bad": 1},
+            "decision_threshold": 0.5,
+        },
+    )
+    mean_model = FakeMeanModel()
+    aleatoric_model = FakeAleatoricModel()
+    obs = FakeObs(12)
+    results = predictor.predict_many(
+        FakeEnv(),
+        obs,
+        [FakeObs(i) for i in range(13)],
+        ["line_ok", "line_bad"],
+        mean_model,
+        aleatoric_model,
+        _cfg(),
+    )
+    assert mean_model.calls == 1
+    assert aleatoric_model.calls == 1
+    assert [result["line"] for result in results] == ["line_ok", "line_bad"]
+    assert all(result["failure_prediction"] == 1 for result in results)
+    assert len(classifier.rows) == 2
+    assert classifier.rows[0].columns.tolist() == CLASSIFIER_FEATURES
+    assert classifier.rows[0]["fcast_max_line_rho"].iloc[0] == np.float32(0.96)
+    assert classifier.rows[1]["fcast_max_line_rho"].iloc[0] == np.float32(0.97)
 
 
 def _check_classifier_metadata_and_prediction_round_trip():
@@ -222,6 +312,12 @@ class FailureForecastTests(unittest.TestCase):
 
     def test_collection_labels_agent_response_blackout(self):
         _check_collection_labels_agent_response_blackout()
+
+    def test_forecaster_targets_t12(self):
+        _check_forecaster_targets_t12()
+
+    def test_runtime_contingencies_share_forecast_and_use_scenario_features(self):
+        _check_runtime_contingencies_share_forecast_and_use_scenario_features()
 
     def test_classifier_metadata_and_prediction_round_trip(self):
         _check_classifier_metadata_and_prediction_round_trip()

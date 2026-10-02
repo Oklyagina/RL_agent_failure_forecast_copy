@@ -355,10 +355,10 @@ def main() -> None:
     )
     mean_model, aleatoric_model = map(joblib.load, failure_paths[:2])
     predictor = FailureForecastPredictor.load(failure_paths[2])
-    line = next(iter(predictor.line_map))
+    lines = list(predictor.line_map)
     failure_cfg = FailureForecastConfig.from_env(
         env, env_name=ENV_NAME, agent_name=AGENT_NAME,
-        artifact_dir=failure_dir, lines_to_test=[line])
+        artifact_dir=failure_dir, lines_to_test=lines)
     print(f"[3/4] ENN ({meta['num_classes']} classes), scaler and "
           f"calibration loaded; failure models loaded")
 
@@ -377,11 +377,11 @@ def main() -> None:
               f"action_pctile={info['epistemic_uncertainty_action_pctile']}")
         recommendations.append(to_interactiveai(action, info))
         if t == N_STEPS - 1:
-            failure = predictor.predict(
-                env, agent, obs, observations, line,
+            failures = predictor.predict_many(
+                env, obs, observations, lines,
                 mean_model, aleatoric_model, failure_cfg)
-            recommendations[-1]["kpis"].update(failure)
-            print(f"  t+12 failure on {line}: {failure}")
+            recommendations[-1]["kpis"]["failure_forecasts"] = failures
+            print(f"  t+12 failure forecasts: {failures}")
             break
         obs, reward, done, _ = env.step(action)
         if done:
