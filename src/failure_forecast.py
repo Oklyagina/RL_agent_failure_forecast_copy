@@ -246,6 +246,40 @@ def _simulator_result(simulator: Any) -> Tuple[Any, float, bool, dict]:
     return simulator.current_obs, 0.0, not converged, {"exception": exceptions}
 
 
+class _SimulatorBackedObservation:
+    """Expose a Simulator state through the observation interface used by agents.
+
+    Grid2Op deliberately removes ``_obs_env`` from ``Simulator.current_obs``, so
+    calling ``current_obs.simulate(...)`` raises ``NoForecastAvailable``.  Some
+    otherwise compatible agents use that method while selecting an action.  This
+    adapter keeps all observation attributes from the actual contingency state
+    while routing branch simulations back through the corresponding Simulator.
+    """
+
+    def __init__(self, simulator: Any):
+        self._simulator = simulator
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._simulator.current_obs, name)
+
+    def copy(self) -> "_SimulatorBackedObservation":
+        return _SimulatorBackedObservation(self._simulator.copy())
+
+    def get_simulator(self) -> Any:
+        return self._simulator.copy()
+
+    def simulate(self, action: Any, time_step: int = 1) -> Tuple[Any, float, bool, dict]:
+        if int(time_step) != 1:
+            raise ValueError(
+                "Simulator-backed contingency observations support only "
+                "single-step action simulations."
+            )
+        result = self._simulator.predict(action)
+        obs, reward, done, info = _simulator_result(result)
+        info.update({"is_illegal": False, "is_ambiguous": False})
+        return _SimulatorBackedObservation(result), reward, done, info
+
+
 def _get_uncertainty(model_enn: Any, obs: Any,
                      get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]]) -> float:
     """Compute optional ENN epistemic uncertainty, returning NaN if unavailable."""
@@ -455,7 +489,12 @@ def evaluate_line_failure(
 
     # The label evaluates the configured policy on the actual future
     # contingency scenario, never on the original observation at time t.
-    agent_action = call_agent(agent, attacked_obs, reward=0.0, done=False)
+    agent_obs = (
+        _SimulatorBackedObservation(attacked_simulator)
+        if attacked_simulator is not None
+        else attacked_obs
+    )
+    agent_action = call_agent(agent, agent_obs, reward=0.0, done=False)
     if attacked_simulator is not None:
         action_obs, _, action_done, action_info = _simulator_result(
             attacked_simulator.predict(agent_action)

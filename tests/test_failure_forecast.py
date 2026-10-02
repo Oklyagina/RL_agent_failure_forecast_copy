@@ -20,6 +20,7 @@ from src.failure_forecast import (  # noqa: E402
     CLASSIFIER_FEATURES,
     FailureForecastConfig,
     FailureForecastPredictor,
+    _SimulatorBackedObservation,
     collect_failure_forecast_rows,
     collect_forecaster_training_data,
     get_features_with_history,
@@ -124,6 +125,23 @@ class FakeEnv:
         del action
         self.step_count += 1
         return FakeObs(self.step_count), 0.0, self.step_count >= 14, {"exception": []}
+
+
+class FakeSimulator:
+    def __init__(self, obs):
+        self.current_obs = obs
+        self.converged = True
+        self.error = None
+
+    def copy(self):
+        return FakeSimulator(self.current_obs.copy())
+
+    def predict(self, action):
+        return FakeSimulator(FakeObs(
+            self.current_obs.current_step + 1,
+            attacked=self.current_obs.attacked,
+            disconnected_line=self.current_obs.disconnected_line,
+        ))
 
 
 class FakeAgent:
@@ -269,6 +287,18 @@ def _check_runtime_contingencies_share_forecast_and_use_scenario_features():
     assert classifier.rows[1]["fcast_max_line_rho"].iloc[0] == np.float32(0.97)
 
 
+def _check_simulator_backed_observation_supports_agent_simulation():
+    scenario = FakeObs(12, attacked=True, disconnected_line=1)
+    adapter = _SimulatorBackedObservation(FakeSimulator(scenario))
+    simulated, _, done, info = adapter.simulate(FakeAction("noop"))
+    assert adapter.attacked
+    assert simulated.attacked
+    assert not done
+    assert info["exception"] == []
+    assert info["is_illegal"] is False
+    assert info["is_ambiguous"] is False
+
+
 def _check_classifier_metadata_and_prediction_round_trip():
     import pandas as pd
 
@@ -318,6 +348,9 @@ class FailureForecastTests(unittest.TestCase):
 
     def test_runtime_contingencies_share_forecast_and_use_scenario_features(self):
         _check_runtime_contingencies_share_forecast_and_use_scenario_features()
+
+    def test_simulator_backed_observation_supports_agent_simulation(self):
+        _check_simulator_backed_observation_supports_agent_simulation()
 
     def test_classifier_metadata_and_prediction_round_trip(self):
         _check_classifier_metadata_and_prediction_round_trip()
