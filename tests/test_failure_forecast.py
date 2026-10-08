@@ -20,7 +20,9 @@ from src.failure_forecast import (  # noqa: E402
     CLASSIFIER_FEATURES,
     FailureForecastConfig,
     FailureForecastPredictor,
+    _SimulatorBackedObservation,
     collect_failure_forecast_rows,
+    collect_forecaster_training_data,
     get_features_with_history,
     prepare_classifier_dataframe,
     run_t12_forecast,
@@ -51,7 +53,8 @@ class FakeActionSpace:
 
 
 class FakeObs:
-    def __init__(self, step=0, *, attacked=False):
+    def __init__(self, step=0, *, attacked=False, disconnected_line=None,
+                 after_agent=False):
         self.current_step = step
         self.max_step = 100
         self.load_p = np.asarray([10.0 + step], dtype=np.float32)
@@ -59,19 +62,31 @@ class FakeObs:
         self.gen_p = np.asarray([20.0 + step], dtype=np.float32)
         self.gen_q = np.asarray([3.0], dtype=np.float32)
         self.gen_v = np.asarray([142.0], dtype=np.float32)
-        self.rho = np.asarray([0.40, 0.96 if attacked else 0.50], dtype=np.float32)
+        attacked_rho = 0.96 + 0.01 * (disconnected_line or 0)
+        if after_agent:
+            attacked_rho = 0.20
+        self.rho = np.asarray(
+            [0.40, attacked_rho if attacked else 0.50], dtype=np.float32
+        )
         self.day = 7
         self.hour_of_day = 10
         self.minute_of_hour = 5
         self.day_of_week = 2
         self._forecasted_inj = []
         self.attacked = attacked
+        self.disconnected_line = disconnected_line
+        self.after_agent = after_agent
 
     def to_vect(self):
         return np.asarray([self.current_step, *self.rho], dtype=np.float32)
 
     def copy(self):
-        copied = FakeObs(self.current_step, attacked=self.attacked)
+        copied = FakeObs(
+            self.current_step,
+            attacked=self.attacked,
+            disconnected_line=self.disconnected_line,
+            after_agent=self.after_agent,
+        )
         copied._forecasted_inj = list(self._forecasted_inj)
         return copied
 
@@ -84,9 +99,23 @@ class FakeObs:
             obs._forecasted_inj = list(self._forecasted_inj)
             return obs, 0.0, False, {"exception": []}
         if action.kind == "disconnect":
-            return FakeObs(self.current_step + 1, attacked=True), 0.0, False, {"exception": []}
+            attacked = FakeObs(
+                self.current_step + 1,
+                attacked=True,
+                disconnected_line=action.line_id,
+            )
+            if action.line_id == 2:
+                return attacked, 0.0, True, {
+                    "exception": [RuntimeError("contingency blackout")]
+                }
+            return attacked, 0.0, False, {"exception": []}
         if action.kind == "agent":
-            return FakeObs(self.current_step + 1, attacked=True), 0.0, True, {
+            return FakeObs(
+                self.current_step + 1,
+                attacked=True,
+                disconnected_line=self.disconnected_line,
+                after_agent=True,
+            ), 0.0, True, {
                 "exception": [RuntimeError("blackout")]
             }
         raise AssertionError(action.kind)
@@ -97,10 +126,10 @@ class FakeEnv:
     reward_range = (0.0, 1.0)
     n_load = 1
     n_gen = 1
-    n_line = 2
+    n_line = 3
     gen_pmin = np.asarray([0.0])
     gen_pmax = np.asarray([50.0])
-    name_line = ["line_ok", "line_bad"]
+    name_line = ["line_ok", "line_bad", "line_trip"]
 
     def reset(self, seed=None):
         del seed
@@ -114,30 +143,97 @@ class FakeEnv:
 
 
 class FakeAgent:
+    def __init__(self):
+        self.seen_observations = []
+
     def act(self, obs, reward=0.0, done=False):
-        del obs, reward, done
+        del reward, done
+        self.seen_observations.append(obs)
         return FakeAction("agent")
 
 
+class ObservationOnlyAgent:
+    """Agent exercising the minimal supported ``act(obs)`` interface."""
+
+    def __init__(self):
+        self.seen_observations = []
+
+    def act(self, obs):
+        self.seen_observations.append(obs)
+        return FakeAction("agent")
+
+
+class ExplodingAgent:
+    def act(self, *_args, **_kwargs):
+        raise AssertionError("Inference must not execute the agent")
+
+
 class FakeMeanModel:
+    def __init__(self):
+        self.calls = 0
+
     def predict(self, rows):
         assert len(rows) == 1
+        self.calls += 1
         return np.asarray([[11.0, 4.0, 99.0]], dtype=np.float32)
 
 
 class FakeAleatoricModel:
+    def __init__(self):
+        self.calls = 0
+
     def predict(self, rows):
         assert len(rows) == 1
+        self.calls += 1
         return np.log1p(np.asarray([[1.0, 4.0, 9.0]], dtype=np.float32))
 
 
-def _cfg():
+class FakeSimulator:
+    def __init__(self, obs):
+        self.current_obs = obs
+        self.converged = True
+        self.error = None
+
+    def copy(self):
+        return FakeSimulator(self.current_obs.copy())
+
+    def predict(self, action):
+        if action.kind == "agent":
+            return FakeSimulator(FakeObs(
+                self.current_obs.current_step + 1,
+                attacked=True,
+                disconnected_line=self.current_obs.disconnected_line,
+                after_agent=True,
+            ))
+        return FakeSimulator(self.current_obs.copy())
+
+
+class RecordingClassifier:
+    classes_ = np.asarray([0, 1])
+
+    def __init__(self):
+        self.rows = []
+
+    def predict_proba(self, rows):
+        self.rows.append(rows.copy())
+        return np.asarray([[0.25, 0.75]], dtype=float)
+
+
+class FakeEnn:
+    input_dim = 3
+
+
+def _rho_uncertainty(_model, vect):
+    return float(vect[0, -1])
+
+
+def _cfg(lines=None):
     return FailureForecastConfig.from_env(
         FakeEnv(),
         env_name="fake_grid",
         agent_name="curriculum",
         artifact_dir=Path("unused"),
-        lines_to_test=["line_bad"],
+        lines_to_test=lines or ["line_bad"],
     )
 
 
@@ -163,20 +259,121 @@ def _check_history_features_and_forecast_injection():
 
 
 def _check_collection_labels_agent_response_blackout():
+    agent = ObservationOnlyAgent()
+    mean_model = FakeMeanModel()
+    aleatoric_model = FakeAleatoricModel()
     rows = collect_failure_forecast_rows(
         FakeEnv(),
-        FakeAgent(),
+        agent,
+        mean_model,
+        aleatoric_model,
+        _cfg(["line_ok", "line_bad"]),
+        episodes=1,
+        sampling_stride=12,
+        max_steps=13,
+        model_enn=FakeEnn(),
+        get_uncertainty_fn=_rho_uncertainty,
+    )
+    assert len(rows) == 2
+    assert mean_model.calls == 1
+    assert aleatoric_model.calls == 1
+    by_line = {row["line_disconnected"]: row for row in rows}
+    assert set(by_line) == {"line_ok", "line_bad"}
+    assert all(row["failed"] == 1 for row in rows)
+    assert all(row["label_reason"] == "agent_action_blackout" for row in rows)
+    assert np.isclose(by_line["line_ok"]["fcast_max_line_rho"], 0.96)
+    assert np.isclose(by_line["line_bad"]["fcast_max_line_rho"], 0.97)
+    assert np.isclose(by_line["line_ok"]["epistemic_after"], 0.96)
+    assert np.isclose(by_line["line_bad"]["epistemic_after"], 0.97)
+    assert any(
+        getattr(seen, "attacked", False)
+        and getattr(seen, "disconnected_line", None) == 1
+        for seen in agent.seen_observations
+    )
+
+
+def _check_forecaster_targets_t12():
+    X, y = collect_forecaster_training_data(
+        FakeEnv(), FakeAgent(), episodes=1, max_steps=13
+    )
+    assert X.shape == (1, 19)
+    np.testing.assert_allclose(y[0], [22.0, 14.0, 32.0])
+
+
+def _check_immediate_contingency_blackout_skips_agent_action():
+    agent = ObservationOnlyAgent()
+    rows = collect_failure_forecast_rows(
+        FakeEnv(),
+        agent,
         FakeMeanModel(),
         FakeAleatoricModel(),
-        _cfg(),
+        _cfg(["line_trip"]),
         episodes=1,
         sampling_stride=12,
         max_steps=13,
     )
     assert len(rows) == 1
     assert rows[0]["failed"] == 1
-    assert rows[0]["label_reason"] == "agent_action_blackout"
-    assert rows[0]["line_disconnected"] == "line_bad"
+    assert rows[0]["label_reason"] == "line_disconnection_blackout"
+    assert np.isclose(rows[0]["fcast_max_line_rho"], 0.98)
+    assert not any(
+        getattr(seen, "attacked", False)
+        and getattr(seen, "disconnected_line", None) == 2
+        for seen in agent.seen_observations
+    )
+
+
+def _check_runtime_contingencies_share_forecast_and_use_scenario_features():
+    classifier = RecordingClassifier()
+    predictor = FailureForecastPredictor(
+        classifier,
+        {
+            "features": CLASSIFIER_FEATURES,
+            "line_map": {"ok": 0, "bad": 1, "trip": 2},
+            "decision_threshold": 0.5,
+        },
+    )
+    mean_model = FakeMeanModel()
+    aleatoric_model = FakeAleatoricModel()
+    results = predictor.predict_many(
+        FakeEnv(),
+        ExplodingAgent(),
+        FakeObs(12),
+        [FakeObs(i) for i in range(13)],
+        ["line_ok", "line_bad", "line_trip"],
+        mean_model,
+        aleatoric_model,
+        _cfg(["line_ok", "line_bad", "line_trip"]),
+        model_enn=FakeEnn(),
+        get_uncertainty_fn=_rho_uncertainty,
+    )
+    assert mean_model.calls == 1
+    assert aleatoric_model.calls == 1
+    assert [result["line"] for result in results] == [
+        "line_ok", "line_bad", "line_trip"
+    ]
+    assert all(result["failure_prediction"] == 1 for result in results)
+    assert all(result["failure_probability"] == 0.75 for result in results)
+    assert len(classifier.rows) == 3
+    assert classifier.rows[0].columns.tolist() == CLASSIFIER_FEATURES
+    assert np.isclose(classifier.rows[0]["fcast_max_line_rho"].iloc[0], 0.96)
+    assert np.isclose(classifier.rows[1]["fcast_max_line_rho"].iloc[0], 0.97)
+    assert np.isclose(classifier.rows[2]["fcast_max_line_rho"].iloc[0], 0.98)
+    assert np.isclose(classifier.rows[0]["epistemic_after"].iloc[0], 0.96)
+    assert np.isclose(classifier.rows[1]["epistemic_after"].iloc[0], 0.97)
+    assert np.isclose(classifier.rows[2]["epistemic_after"].iloc[0], 0.98)
+
+
+def _check_simulator_backed_observation_supports_agent_simulation():
+    scenario = FakeObs(12, attacked=True, disconnected_line=1)
+    adapter = _SimulatorBackedObservation(FakeSimulator(scenario))
+    simulated, _, done, info = adapter.simulate(FakeAction("noop"))
+    assert adapter.attacked
+    assert simulated.attacked
+    assert not done
+    assert info["exception"] == []
+    assert info["is_illegal"] is False
+    assert info["is_ambiguous"] is False
 
 
 def _check_classifier_metadata_and_prediction_round_trip():
@@ -222,6 +419,18 @@ class FailureForecastTests(unittest.TestCase):
 
     def test_collection_labels_agent_response_blackout(self):
         _check_collection_labels_agent_response_blackout()
+
+    def test_forecaster_targets_t12(self):
+        _check_forecaster_targets_t12()
+
+    def test_immediate_contingency_blackout_skips_agent_action(self):
+        _check_immediate_contingency_blackout_skips_agent_action()
+
+    def test_runtime_contingencies_share_forecast_and_use_scenario_features(self):
+        _check_runtime_contingencies_share_forecast_and_use_scenario_features()
+
+    def test_simulator_backed_observation_supports_agent_simulation(self):
+        _check_simulator_backed_observation_supports_agent_simulation()
 
     def test_classifier_metadata_and_prediction_round_trip(self):
         _check_classifier_metadata_and_prediction_round_trip()
