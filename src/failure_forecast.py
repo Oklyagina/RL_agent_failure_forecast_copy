@@ -590,13 +590,23 @@ def collect_forecaster_training_data(
     episodes: int,
     seed: int = 0,
     max_steps: Optional[int] = None,
+    sampling_stride: int = HORIZON_STEPS,
+    return_episode_ids: bool = False,
     progress_callback: Optional[Callable[[int, int, int], None]] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Collect forecast-model pairs ``X_t -> injections at t+12``."""
+) -> Any:
+    """Collect hourly-stratified pairs ``X_t -> injections at t+12``.
+
+    One origin is retained per ``sampling_stride`` steps.  The origin offset
+    rotates by episode so an on-demand runtime remains represented at every
+    five-minute phase without storing twelve overlapping rows per hour.
+    """
     if episodes <= 0:
         raise ValueError("episodes must be positive")
+    if sampling_stride <= 0:
+        raise ValueError("sampling_stride must be positive")
     rows_x: List[np.ndarray] = []
     rows_y: List[np.ndarray] = []
+    row_episode_ids: List[int] = []
     for episode in range(episodes):
         try:
             obs = env.reset(seed=seed + episode)
@@ -605,7 +615,7 @@ def collect_forecaster_training_data(
                 env.seed(seed + episode)
             obs = env.reset()
         observations: List[Any] = []
-        episode_features: List[np.ndarray] = []
+        pending_features: Dict[int, np.ndarray] = {}
         reward = getattr(env, "reward_range", (0.0, 0.0))[0]
         done = False
         step = 0
@@ -616,13 +626,20 @@ def collect_forecaster_training_data(
                 pass
         while not done and (max_steps is None or step < max_steps):
             observations.append(obs)
-            x = get_features_with_history(observations, obs)
-            episode_features.append(x)
-            origin_idx = len(observations) - 1 - HORIZON_STEPS
-            if origin_idx >= 0:
+            origin_offset = episode % sampling_stride
+            current_idx = len(observations) - 1
+            if current_idx % sampling_stride == origin_offset:
+                pending_features[current_idx] = get_features_with_history(
+                    observations, obs
+                )
+            origin_idx = current_idx - HORIZON_STEPS
+            if origin_idx in pending_features:
                 y = np.concatenate([obs.load_p, obs.load_q, obs.gen_p], axis=0)
-                rows_x.append(np.asarray(episode_features[origin_idx], dtype=np.float32))
+                rows_x.append(
+                    np.asarray(pending_features.pop(origin_idx), dtype=np.float32)
+                )
                 rows_y.append(np.asarray(y, dtype=np.float32))
+                row_episode_ids.append(int(episode))
             action = call_agent(agent, obs, reward=float(reward), done=done)
             obs_next, reward, done, _ = env.step(action)
             if done:
@@ -633,10 +650,19 @@ def collect_forecaster_training_data(
             progress_callback(episode, step, len(rows_x))
     if not rows_x:
         raise RuntimeError("Forecast data collection produced no rows.")
-    return np.stack(rows_x).astype(np.float32), np.stack(rows_y).astype(np.float32)
+    X = np.stack(rows_x).astype(np.float32)
+    y = np.stack(rows_y).astype(np.float32)
+    if return_episode_ids:
+        return X, y, np.asarray(row_episode_ids, dtype=np.int32)
+    return X, y
 
 
-def save_forecaster_training_data(out_dir: str | Path, X: np.ndarray, y: np.ndarray) -> Dict[str, str]:
+def save_forecaster_training_data(
+    out_dir: str | Path,
+    X: np.ndarray,
+    y: np.ndarray,
+    episode_ids: Optional[np.ndarray] = None,
+) -> Dict[str, str]:
     """Persist forecast training arrays beside the downstream classifier data."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -644,7 +670,62 @@ def save_forecaster_training_data(out_dir: str | Path, X: np.ndarray, y: np.ndar
     y_path = out / "forecast_y.npy"
     np.save(x_path, np.asarray(X, dtype=np.float32))
     np.save(y_path, np.asarray(y, dtype=np.float32))
-    return {"X": str(x_path), "y": str(y_path)}
+    paths = {"X": str(x_path), "y": str(y_path)}
+    if episode_ids is not None:
+        episode_path = out / "forecast_episode_ids.npy"
+        np.save(episode_path, np.asarray(episode_ids, dtype=np.int32))
+        paths["episode_ids"] = str(episode_path)
+    return paths
+
+
+def _fixed_tuning_indices(
+    row_count: int,
+    episode_ids: Optional[np.ndarray],
+    *,
+    max_subsample: int,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Create one deterministic tuning split, grouped by episode when available."""
+    if row_count < 2:
+        raise ValueError("Optuna tuning requires at least two forecast rows.")
+    if max_subsample <= 0:
+        raise ValueError("max_subsample must be positive.")
+    rng = np.random.default_rng(seed)
+
+    if episode_ids is not None:
+        groups = np.asarray(episode_ids)
+        if groups.ndim != 1 or len(groups) != row_count:
+            raise ValueError("episode_ids must be one-dimensional and match X/y rows.")
+        unique_episodes = np.unique(groups)
+        if len(unique_episodes) < 2:
+            raise ValueError("Episode-separated tuning requires at least two episodes.")
+        shuffled = rng.permutation(unique_episodes)
+        validation_episode_count = min(
+            len(shuffled) - 1,
+            max(1, int(round(0.2 * len(shuffled)))),
+        )
+        validation_episodes = shuffled[:validation_episode_count]
+        validation_mask = np.isin(groups, validation_episodes)
+        train_pool = np.flatnonzero(~validation_mask)
+        validation_pool = np.flatnonzero(validation_mask)
+    else:
+        shuffled_rows = rng.permutation(row_count)
+        validation_count = min(
+            row_count - 1,
+            max(1, int(round(0.2 * row_count))),
+        )
+        validation_pool = shuffled_rows[:validation_count]
+        train_pool = shuffled_rows[validation_count:]
+
+    train_count = min(int(max_subsample), len(train_pool))
+    validation_count = min(max(1, int(max_subsample) // 5), len(validation_pool))
+    train_idx = rng.choice(train_pool, size=train_count, replace=False)
+    validation_idx = rng.choice(
+        validation_pool,
+        size=validation_count,
+        replace=False,
+    )
+    return np.asarray(train_idx, dtype=int), np.asarray(validation_idx, dtype=int)
 
 
 def train_mean_forecaster(
@@ -655,6 +736,7 @@ def train_mean_forecaster(
     n_trials: int = 20,
     max_subsample: int = 5000,
     seed: int = 42,
+    episode_ids: Optional[np.ndarray] = None,
     progress_callback: Optional[Callable[[int, int, float], None]] = None,
 ) -> Any:
     """Train the mean forecaster for injections twelve steps ahead."""
@@ -665,12 +747,17 @@ def train_mean_forecaster(
 
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
-    rng = np.random.default_rng(seed)
 
     if n_trials > 0:
         import optuna
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
+        tune_train_idx, tune_validation_idx = _fixed_tuning_indices(
+            len(X),
+            episode_ids,
+            max_subsample=int(max_subsample),
+            seed=int(seed),
+        )
 
         def objective(trial: Any) -> float:
             params = {
@@ -681,12 +768,10 @@ def train_mean_forecaster(
                 "early_stopping": True,
                 "random_state": seed,
             }
-            sub_n = min(int(max_subsample), len(X))
-            sub_idx = rng.choice(len(X), size=sub_n, replace=False)
             model = MultiOutputRegressor(HistGradientBoostingRegressor(**params))
-            model.fit(X[sub_idx], y[sub_idx])
-            pred = model.predict(X[sub_idx])
-            return float(np.sqrt(mean_squared_error(y[sub_idx], pred)))
+            model.fit(X[tune_train_idx], y[tune_train_idx])
+            pred = model.predict(X[tune_validation_idx])
+            return float(np.sqrt(mean_squared_error(y[tune_validation_idx], pred)))
 
         study = optuna.create_study(direction="minimize")
         total_trials = int(n_trials)

@@ -21,6 +21,7 @@ from src.failure_forecast import (  # noqa: E402
     FailureForecastConfig,
     FailureForecastPredictor,
     _SimulatorBackedObservation,
+    _fixed_tuning_indices,
     _split_classifier_rows,
     collect_failure_forecast_rows,
     collect_forecaster_training_data,
@@ -294,11 +295,60 @@ def _check_collection_labels_agent_response_blackout():
 
 
 def _check_forecaster_targets_t12():
-    X, y = collect_forecaster_training_data(
-        FakeEnv(), FakeAgent(), episodes=1, max_steps=13
+    X, y, episode_ids = collect_forecaster_training_data(
+        FakeEnv(), FakeAgent(), episodes=1, max_steps=13,
+        return_episode_ids=True,
     )
     assert X.shape == (1, 19)
     np.testing.assert_allclose(y[0], [22.0, 14.0, 32.0])
+    np.testing.assert_array_equal(episode_ids, [0])
+
+
+def _check_hourly_sampling_rotates_offsets_by_episode():
+    class LongFakeEnv(FakeEnv):
+        def step(self, action):
+            del action
+            self.step_count += 1
+            return (
+                FakeObs(self.step_count),
+                0.0,
+                self.step_count >= 36,
+                {"exception": []},
+            )
+
+    X, y, episode_ids = collect_forecaster_training_data(
+        LongFakeEnv(),
+        FakeAgent(),
+        episodes=12,
+        max_steps=36,
+        sampling_stride=12,
+        return_episode_ids=True,
+    )
+    assert X.shape == (24, 19)
+    assert y.shape == (24, 3)
+    assert episode_ids.shape == (24,)
+    origins = np.rint(X[:, 0] - 10.0).astype(int)
+    np.testing.assert_array_equal(origins % 12, episode_ids % 12)
+    np.testing.assert_allclose(y[:, 0] - X[:, 0], 12.0)
+    for episode in range(12):
+        assert np.sum(episode_ids == episode) == 2
+
+
+def _check_forecaster_tuning_split_is_fixed_and_episode_separated():
+    episode_ids = np.repeat(np.arange(10, dtype=np.int32), 5)
+    train_a, validation_a = _fixed_tuning_indices(
+        len(episode_ids), episode_ids, max_subsample=20, seed=7
+    )
+    train_b, validation_b = _fixed_tuning_indices(
+        len(episode_ids), episode_ids, max_subsample=20, seed=7
+    )
+    np.testing.assert_array_equal(train_a, train_b)
+    np.testing.assert_array_equal(validation_a, validation_b)
+    assert len(train_a) == 20
+    assert len(validation_a) == 4
+    assert not (
+        set(episode_ids[train_a]) & set(episode_ids[validation_a])
+    )
 
 
 def _check_immediate_contingency_blackout_skips_agent_action():
@@ -453,6 +503,12 @@ class FailureForecastTests(unittest.TestCase):
 
     def test_forecaster_targets_t12(self):
         _check_forecaster_targets_t12()
+
+    def test_hourly_sampling_rotates_offsets_by_episode(self):
+        _check_hourly_sampling_rotates_offsets_by_episode()
+
+    def test_forecaster_tuning_split_is_fixed_and_episode_separated(self):
+        _check_forecaster_tuning_split_is_fixed_and_episode_separated()
 
     def test_immediate_contingency_blackout_skips_agent_action(self):
         _check_immediate_contingency_blackout_skips_agent_action()

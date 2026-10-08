@@ -39,7 +39,7 @@ DEFAULTS = {
 #============= Failure forecast defaults =================#
     "FORECAST_EPISODES": "900",
     "FORECAST_MAX_STEPS": "0",
-    "FORECAST_MEAN_TRIALS": "500",
+    "FORECAST_MEAN_TRIALS": "50",
     "FAILURE_EPISODES": "100",
     "FAILURE_MAX_STEPS": "0",
     "FAILURE_SAMPLING_STRIDE": "20",

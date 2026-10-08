@@ -29,6 +29,7 @@ from project_config import (  # noqa: E402
 )
 from src.agent_runtime import build_agent  # noqa: E402
 from src.failure_forecast import (  # noqa: E402
+    HORIZON_STEPS,
     collect_forecaster_training_data,
     save_forecaster_training_data,
     train_aleatoric_forecaster,
@@ -107,7 +108,10 @@ def main() -> None:
     parser.add_argument("--mean-trials", type=int, default=FORECAST_MEAN_TRIALS)
     parser.add_argument("--max-subsample", type=int, default=5000)
     parser.add_argument("--reuse-data", action="store_true",
-                        help="reuse forecast_X.npy and forecast_y.npy from out-dir when present")
+                        help=(
+                            "reuse forecast_X.npy, forecast_y.npy, and "
+                            "forecast_episode_ids.npy from out-dir when present"
+                        ))
     args = parser.parse_args()
 
     configure_grid2op_warnings()
@@ -118,6 +122,7 @@ def main() -> None:
     aleatoric_path = out_dir / "aleatoric_forecaster.pkl"
     x_path = out_dir / "forecast_X.npy"
     y_path = out_dir / "forecast_y.npy"
+    episode_ids_path = out_dir / "forecast_episode_ids.npy"
 
     print("Failure forecaster training")
     print(f"  env_dir       : {args.env_dir}")
@@ -126,13 +131,22 @@ def main() -> None:
     print(f"  output        : {out_dir}")
     print(f"  episodes      : {args.episodes}")
     print(f"  mean_trials   : {args.mean_trials}")
+    print(f"  sample cadence: every {HORIZON_STEPS} steps with rotated episode offsets")
 
-    if args.reuse_data and x_path.is_file() and y_path.is_file():
+    if (
+        args.reuse_data
+        and x_path.is_file()
+        and y_path.is_file()
+        and episode_ids_path.is_file()
+    ):
         import numpy as np
 
         print_stage(1, 3, "Reusing forecast training arrays")
-        X = np.load(x_path)
-        y = np.load(y_path)
+        X = np.load(x_path, mmap_mode="r", allow_pickle=False)
+        y = np.load(y_path, mmap_mode="r", allow_pickle=False)
+        episode_ids = np.load(
+            episode_ids_path, mmap_mode="r", allow_pickle=False
+        )
         print(f"[data] reused {X.shape[0]} rows from {out_dir}")
     else:
         print_stage(1, 3, "Collecting forecast training arrays")
@@ -156,25 +170,27 @@ def main() -> None:
                 progress.update(1)
                 progress.set_postfix(last_steps=steps, rows=total_rows, refresh=False)
 
-            X, y = collect_forecaster_training_data(
+            X, y, episode_ids = collect_forecaster_training_data(
                 env,
                 agent,
                 episodes=args.episodes,
                 seed=args.seed,
                 max_steps=args.max_steps,
+                sampling_stride=HORIZON_STEPS,
+                return_episode_ids=True,
                 progress_callback=update,
             )
         finally:
             progress.close()
             env.close()
-        save_forecaster_training_data(out_dir, X, y)
+        save_forecaster_training_data(out_dir, X, y, episode_ids)
         print(f"[data] wrote X={X.shape} y={y.shape} -> {out_dir}")
 
     print_stage(2, 3, "Training mean forecaster")
 
     def report_trial(done: int, total: int, best_rmse: float) -> None:
-        """Print occasional Optuna progress without flooding the console."""
-        if done == 1 or done == total or done % max(1, total // 5) == 0:
+        """Print the first, every tenth, and final Optuna trial."""
+        if done == 1 or done == total or done % 10 == 0:
             print(f"[mean] trial {done}/{total} best_rmse={best_rmse:.4f}")
 
     mean_model = train_mean_forecaster(
@@ -184,6 +200,7 @@ def main() -> None:
         n_trials=args.mean_trials,
         max_subsample=args.max_subsample,
         seed=args.seed,
+        episode_ids=episode_ids,
         progress_callback=report_trial if args.mean_trials > 0 else None,
     )
     print_stage(3, 3, "Training aleatoric forecaster")

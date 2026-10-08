@@ -135,9 +135,139 @@ def _configure_logging() -> None:
 
 
 def _print_trial_progress(done: int, total: int, best_rmse: float) -> None:
-    """Report useful Optuna progress without printing every trial."""
-    if done == 1 or done == total or done % max(1, total // 5) == 0:
+    """Report the first, every tenth, and final Optuna trial."""
+    if done == 1 or done == total or done % 10 == 0:
         print(f"[mean] trial {done}/{total} best_rmse={best_rmse:.4f}")
+
+
+def _validate_forecast_arrays(
+    X: np.ndarray,
+    y: np.ndarray,
+    episode_ids: np.ndarray,
+) -> dict[str, int]:
+    """Validate the persisted feature/target contract for forecast training."""
+    if X.ndim != 2 or y.ndim != 2:
+        raise ValueError(f"forecast arrays must be two-dimensional: X={X.shape}, y={y.shape}")
+    if len(X) == 0 or len(X) != len(y):
+        raise ValueError(f"forecast arrays need equal nonzero row counts: X={X.shape}, y={y.shape}")
+    if X.dtype != np.dtype(np.float32) or y.dtype != np.dtype(np.float32):
+        raise ValueError(
+            "forecast arrays must use float32: "
+            f"X={X.dtype}, y={y.dtype}"
+        )
+    if y.shape[1] <= 0:
+        raise ValueError("forecast targets must contain at least one injection value")
+    if episode_ids.ndim != 1 or len(episode_ids) != len(X):
+        raise ValueError(
+            "forecast episode IDs must be one-dimensional and match X/y rows"
+        )
+    if not np.issubdtype(episode_ids.dtype, np.integer):
+        raise ValueError(f"forecast episode IDs must be integers: {episode_ids.dtype}")
+
+    # get_features_with_history stores four injection snapshots (current, 1h,
+    # 1d, 1w) followed by seven calendar/time features.
+    expected_input_dim = 4 * int(y.shape[1]) + 7
+    if int(X.shape[1]) != expected_input_dim:
+        raise ValueError(
+            f"forecast input width is {X.shape[1]}, expected {expected_input_dim} "
+            f"for output width {y.shape[1]}"
+        )
+    return {
+        "rows": int(len(X)),
+        "input_dim": int(X.shape[1]),
+        "output_dim": int(y.shape[1]),
+        "episodes_with_rows": int(len(np.unique(episode_ids))),
+    }
+
+
+def _forecast_data_dimensions(
+    X: np.ndarray,
+    y: np.ndarray,
+    episode_ids: np.ndarray,
+    *,
+    forecast_episodes: int,
+    forecast_limit: int | None,
+    seed: int,
+) -> dict[str, int]:
+    """Describe the dataset and the collection settings needed for reuse."""
+    dimensions = _validate_forecast_arrays(X, y, episode_ids)
+    dimensions.update({
+        "forecast_episodes": int(forecast_episodes),
+        "forecast_max_steps": 0 if forecast_limit is None else int(forecast_limit),
+        "seed": int(seed),
+        "horizon_steps": int(HORIZON_STEPS),
+        "horizon_minutes": int(HORIZON_STEPS * STEP_MINUTES),
+        "forecast_sampling_stride": int(HORIZON_STEPS),
+    })
+    return dimensions
+
+
+def _load_forecast_data_cache(
+    paths: dict[str, Path],
+    *,
+    agent_name: str,
+    forecast_episodes: int,
+    forecast_limit: int | None,
+    seed: int,
+) -> tuple[tuple[np.ndarray, np.ndarray, np.ndarray] | None, str]:
+    """Load a structurally valid, provenance-confirmed t+12 dataset cache."""
+    outputs = [
+        paths["forecast_X"],
+        paths["forecast_y"],
+        paths["forecast_episode_ids"],
+    ]
+    missing = [path.name for path in outputs if not path.is_file()]
+    if missing:
+        return None, "missing " + ", ".join(missing)
+
+    sidecar = provenance_path(paths["forecast_X"])
+    if not sidecar.is_file():
+        return None, "forecast data provenance is missing"
+    try:
+        metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"forecast data provenance is invalid: {exc}"
+
+    expected_settings = {
+        "forecast_episodes": int(forecast_episodes),
+        "forecast_max_steps": 0 if forecast_limit is None else int(forecast_limit),
+        "seed": int(seed),
+        "horizon_steps": int(HORIZON_STEPS),
+        "horizon_minutes": int(HORIZON_STEPS * STEP_MINUTES),
+        "forecast_sampling_stride": int(HORIZON_STEPS),
+    }
+    if metadata.get("stage") != "forecast_data":
+        return None, "forecast data provenance has the wrong stage"
+    if metadata.get("status") != "reusable":
+        return None, "forecast data provenance is not reusable"
+    if metadata.get("environment") != ENV_NAME:
+        return None, "forecast data provenance has a different environment"
+    if metadata.get("agent") != agent_name:
+        return None, "forecast data provenance has a different agent"
+    metadata_outputs = metadata.get("outputs")
+    if not isinstance(metadata_outputs, list):
+        return None, "forecast data provenance has invalid outputs"
+    recorded_outputs = sorted(str(path) for path in metadata_outputs)
+    if recorded_outputs != sorted(str(path) for path in outputs):
+        return None, "forecast data provenance references different files"
+    recorded_dimensions = metadata.get("dimensions") or {}
+    for key, expected in expected_settings.items():
+        if recorded_dimensions.get(key) != expected:
+            return None, f"forecast data provenance has incompatible {key}"
+
+    try:
+        X = np.load(paths["forecast_X"], mmap_mode="r", allow_pickle=False)
+        y = np.load(paths["forecast_y"], mmap_mode="r", allow_pickle=False)
+        episode_ids = np.load(
+            paths["forecast_episode_ids"], mmap_mode="r", allow_pickle=False
+        )
+        actual_dimensions = _validate_forecast_arrays(X, y, episode_ids)
+    except (OSError, ValueError) as exc:
+        return None, f"forecast arrays are invalid: {exc}"
+    for key, actual in actual_dimensions.items():
+        if recorded_dimensions.get(key) != actual:
+            return None, f"forecast data provenance has incompatible {key}"
+    return (X, y, episode_ids), "compatible hourly-stratified t+12 forecast data"
 
 
 def _validate_rows(
@@ -195,8 +325,13 @@ def _validate_artifacts(
 
     X = np.load(paths["forecast_X"], mmap_mode="r", allow_pickle=False)
     y = np.load(paths["forecast_y"], mmap_mode="r", allow_pickle=False)
-    if X.ndim != 2 or y.ndim != 2 or len(X) == 0 or len(X) != len(y):
-        raise RuntimeError(f"Invalid saved forecast arrays: X={X.shape}, y={y.shape}")
+    episode_ids = np.load(
+        paths["forecast_episode_ids"], mmap_mode="r", allow_pickle=False
+    )
+    try:
+        _validate_forecast_arrays(X, y, episode_ids)
+    except ValueError as exc:
+        raise RuntimeError(f"Invalid saved forecast arrays: {exc}") from exc
 
     mean_model = joblib.load(paths["mean_forecaster"])
     aleatoric_model = joblib.load(paths["aleatoric_forecaster"])
@@ -292,6 +427,7 @@ def run_full_forecasting(
     agent_factory: str | None = AGENT_FACTORY or None,
     policy_agent_dir: Path | None = None,
     artifact_dir: Path | None = None,
+    reuse_forecast_data: bool = True,
 ) -> dict[str, Path]:
     """Train and validate the configured production failure-forecast bundle.
 
@@ -320,6 +456,7 @@ def run_full_forecasting(
     paths = {
         "forecast_X": output_dir / "forecast_X.npy",
         "forecast_y": output_dir / "forecast_y.npy",
+        "forecast_episode_ids": output_dir / "forecast_episode_ids.npy",
         "mean_forecaster": output_dir / "mean_forecaster.pkl",
         "aleatoric_forecaster": output_dir / "aleatoric_forecaster.pkl",
         "failure_rows": output_dir / "failure_forecast_rows.csv",
@@ -335,9 +472,12 @@ def run_full_forecasting(
     print(f"  environment       : {ENV_NAME} ({env_dir})")
     print(f"  agent             : {agent_name}")
     print(f"  forecast episodes : {forecast_episodes}")
+    print(f"  forecast cadence  : every {HORIZON_STEPS} steps, offset rotated by episode")
+    print(f"  mean trials       : {mean_trials}")
     print(f"  failure episodes  : {failure_episodes}")
     print(f"  forecast max steps: {forecast_limit or 'full episode'}")
     print(f"  failure max steps : {failure_limit or 'full episode'}")
+    print(f"  reuse forecast data: {bool(reuse_forecast_data)}")
     print(f"  output            : {output_dir}")
 
     for stage, primary in (
@@ -350,33 +490,77 @@ def run_full_forecasting(
             "full forecasting run scheduled to replace this stage",
         )
 
-    print("\n[1/6] Collect genuine t -> t+12 forecast pairs")
-    env = _make_environment(env_dir)
-    progress = tqdm(
-        total=int(forecast_episodes), desc="Forecast data", unit="episode"
-    )
-    try:
-        agent = _make_agent(env, agent_factory, policy_agent_dir)
-
-        def forecast_progress(_episode: int, steps: int, total_rows: int) -> None:
-            progress.update(1)
-            progress.set_postfix(last_steps=steps, rows=total_rows, refresh=False)
-
-        X, y = collect_forecaster_training_data(
-            env,
-            agent,
-            episodes=int(forecast_episodes),
+    cached_data = None
+    cache_reason = "reuse disabled"
+    if reuse_forecast_data:
+        cached_data, cache_reason = _load_forecast_data_cache(
+            paths,
+            agent_name=agent_name,
+            forecast_episodes=int(forecast_episodes),
+            forecast_limit=forecast_limit,
             seed=int(seed),
-            max_steps=forecast_limit,
-            progress_callback=forecast_progress,
         )
-    finally:
-        progress.close()
-        env.close()
-    save_forecaster_training_data(output_dir, X, y)
-    if X.ndim != 2 or y.ndim != 2 or len(X) == 0 or len(X) != len(y):
-        raise RuntimeError(f"Invalid forecast arrays: X={X.shape}, y={y.shape}")
-    print(f"[data] X={X.shape} y={y.shape}")
+
+    if cached_data is not None:
+        print("\n[1/6] Reuse genuine t -> t+12 forecast pairs")
+        X, y, episode_ids = cached_data
+        print(f"[cache] {cache_reason}: X={X.shape} y={y.shape}")
+    else:
+        print("\n[1/6] Collect genuine t -> t+12 forecast pairs")
+        print(f"[cache] collecting fresh data: {cache_reason}")
+        mark_provenance_stale(
+            provenance_path(paths["forecast_X"]),
+            "forecast_data",
+            ENV_NAME,
+            agent_name,
+            cache_reason,
+        )
+        env = _make_environment(env_dir)
+        progress = tqdm(
+            total=int(forecast_episodes), desc="Forecast data", unit="episode"
+        )
+        try:
+            agent = _make_agent(env, agent_factory, policy_agent_dir)
+
+            def forecast_progress(_episode: int, steps: int, total_rows: int) -> None:
+                progress.update(1)
+                progress.set_postfix(last_steps=steps, rows=total_rows, refresh=False)
+
+            X, y, episode_ids = collect_forecaster_training_data(
+                env,
+                agent,
+                episodes=int(forecast_episodes),
+                seed=int(seed),
+                max_steps=forecast_limit,
+                sampling_stride=HORIZON_STEPS,
+                return_episode_ids=True,
+                progress_callback=forecast_progress,
+            )
+        finally:
+            progress.close()
+            env.close()
+        save_forecaster_training_data(output_dir, X, y, episode_ids)
+        data_dimensions = _forecast_data_dimensions(
+            X,
+            y,
+            episode_ids,
+            forecast_episodes=int(forecast_episodes),
+            forecast_limit=forecast_limit,
+            seed=int(seed),
+        )
+        write_provenance(
+            provenance_path(paths["forecast_X"]),
+            "forecast_data",
+            ENV_NAME,
+            agent_name,
+            [
+                paths["forecast_X"],
+                paths["forecast_y"],
+                paths["forecast_episode_ids"],
+            ],
+            data_dimensions,
+        )
+        print(f"[data] X={X.shape} y={y.shape}")
 
     print("\n[2/6] Train mean injection forecaster")
     mean_model = train_mean_forecaster(
@@ -385,6 +569,7 @@ def run_full_forecasting(
         model_path=paths["mean_forecaster"],
         n_trials=int(mean_trials),
         seed=int(seed),
+        episode_ids=episode_ids,
         progress_callback=_print_trial_progress if mean_trials else None,
     )
 
