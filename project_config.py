@@ -37,13 +37,13 @@ DEFAULTS = {
     "ENN_VAL_FRAC": "0.1",
 
 #============= Failure forecast defaults =================#
-    "FORECAST_EPISODES": "50",
+    "FORECAST_EPISODES": "900",
     "FORECAST_MAX_STEPS": "0",
-    "FORECAST_MEAN_TRIALS": "20",
-    "FAILURE_EPISODES": "50",
+    "FORECAST_MEAN_TRIALS": "500",
+    "FAILURE_EPISODES": "100",
     "FAILURE_MAX_STEPS": "0",
     "FAILURE_SAMPLING_STRIDE": "20",
-    "FAILURE_LINES": "",
+    "FAILURE_LINES": "62_58_180,62_63_160,48_50_136,48_53_141,41_48_131,39_41_121,43_44_125,44_45_126,34_35_110,54_58_154",
     "FAILURE_THRESHOLD": "0.5",
 
     "EXAMPLE_N_STEPS": "5",
@@ -105,6 +105,18 @@ def configure_grid2op_warnings() -> None:
         message=r"We found either some slack coefficient to be < 0\. or they were all 0\.We set them all to 1\.0 to avoid such issues",
         category=UserWarning,
         module=r"lightsim2grid\.gridmodel\.from_pandapower\._aux_add_slack",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"divide by zero encountered in divide",
+        category=RuntimeWarning,
+        module=r"grid2op\.Backend\.backend",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"invalid value encountered in multiply",
+        category=RuntimeWarning,
+        module=r"grid2op\.Backend\.backend",
     )
 
 

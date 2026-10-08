@@ -22,6 +22,10 @@ from project_config import (  # noqa: E402
     ASSETS_DIR,
     ENV_DIR,
     ENV_NAME,
+    FAILURE_EPISODES,
+    FAILURE_LINES,
+    FAILURE_MAX_STEPS,
+    FAILURE_SAMPLING_STRIDE,
     SEED,
     configure_grid2op_warnings,
 )
@@ -67,11 +71,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--agent-name", default=AGENT_NAME)
     parser.add_argument("--agent-factory", default=AGENT_FACTORY or None)
-    parser.add_argument("--episodes", type=int, default=50)
+    parser.add_argument("--episodes", type=int, default=FAILURE_EPISODES)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--sampling-stride", type=int, default=20)
-    parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--lines", default=None,
+    parser.add_argument("--sampling-stride", type=int, default=FAILURE_SAMPLING_STRIDE)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None if FAILURE_MAX_STEPS == 0 else FAILURE_MAX_STEPS,
+    )
+    parser.add_argument("--lines", default=FAILURE_LINES or None,
                         help="comma-separated line names/ids; default: all env lines")
     parser.add_argument("--mean-model", type=Path, required=True)
     parser.add_argument("--aleatoric-model", type=Path, required=True)

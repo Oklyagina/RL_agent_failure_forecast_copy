@@ -21,6 +21,9 @@ from project_config import (  # noqa: E402
     ASSETS_DIR,
     ENV_DIR,
     ENV_NAME,
+    FORECAST_EPISODES,
+    FORECAST_MAX_STEPS,
+    FORECAST_MEAN_TRIALS,
     SEED,
     configure_grid2op_warnings,
 )
@@ -94,10 +97,14 @@ def main() -> None:
         help="runnable CurriculumAgent package with model/ and actions/; default auto-discovers assets/<ENV_NAME>",
     )
     parser.add_argument("--out-dir", type=Path, default=None)
-    parser.add_argument("--episodes", type=int, default=50)
-    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--episodes", type=int, default=FORECAST_EPISODES)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None if FORECAST_MAX_STEPS == 0 else FORECAST_MAX_STEPS,
+    )
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--mean-trials", type=int, default=20)
+    parser.add_argument("--mean-trials", type=int, default=FORECAST_MEAN_TRIALS)
     parser.add_argument("--max-subsample", type=int, default=5000)
     parser.add_argument("--reuse-data", action="store_true",
                         help="reuse forecast_X.npy and forecast_y.npy from out-dir when present")

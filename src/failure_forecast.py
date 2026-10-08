@@ -856,6 +856,74 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray,
     }
 
 
+def _split_classifier_rows(
+    dataframe: pd.DataFrame,
+    *,
+    seed: int,
+    test_size: float = 0.2,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, Dict[str, Any]]:
+    """Split classifier rows while keeping each episode in exactly one set."""
+    from sklearn.model_selection import train_test_split
+
+    X = dataframe[CLASSIFIER_FEATURES].copy()
+    y = dataframe["label"].astype(int)
+    if "episode" in dataframe.columns and dataframe["episode"].nunique() >= 2:
+        episodes = pd.to_numeric(dataframe["episode"], errors="raise").astype(int)
+        unique_episodes = np.asarray(sorted(episodes.unique()), dtype=int)
+        episode_has_failure = (
+            pd.DataFrame({"episode": episodes, "label": y})
+            .groupby("episode", sort=True)["label"]
+            .max()
+            .reindex(unique_episodes)
+            .astype(int)
+        )
+        stratify = None
+        class_counts = episode_has_failure.value_counts()
+        if episode_has_failure.nunique() > 1 and int(class_counts.min()) >= 2:
+            stratify = episode_has_failure.to_numpy()
+        train_episodes, test_episodes = train_test_split(
+            unique_episodes,
+            test_size=float(test_size),
+            random_state=int(seed),
+            stratify=stratify,
+        )
+        train_mask = episodes.isin(train_episodes)
+        test_mask = episodes.isin(test_episodes)
+        X_train, X_test = X.loc[train_mask], X.loc[test_mask]
+        y_train, y_test = y.loc[train_mask], y.loc[test_mask]
+        split_info = {
+            "strategy": "episode_grouped",
+            "test_fraction": float(test_size),
+            "train_episodes": int(len(train_episodes)),
+            "test_episodes": int(len(test_episodes)),
+            "train_rows": int(train_mask.sum()),
+            "test_rows": int(test_mask.sum()),
+        }
+    else:
+        stratify = y if int(y.value_counts().min()) >= 2 else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            X,
+            y,
+            test_size=float(test_size),
+            random_state=int(seed),
+            stratify=stratify,
+        )
+        split_info = {
+            "strategy": "row_stratified",
+            "test_fraction": float(test_size),
+            "train_episodes": None,
+            "test_episodes": None,
+            "train_rows": int(len(X_train)),
+            "test_rows": int(len(X_test)),
+        }
+
+    if y_train.nunique() < 2:
+        raise ValueError("Classifier training split does not contain both classes.")
+    if y_test.nunique() < 2:
+        raise ValueError("Classifier test split does not contain both classes.")
+    return X_train, X_test, y_train, y_test, split_info
+
+
 def train_failure_classifier(
     dataframe: pd.DataFrame,
     *,
@@ -868,20 +936,18 @@ def train_failure_classifier(
 ) -> Tuple[Any, Dict[str, Any]]:
     import joblib
     from sklearn.ensemble import HistGradientBoostingClassifier
-    from sklearn.model_selection import train_test_split
 
     if "label" not in dataframe.columns:
         raise ValueError("Use prepare_classifier_dataframe before training.")
-    X = dataframe[CLASSIFIER_FEATURES].copy()
     y = dataframe["label"].astype(int)
     if y.nunique() < 2:
         raise ValueError("Failure classifier requires both classes.")
     if int(y.value_counts().min()) < 2:
         raise ValueError("Failure classifier needs at least two samples per class.")
 
-    stratify = y if int(y.value_counts().min()) >= 2 else None
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=seed, stratify=stratify
+    X_train, X_test, y_train, y_test, split_info = _split_classifier_rows(
+        dataframe,
+        seed=seed,
     )
     cat_indices = [CLASSIFIER_FEATURES.index("line_id_encoded")]
     model = HistGradientBoostingClassifier(
@@ -906,6 +972,15 @@ def train_failure_classifier(
         "line_map": dataframe.attrs.get("line_map", {}),
         "failure_class": 1,
         "decision_threshold": float(threshold),
+        "split": split_info,
+        "label_reason_counts": {
+            str(reason): int(count)
+            for reason, count in (
+                dataframe["label_reason"].value_counts().items()
+                if "label_reason" in dataframe.columns
+                else []
+            )
+        },
         "model_params": {
             "class_weight": "balanced",
             "learning_rate": 0.05,

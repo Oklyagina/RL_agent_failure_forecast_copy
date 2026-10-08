@@ -21,6 +21,7 @@ from src.failure_forecast import (  # noqa: E402
     FailureForecastConfig,
     FailureForecastPredictor,
     _SimulatorBackedObservation,
+    _split_classifier_rows,
     collect_failure_forecast_rows,
     collect_forecaster_training_data,
     get_features_with_history,
@@ -413,6 +414,36 @@ def _check_classifier_metadata_and_prediction_round_trip():
         assert predictor.metadata["environment"] == "fake_grid"
 
 
+def _check_classifier_split_keeps_episodes_disjoint():
+    import pandas as pd
+
+    rows = []
+    for episode in range(10):
+        for sample in range(4):
+            row = {
+                "episode": episode,
+                "line_disconnected": "line_bad" if sample % 2 else "line_ok",
+                "failed": sample % 2,
+                "label_reason": (
+                    "agent_action_blackout" if sample % 2 else "survived_agent_action"
+                ),
+            }
+            for offset, feature in enumerate(CLASSIFIER_FEATURES):
+                if feature in {"line_id_encoded", "load_gen_ratio"}:
+                    continue
+                row[feature] = float(episode + sample + offset)
+            rows.append(row)
+    dataframe = prepare_classifier_dataframe(pd.DataFrame(rows))
+    X_train, X_test, _, _, split = _split_classifier_rows(dataframe, seed=0)
+    train_episodes = set(dataframe.loc[X_train.index, "episode"])
+    test_episodes = set(dataframe.loc[X_test.index, "episode"])
+    assert not train_episodes & test_episodes
+    assert train_episodes | test_episodes == set(range(10))
+    assert split["strategy"] == "episode_grouped"
+    assert split["train_episodes"] == 8
+    assert split["test_episodes"] == 2
+
+
 class FailureForecastTests(unittest.TestCase):
     def test_history_features_and_forecast_injection(self):
         _check_history_features_and_forecast_injection()
@@ -434,6 +465,9 @@ class FailureForecastTests(unittest.TestCase):
 
     def test_classifier_metadata_and_prediction_round_trip(self):
         _check_classifier_metadata_and_prediction_round_trip()
+
+    def test_classifier_split_keeps_episodes_disjoint(self):
+        _check_classifier_split_keeps_episodes_disjoint()
 
 
 if __name__ == "__main__":
