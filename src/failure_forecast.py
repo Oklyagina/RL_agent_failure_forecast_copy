@@ -12,6 +12,7 @@ This module ports the legacy failure-forecast feature path from
 """
 from __future__ import annotations
 
+import copy
 import csv
 import datetime as _dt
 import json
@@ -200,6 +201,14 @@ def _resolve_line_id(env: Any, line: Any) -> int:
     return int(line)
 
 
+def eligible_lines(env: Any, obs: Any, lines: Sequence[Any]) -> List[Any]:
+    """Keep requested lines that are currently connected (shared by train/inference)."""
+    status = getattr(obs, "line_status", None)
+    if status is None:
+        return list(lines)
+    return [line for line in lines if bool(status[_resolve_line_id(env, line)])]
+
+
 def normalize_line_name(line: Any) -> str:
     """Normalize Grid2Op line names for stable classifier metadata keys."""
     return str(line).replace("line_", "")
@@ -238,6 +247,32 @@ def _simulate(obs: Any, action: Any) -> Tuple[Any, float, bool, dict]:
     return obs.simulate(action)
 
 
+def clone_agent_for_contingency(agent: Any) -> Any:
+    """Clone the policy at its current state for one contingency evaluation.
+
+    A line branch is allowed to mutate its private policy clone, but it must not
+    change the rollout policy or the clone used for another line.  Policies may
+    expose ``clone_for_contingency()``; otherwise the policy is shallow-copied
+    (sharing heavy read-only resources such as Keras models and action sets) and
+    its mutable containers (lists/dicts, e.g. CurriculumAgent's recovery stack)
+    are deep-copied.
+    """
+    clone_method = getattr(agent, "clone_for_contingency", None)
+    if callable(clone_method):
+        cloned = clone_method()
+    else:
+        cloned = copy.copy(agent)
+        for name, value in vars(agent).items():
+            if isinstance(value, (list, dict, set)):
+                setattr(cloned, name, copy.deepcopy(value))
+    if cloned is agent:
+        raise RuntimeError(
+            "clone_for_contingency() returned the original agent; a distinct "
+            "policy instance is required for each line."
+        )
+    return cloned
+
+
 def _simulator_result(simulator: Any) -> Tuple[Any, float, bool, dict]:
     """Convert a Grid2Op Simulator state to the observation simulation contract."""
     converged = bool(simulator.converged)
@@ -272,7 +307,7 @@ class _SimulatorBackedObservation:
                 "Simulator-backed contingency observations support only "
                 "single-step action simulations."
             )
-        result = self._simulator.predict(action)
+        result = self._simulator.copy().predict(action)
         obs, reward, done, info = _simulator_result(result)
         info.update({"is_illegal": False, "is_ambiguous": False})
         return _SimulatorBackedObservation(result), reward, done, info
@@ -310,7 +345,7 @@ def run_t12_forecast(
     model_enn: Any = None,
     get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
 ) -> Dict[str, Any]:
-    """Run the legacy t+12 forecast and return forecast state/features."""
+    """Predict t+12 injections and solve the common future base-state PF."""
     x_t12 = get_features_with_history(observations, obs)
     y_pred = np.asarray(mean_model.predict([x_t12])[0], dtype=float)
     z_pred = np.asarray(aleatoric_model.predict([x_t12])[0], dtype=float)
@@ -378,15 +413,15 @@ def build_feature_row(
     forecast: Dict[str, Any],
     cfg: FailureForecastConfig,
     *,
-    scenario_obs: Any = None,
+    scenario_obs: Any,
 ) -> Dict[str, Any]:
-    """Combine current and post-contingency scenario features into one row."""
+    """Combine current and forecast post-contingency (t+12) features in one row.
+
+    Shared by training and inference; ``scenario_obs`` must be a valid
+    post-contingency observation.
+    """
     current = compute_grid_stats(obs)
-    fcast = (
-        compute_grid_stats(scenario_obs)
-        if scenario_obs is not None
-        else forecast.get("forecast_grid_stats", {})
-    )
+    fcast = compute_grid_stats(scenario_obs)
     sum_load = float(current.get("sum_load_p", np.nan))
     sum_gen = float(current.get("sum_gen_p", np.nan))
     row = {
@@ -428,7 +463,7 @@ def simulate_line_contingency(
     disconnect_action = make_disconnect_action(env, line)
     simulator = forecast.get("simulator")
     if simulator is not None:
-        contingency_simulator = simulator.predict(disconnect_action)
+        contingency_simulator = simulator.copy().predict(disconnect_action)
         scenario_obs, _, done, info = _simulator_result(contingency_simulator)
     else:
         contingency_simulator = None
@@ -474,32 +509,29 @@ def evaluate_line_failure(
     disconnect_done = contingency["done"]
     disconnect_info = contingency["info"]
 
+    if _failure_from_done(bool(disconnect_done), attacked_obs, disconnect_info):
+        # The contingency PF itself diverged: there is no valid post-contingency
+        # state and the agent never acts, so this is not a labeled sample.
+        return None
+
     row_forecast = dict(forecast)
     row_forecast["epistemic_after"] = _get_uncertainty(
         model_enn, attacked_obs, get_uncertainty_fn
     )
-    row = build_feature_row(
-        env,
-        obs,
-        line,
-        row_forecast,
-        cfg,
-        scenario_obs=attacked_obs,
-    )
+    row = build_feature_row(env, obs, line, row_forecast, cfg,
+                            scenario_obs=attacked_obs)
     row["forecast_failed"] = False
-    if _failure_from_done(bool(disconnect_done), attacked_obs, disconnect_info):
-        row.update({"failed": 1, "label_reason": "line_disconnection_blackout"})
-        return row
 
+    contingency_agent = clone_agent_for_contingency(agent)
     agent_obs = (
         _SimulatorBackedObservation(attacked_simulator)
         if attacked_simulator is not None
         else attacked_obs
     )
-    agent_action = call_agent(agent, agent_obs, reward=0.0, done=False)
+    agent_action = call_agent(contingency_agent, agent_obs, reward=0.0, done=False)
     if attacked_simulator is not None:
         action_obs, _, action_done, action_info = _simulator_result(
-            attacked_simulator.predict(agent_action)
+            attacked_simulator.copy().predict(agent_action)
         )
     else:
         action_obs, _, action_done, action_info = _simulate(
@@ -564,7 +596,7 @@ def collect_failure_forecast_rows(
                     get_uncertainty_fn=get_uncertainty_fn,
                 )
                 if not forecast["forecast_failed"]:
-                    for line in cfg.lines_to_test:
+                    for line in eligible_lines(env, obs, cfg.lines_to_test):
                         row = evaluate_line_failure(
                             env, agent, obs, observations, line, mean_model,
                             aleatoric_model, cfg, forecast=forecast,
@@ -641,10 +673,10 @@ def collect_forecaster_training_data(
                 rows_y.append(np.asarray(y, dtype=np.float32))
                 row_episode_ids.append(int(episode))
             action = call_agent(agent, obs, reward=float(reward), done=done)
-            obs_next, reward, done, _ = env.step(action)
+            next_obs, reward, done, _ = env.step(action)
             if done:
                 break
-            obs = obs_next
+            obs = next_obs
             step += 1
         if progress_callback:
             progress_callback(episode, step, len(rows_x))
@@ -1057,6 +1089,8 @@ def train_failure_classifier(
         "line_map": dataframe.attrs.get("line_map", {}),
         "failure_class": 1,
         "decision_threshold": float(threshold),
+        "forecast_horizon_steps": HORIZON_STEPS,
+        "forecast_horizon_minutes": HORIZON_STEPS * STEP_MINUTES,
         "split": split_info,
         "label_reason_counts": {
             str(reason): int(count)
@@ -1126,7 +1160,7 @@ class FailureForecastPredictor:
         prob = float(_failure_probability(self.model, X)[0])
         return {
             "failure_prediction": 1 if prob >= self.threshold else 0,
-            "failure_probability": np.round(prob, 3),
+            "failure_probability": prob,
         }
 
     def predict(
@@ -1192,20 +1226,19 @@ class FailureForecastPredictor:
             )
 
         predictions: List[Dict[str, Any]] = []
-        for line in lines:
+        for line in eligible_lines(env, obs, lines):
             contingency = simulate_line_contingency(env, forecast, line)
+            if _failure_from_done(
+                contingency["done"], contingency["obs"], contingency["info"]
+            ):
+                # No valid post-contingency state (never a training sample).
+                continue
             row_forecast = dict(forecast)
             row_forecast["epistemic_after"] = _get_uncertainty(
                 model_enn, contingency["obs"], get_uncertainty_fn
             )
-            row = build_feature_row(
-                env,
-                obs,
-                line,
-                row_forecast,
-                cfg,
-                scenario_obs=contingency["obs"],
-            )
+            row = build_feature_row(env, obs, line, row_forecast, cfg,
+                                    scenario_obs=contingency["obs"])
             predictions.append({
                 "line": _line_name(env, line),
                 **self.predict_from_features(row),

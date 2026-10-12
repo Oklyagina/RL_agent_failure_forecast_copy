@@ -100,6 +100,7 @@ def find_artifact_set():
                 "          python training/train_enn.py\n"
                 "        and then re-run this script.")
         cands.sort(key=lambda d: (
+            d != configured_dir,
             _artifact_rank(d),
             -(d / "enn_meta.json").stat().st_mtime,
         ))
@@ -142,6 +143,29 @@ def find_enn_weights(prefer_dir: Path | None = None) -> Path:
     print(f"       auto: ENN weights -> {cands[0].relative_to(ROOT)}"
           + (f"  (candidates: {len(cands)})" if len(cands) > 1 else ""))
     return cands[0]
+
+
+def enn_uncertainty_fn(scaler):
+    """ENN vacuity of a raw observation vector, scaled as in assess_observation."""
+    import torch
+
+    def uncertainty_fn(model, vect):
+        x = scaler.transform(vect).astype(np.float32)
+        with torch.no_grad():
+            return float(model(torch.as_tensor(x))["uncertainty"][0].item())
+
+    return uncertainty_fn
+
+
+def load_enn_uncertainty():
+    """Return ``(enn, uncertainty_fn)`` for failure-forecast ENN features.
+
+    Shared by training and inference so both use the same trained ENN and scaler.
+    """
+    scaler_json, meta_json, _ = find_artifact_set()
+    meta = json.loads(meta_json.read_text())
+    enn = load_enn(find_enn_weights(prefer_dir=meta_json.parent), meta)
+    return enn, enn_uncertainty_fn(scaler_from_json(scaler_json))
 
 
 def find_actions_npy(meta: dict) -> Path:
@@ -379,8 +403,14 @@ def main() -> None:
         if t == N_STEPS - 1:
             failures = predictor.predict_many(
                 env, agent, obs, observations, lines,
-                mean_model, aleatoric_model, failure_cfg)
-            recommendations[-1]["kpis"]["failure_forecasts"] = failures
+                mean_model, aleatoric_model, failure_cfg,
+                model_enn=enn, get_uncertainty_fn=enn_uncertainty_fn(calibration.scaler))
+            kpis = recommendations[-1]["kpis"]
+            if failures:
+                worst = max(failures, key=lambda f: f["failure_probability"])
+                kpis["failure_prediction"] = worst["failure_prediction"]
+                kpis["failure_probability"] = worst["failure_probability"]
+            kpis["failure_forecasts"] = failures
             print(f"  t+12 failure forecasts: {failures}")
             break
         obs, reward, done, _ = env.step(action)

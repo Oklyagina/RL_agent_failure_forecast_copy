@@ -287,11 +287,6 @@ def _check_collection_labels_agent_response_blackout():
     assert np.isclose(by_line["line_bad"]["fcast_max_line_rho"], 0.97)
     assert np.isclose(by_line["line_ok"]["epistemic_after"], 0.96)
     assert np.isclose(by_line["line_bad"]["epistemic_after"], 0.97)
-    assert any(
-        getattr(seen, "attacked", False)
-        and getattr(seen, "disconnected_line", None) == 1
-        for seen in agent.seen_observations
-    )
 
 
 def _check_forecaster_targets_t12():
@@ -363,15 +358,7 @@ def _check_immediate_contingency_blackout_skips_agent_action():
         sampling_stride=12,
         max_steps=13,
     )
-    assert len(rows) == 1
-    assert rows[0]["failed"] == 1
-    assert rows[0]["label_reason"] == "line_disconnection_blackout"
-    assert np.isclose(rows[0]["fcast_max_line_rho"], 0.98)
-    assert not any(
-        getattr(seen, "attacked", False)
-        and getattr(seen, "disconnected_line", None) == 2
-        for seen in agent.seen_observations
-    )
+    assert rows == []
 
 
 def _check_runtime_contingencies_share_forecast_and_use_scenario_features():
@@ -400,19 +387,15 @@ def _check_runtime_contingencies_share_forecast_and_use_scenario_features():
     )
     assert mean_model.calls == 1
     assert aleatoric_model.calls == 1
-    assert [result["line"] for result in results] == [
-        "line_ok", "line_bad", "line_trip"
-    ]
+    assert [result["line"] for result in results] == ["line_ok", "line_bad"]
     assert all(result["failure_prediction"] == 1 for result in results)
     assert all(result["failure_probability"] == 0.75 for result in results)
-    assert len(classifier.rows) == 3
+    assert len(classifier.rows) == 2
     assert classifier.rows[0].columns.tolist() == CLASSIFIER_FEATURES
     assert np.isclose(classifier.rows[0]["fcast_max_line_rho"].iloc[0], 0.96)
     assert np.isclose(classifier.rows[1]["fcast_max_line_rho"].iloc[0], 0.97)
-    assert np.isclose(classifier.rows[2]["fcast_max_line_rho"].iloc[0], 0.98)
     assert np.isclose(classifier.rows[0]["epistemic_after"].iloc[0], 0.96)
     assert np.isclose(classifier.rows[1]["epistemic_after"].iloc[0], 0.97)
-    assert np.isclose(classifier.rows[2]["epistemic_after"].iloc[0], 0.98)
 
 
 def _check_simulator_backed_observation_supports_agent_simulation():

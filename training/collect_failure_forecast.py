@@ -29,6 +29,7 @@ from project_config import (  # noqa: E402
     SEED,
     configure_grid2op_warnings,
 )
+from run_example import load_enn_uncertainty  # noqa: E402
 from src.agent_runtime import build_agent  # noqa: E402
 from src.failure_forecast import (  # noqa: E402
     FailureForecastConfig,
@@ -108,6 +109,7 @@ def main() -> None:
         )
         mean_model = joblib.load(args.mean_model)
         aleatoric_model = joblib.load(args.aleatoric_model)
+        enn, uncertainty_fn = load_enn_uncertainty()
 
         def update(_episode: int, steps: int, total_rows: int) -> None:
             progress.update(1)
@@ -123,6 +125,8 @@ def main() -> None:
             seed=args.seed,
             sampling_stride=args.sampling_stride,
             max_steps=args.max_steps,
+            model_enn=enn,
+            get_uncertainty_fn=uncertainty_fn,
             progress_callback=update,
         )
     finally:
