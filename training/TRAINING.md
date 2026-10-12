@@ -151,13 +151,33 @@ live Grid2Op environment.
 A live Grid2Op validation requires the target environment dataset, active agent
 assets, trained ENN artifacts, and the pinned Grid2Op/LightSim dependency stack.
 
+For a small end-to-end pipeline check that writes only to `artifacts_smoke/`,
+run:
+
+```bash
+python smoke_test.py
+```
+
+The smoke test uses short runs and adds clearly marked synthetic positive rows
+only when the tiny sample does not contain both classifier labels.
+
 ## Failure Forecasting
 
-The active module-only failure forecast predicts whether the configured RL agent
-will fail one hour ahead after a candidate line disconnection. It ports the
-legacy archive forecast path: historical t/1h/1d/1w features, t+12 mean and
-aleatoric forecasters, `_forecasted_inj` power-flow simulation, and HGB failure
-classification.
+The failure forecast predicts whether the configured RL agent will fail one
+hour ahead after a candidate line disconnection. Forecast inputs contain the
+current, 1-hour, 1-day, and 1-week grid values plus time features. Collection
+stores one origin every 12 steps, rotates the five-minute offset by episode,
+and pairs each origin with its actual `t+12` injections. The resulting
+`forecast_X.npy`, `forecast_y.npy`, and `forecast_episode_ids.npy` files support
+an episode-separated tuning split for the mean forecaster.
+
+Failure-row collection builds one common forecasted `t+12` state and evaluates
+each currently connected selected line in an isolated contingency branch. The
+agent action used for the label is requested from the post-contingency state;
+runtime prediction does not execute the agent. During row collection, forecast
+or contingency states whose power flow does not converge are omitted because
+they do not provide a valid classifier feature row. Runtime raises for an
+invalid forecast base state and skips invalid contingency branches.
 
 Run the full pipeline:
 
@@ -203,8 +223,31 @@ python training/predict_failure_forecast.py \
   --line line_a
 ```
 
+`--line` accepts a comma-separated list. Omit it to predict all lines stored in
+the classifier metadata. Each returned item contains the line name, failure
+probability, and thresholded binary prediction.
+
+For the production failure-forecast bundle, configure `.env` and run the
+in-process trainer:
+
+```bash
+python forecaster_full_train.py
+```
+
+This script collects and validates genuine `t -> t+12` pairs, trains both
+forecasters and the classifier, reopens the saved bundle, and checks per-line
+inference.
+
 Artifacts are written under:
 
 ```text
 artifacts/<ENV_NAME>/<AGENT_NAME>/failure_forecast/
+|-- forecast_X.npy
+|-- forecast_y.npy
+|-- forecast_episode_ids.npy
+|-- mean_forecaster.pkl
+|-- aleatoric_forecaster.pkl
+|-- failure_forecast_rows.csv
+|-- failure_classifier.pkl
+`-- failure_classifier_metadata.json
 ```

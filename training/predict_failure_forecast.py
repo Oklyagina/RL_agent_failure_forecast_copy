@@ -24,8 +24,10 @@ from project_config import (  # noqa: E402
     SEED,
     configure_grid2op_warnings,
 )
+from run_example import load_enn_uncertainty  # noqa: E402
 from src.agent_runtime import build_agent, call_agent  # noqa: E402
-from src.failure_forecast import FailureForecastConfig, FailureForecastPredictor  # noqa: E402
+from src.failure_forecast import (FailureForecastConfig,
+                                  FailureForecastPredictor)  # noqa: E402
 
 
 def default_dir(agent_name: str) -> Path:
@@ -52,7 +54,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--agent-name", default=AGENT_NAME)
     parser.add_argument("--agent-factory", default=AGENT_FACTORY or None)
-    parser.add_argument("--line", required=True)
+    parser.add_argument("--line", default=None,
+                        help="comma-separated lines; default: all classifier lines")
     parser.add_argument("--step", type=int, default=12)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--mean-model", type=Path, required=True)
@@ -88,16 +91,20 @@ def main() -> None:
             if done:
                 raise RuntimeError("Episode ended before the requested smoke step.")
         observations.append(obs)
+        lines = [part.strip() for part in args.line.split(",")] if args.line \
+            else list(predictor.line_map)
         cfg = FailureForecastConfig.from_env(
             env,
             env_name=ENV_NAME,
             agent_name=args.agent_name,
             artifact_dir=out_dir,
-            lines_to_test=[args.line],
+            lines_to_test=lines,
         )
-        print(predictor.predict(
-            env, agent, obs, observations, args.line,
+        enn, uncertainty_fn = load_enn_uncertainty()
+        print(predictor.predict_many(
+            env, agent, obs, observations, lines,
             mean_model, aleatoric_model, cfg,
+            model_enn=enn, get_uncertainty_fn=uncertainty_fn,
         ))
     finally:
         env.close()

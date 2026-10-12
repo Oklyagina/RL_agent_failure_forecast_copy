@@ -12,6 +12,7 @@ This module ports the legacy failure-forecast feature path from
 """
 from __future__ import annotations
 
+import copy
 import csv
 import datetime as _dt
 import json
@@ -200,6 +201,14 @@ def _resolve_line_id(env: Any, line: Any) -> int:
     return int(line)
 
 
+def eligible_lines(env: Any, obs: Any, lines: Sequence[Any]) -> List[Any]:
+    """Keep requested lines that are currently connected (shared by train/inference)."""
+    status = getattr(obs, "line_status", None)
+    if status is None:
+        return list(lines)
+    return [line for line in lines if bool(status[_resolve_line_id(env, line)])]
+
+
 def normalize_line_name(line: Any) -> str:
     """Normalize Grid2Op line names for stable classifier metadata keys."""
     return str(line).replace("line_", "")
@@ -238,12 +247,70 @@ def _simulate(obs: Any, action: Any) -> Tuple[Any, float, bool, dict]:
     return obs.simulate(action)
 
 
+def clone_agent_for_contingency(agent: Any) -> Any:
+    """Clone the policy at its current state for one contingency evaluation.
+
+    A line branch is allowed to mutate its private policy clone, but it must not
+    change the rollout policy or the clone used for another line.  Policies may
+    expose ``clone_for_contingency()``; otherwise the policy is shallow-copied
+    (sharing heavy read-only resources such as Keras models and action sets) and
+    its mutable containers (lists/dicts, e.g. CurriculumAgent's recovery stack)
+    are deep-copied.
+    """
+    clone_method = getattr(agent, "clone_for_contingency", None)
+    if callable(clone_method):
+        cloned = clone_method()
+    else:
+        cloned = copy.copy(agent)
+        for name, value in vars(agent).items():
+            if isinstance(value, (list, dict, set)):
+                setattr(cloned, name, copy.deepcopy(value))
+    if cloned is agent:
+        raise RuntimeError(
+            "clone_for_contingency() returned the original agent; a distinct "
+            "policy instance is required for each line."
+        )
+    return cloned
+
+
 def _simulator_result(simulator: Any) -> Tuple[Any, float, bool, dict]:
     """Convert a Grid2Op Simulator state to the observation simulation contract."""
     converged = bool(simulator.converged)
     error = getattr(simulator, "error", None)
     exceptions = [] if converged or error is None else [error]
     return simulator.current_obs, 0.0, not converged, {"exception": exceptions}
+
+
+class _SimulatorBackedObservation:
+    """Expose a Simulator state through the observation interface used by agents.
+
+    Grid2Op clears ``_obs_env`` on ``Simulator.current_obs``. Agents that call
+    ``obs.simulate(...)`` while selecting an action therefore need simulations
+    routed through the corresponding Simulator instead.
+    """
+
+    def __init__(self, simulator: Any):
+        self._simulator = simulator
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._simulator.current_obs, name)
+
+    def copy(self) -> "_SimulatorBackedObservation":
+        return _SimulatorBackedObservation(self._simulator.copy())
+
+    def get_simulator(self) -> Any:
+        return self._simulator.copy()
+
+    def simulate(self, action: Any, time_step: int = 1) -> Tuple[Any, float, bool, dict]:
+        if int(time_step) != 1:
+            raise ValueError(
+                "Simulator-backed contingency observations support only "
+                "single-step action simulations."
+            )
+        result = self._simulator.copy().predict(action)
+        obs, reward, done, info = _simulator_result(result)
+        info.update({"is_illegal": False, "is_ambiguous": False})
+        return _SimulatorBackedObservation(result), reward, done, info
 
 
 def _get_uncertainty(model_enn: Any, obs: Any,
@@ -278,7 +345,7 @@ def run_t12_forecast(
     model_enn: Any = None,
     get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
 ) -> Dict[str, Any]:
-    """Run the legacy t+12 forecast and return forecast state/features."""
+    """Predict t+12 injections and solve the common future base-state PF."""
     x_t12 = get_features_with_history(observations, obs)
     y_pred = np.asarray(mean_model.predict([x_t12])[0], dtype=float)
     z_pred = np.asarray(aleatoric_model.predict([x_t12])[0], dtype=float)
@@ -339,11 +406,22 @@ def run_t12_forecast(
     }
 
 
-def build_feature_row(env: Any, obs: Any, line: Any, forecast: Dict[str, Any],
-                      cfg: FailureForecastConfig) -> Dict[str, Any]:
-    """Combine current, forecast, uncertainty, and line features into one row."""
+def build_feature_row(
+    env: Any,
+    obs: Any,
+    line: Any,
+    forecast: Dict[str, Any],
+    cfg: FailureForecastConfig,
+    *,
+    scenario_obs: Any,
+) -> Dict[str, Any]:
+    """Combine current and forecast post-contingency (t+12) features in one row.
+
+    Shared by training and inference; ``scenario_obs`` must be a valid
+    post-contingency observation.
+    """
     current = compute_grid_stats(obs)
-    fcast = forecast.get("forecast_grid_stats", {})
+    fcast = compute_grid_stats(scenario_obs)
     sum_load = float(current.get("sum_load_p", np.nan))
     sum_gen = float(current.get("sum_gen_p", np.nan))
     row = {
@@ -376,6 +454,30 @@ def build_feature_row(env: Any, obs: Any, line: Any, forecast: Dict[str, Any],
     return row
 
 
+def simulate_line_contingency(
+    env: Any,
+    forecast: Dict[str, Any],
+    line: Any,
+) -> Dict[str, Any]:
+    """Disconnect one line from the common future state in an isolated branch."""
+    disconnect_action = make_disconnect_action(env, line)
+    simulator = forecast.get("simulator")
+    if simulator is not None:
+        contingency_simulator = simulator.copy().predict(disconnect_action)
+        scenario_obs, _, done, info = _simulator_result(contingency_simulator)
+    else:
+        contingency_simulator = None
+        scenario_obs, _, done, info = _simulate(
+            forecast["forecast_obs"], disconnect_action
+        )
+    return {
+        "simulator": contingency_simulator,
+        "obs": scenario_obs,
+        "done": bool(done),
+        "info": info or {},
+    }
+
+
 def evaluate_line_failure(
     env: Any,
     agent: Any,
@@ -386,43 +488,50 @@ def evaluate_line_failure(
     aleatoric_model: Any,
     cfg: FailureForecastConfig,
     *,
+    forecast: Optional[Dict[str, Any]] = None,
     model_enn: Any = None,
     get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
-) -> Dict[str, Any]:
+) -> Optional[Dict[str, Any]]:
     """Create one labeled legacy-compatible row for one line contingency."""
-    forecast = run_t12_forecast(
-        env, obs, observations, mean_model, aleatoric_model, cfg,
-        model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
-    )
-    row = build_feature_row(env, obs, line, forecast, cfg)
-    row["forecast_failed"] = bool(forecast["forecast_failed"])
+    if forecast is None:
+        forecast = run_t12_forecast(
+            env, obs, observations, mean_model, aleatoric_model, cfg,
+            model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
+        )
     if forecast["forecast_failed"]:
-        row.update({"failed": 1, "label_reason": "forecast_failed_before_contingency"})
-        return row
+        # Without a valid future base state there is no contingency scenario
+        # from which to derive a meaningful agent-failure label.
+        return None
 
-    disconnect_action = make_disconnect_action(env, line)
-    simulator = forecast.get("simulator")
-    if simulator is not None:
-        attacked_simulator = simulator.predict(disconnect_action)
-        attacked_obs, _, disconnect_done, disconnect_info = _simulator_result(
-            attacked_simulator
-        )
-    else:
-        attacked_simulator = None
-        attacked_obs, _, disconnect_done, disconnect_info = _simulate(
-            forecast["forecast_obs"], disconnect_action
-        )
+    contingency = simulate_line_contingency(env, forecast, line)
+    attacked_simulator = contingency["simulator"]
+    attacked_obs = contingency["obs"]
+    disconnect_done = contingency["done"]
+    disconnect_info = contingency["info"]
+
     if _failure_from_done(bool(disconnect_done), attacked_obs, disconnect_info):
-        row.update({"failed": 1, "label_reason": "line_disconnection_blackout"})
-        return row
+        # The contingency PF itself diverged: there is no valid post-contingency
+        # state and the agent never acts, so this is not a labeled sample.
+        return None
 
-    # Evaluate the live recommendation against the forecasted contingency. A
-    # Simulator observation is detached from Grid2Op's nested obs.simulate API,
-    # which some policies (including CurriculumAgent) use internally.
-    agent_action = call_agent(agent, obs, reward=0.0, done=False)
+    row_forecast = dict(forecast)
+    row_forecast["epistemic_after"] = _get_uncertainty(
+        model_enn, attacked_obs, get_uncertainty_fn
+    )
+    row = build_feature_row(env, obs, line, row_forecast, cfg,
+                            scenario_obs=attacked_obs)
+    row["forecast_failed"] = False
+
+    contingency_agent = clone_agent_for_contingency(agent)
+    agent_obs = (
+        _SimulatorBackedObservation(attacked_simulator)
+        if attacked_simulator is not None
+        else attacked_obs
+    )
+    agent_action = call_agent(contingency_agent, agent_obs, reward=0.0, done=False)
     if attacked_simulator is not None:
         action_obs, _, action_done, action_info = _simulator_result(
-            attacked_simulator.predict(agent_action)
+            attacked_simulator.copy().predict(agent_action)
         )
     else:
         action_obs, _, action_done, action_info = _simulate(
@@ -476,14 +585,28 @@ def collect_failure_forecast_rows(
             observations.append(obs)
             current_step = int(getattr(obs, "current_step", step))
             if current_step >= HORIZON_STEPS and current_step % sampling_stride == 0:
-                for line in cfg.lines_to_test:
-                    row = evaluate_line_failure(
-                        env, agent, obs, observations, line, mean_model,
-                        aleatoric_model, cfg, model_enn=model_enn,
-                        get_uncertainty_fn=get_uncertainty_fn,
-                    )
-                    row["episode"] = int(episode)
-                    rows.append(row)
+                forecast = run_t12_forecast(
+                    env,
+                    obs,
+                    observations,
+                    mean_model,
+                    aleatoric_model,
+                    cfg,
+                    model_enn=model_enn,
+                    get_uncertainty_fn=get_uncertainty_fn,
+                )
+                if not forecast["forecast_failed"]:
+                    for line in eligible_lines(env, obs, cfg.lines_to_test):
+                        row = evaluate_line_failure(
+                            env, agent, obs, observations, line, mean_model,
+                            aleatoric_model, cfg, forecast=forecast,
+                            model_enn=model_enn,
+                            get_uncertainty_fn=get_uncertainty_fn,
+                        )
+                        if row is None:
+                            continue
+                        row["episode"] = int(episode)
+                        rows.append(row)
             action = call_agent(agent, obs, reward=float(reward), done=done)
             obs, reward, done, _ = env.step(action)
             step += 1
@@ -499,13 +622,23 @@ def collect_forecaster_training_data(
     episodes: int,
     seed: int = 0,
     max_steps: Optional[int] = None,
+    sampling_stride: int = HORIZON_STEPS,
+    return_episode_ids: bool = False,
     progress_callback: Optional[Callable[[int, int, int], None]] = None,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Collect legacy forecast-model pairs ``X -> next(load_p, load_q, gen_p)``."""
+) -> Any:
+    """Collect hourly-stratified pairs ``X_t -> injections at t+12``.
+
+    One origin is retained per ``sampling_stride`` steps.  The origin offset
+    rotates by episode so an on-demand runtime remains represented at every
+    five-minute phase without storing twelve overlapping rows per hour.
+    """
     if episodes <= 0:
         raise ValueError("episodes must be positive")
+    if sampling_stride <= 0:
+        raise ValueError("sampling_stride must be positive")
     rows_x: List[np.ndarray] = []
     rows_y: List[np.ndarray] = []
+    row_episode_ids: List[int] = []
     for episode in range(episodes):
         try:
             obs = env.reset(seed=seed + episode)
@@ -514,6 +647,7 @@ def collect_forecaster_training_data(
                 env.seed(seed + episode)
             obs = env.reset()
         observations: List[Any] = []
+        pending_features: Dict[int, np.ndarray] = {}
         reward = getattr(env, "reward_range", (0.0, 0.0))[0]
         done = False
         step = 0
@@ -524,24 +658,43 @@ def collect_forecaster_training_data(
                 pass
         while not done and (max_steps is None or step < max_steps):
             observations.append(obs)
-            x = get_features_with_history(observations, obs)
+            origin_offset = episode % sampling_stride
+            current_idx = len(observations) - 1
+            if current_idx % sampling_stride == origin_offset:
+                pending_features[current_idx] = get_features_with_history(
+                    observations, obs
+                )
+            origin_idx = current_idx - HORIZON_STEPS
+            if origin_idx in pending_features:
+                y = np.concatenate([obs.load_p, obs.load_q, obs.gen_p], axis=0)
+                rows_x.append(
+                    np.asarray(pending_features.pop(origin_idx), dtype=np.float32)
+                )
+                rows_y.append(np.asarray(y, dtype=np.float32))
+                row_episode_ids.append(int(episode))
             action = call_agent(agent, obs, reward=float(reward), done=done)
-            obs_next, reward, done, _ = env.step(action)
+            next_obs, reward, done, _ = env.step(action)
             if done:
                 break
-            y = np.concatenate([obs_next.load_p, obs_next.load_q, obs_next.gen_p], axis=0)
-            rows_x.append(np.asarray(x, dtype=np.float32))
-            rows_y.append(np.asarray(y, dtype=np.float32))
-            obs = obs_next
+            obs = next_obs
             step += 1
         if progress_callback:
             progress_callback(episode, step, len(rows_x))
     if not rows_x:
         raise RuntimeError("Forecast data collection produced no rows.")
-    return np.stack(rows_x).astype(np.float32), np.stack(rows_y).astype(np.float32)
+    X = np.stack(rows_x).astype(np.float32)
+    y = np.stack(rows_y).astype(np.float32)
+    if return_episode_ids:
+        return X, y, np.asarray(row_episode_ids, dtype=np.int32)
+    return X, y
 
 
-def save_forecaster_training_data(out_dir: str | Path, X: np.ndarray, y: np.ndarray) -> Dict[str, str]:
+def save_forecaster_training_data(
+    out_dir: str | Path,
+    X: np.ndarray,
+    y: np.ndarray,
+    episode_ids: Optional[np.ndarray] = None,
+) -> Dict[str, str]:
     """Persist forecast training arrays beside the downstream classifier data."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -549,7 +702,62 @@ def save_forecaster_training_data(out_dir: str | Path, X: np.ndarray, y: np.ndar
     y_path = out / "forecast_y.npy"
     np.save(x_path, np.asarray(X, dtype=np.float32))
     np.save(y_path, np.asarray(y, dtype=np.float32))
-    return {"X": str(x_path), "y": str(y_path)}
+    paths = {"X": str(x_path), "y": str(y_path)}
+    if episode_ids is not None:
+        episode_path = out / "forecast_episode_ids.npy"
+        np.save(episode_path, np.asarray(episode_ids, dtype=np.int32))
+        paths["episode_ids"] = str(episode_path)
+    return paths
+
+
+def _fixed_tuning_indices(
+    row_count: int,
+    episode_ids: Optional[np.ndarray],
+    *,
+    max_subsample: int,
+    seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Create one deterministic tuning split, grouped by episode when available."""
+    if row_count < 2:
+        raise ValueError("Optuna tuning requires at least two forecast rows.")
+    if max_subsample <= 0:
+        raise ValueError("max_subsample must be positive.")
+    rng = np.random.default_rng(seed)
+
+    if episode_ids is not None:
+        groups = np.asarray(episode_ids)
+        if groups.ndim != 1 or len(groups) != row_count:
+            raise ValueError("episode_ids must be one-dimensional and match X/y rows.")
+        unique_episodes = np.unique(groups)
+        if len(unique_episodes) < 2:
+            raise ValueError("Episode-separated tuning requires at least two episodes.")
+        shuffled = rng.permutation(unique_episodes)
+        validation_episode_count = min(
+            len(shuffled) - 1,
+            max(1, int(round(0.2 * len(shuffled)))),
+        )
+        validation_episodes = shuffled[:validation_episode_count]
+        validation_mask = np.isin(groups, validation_episodes)
+        train_pool = np.flatnonzero(~validation_mask)
+        validation_pool = np.flatnonzero(validation_mask)
+    else:
+        shuffled_rows = rng.permutation(row_count)
+        validation_count = min(
+            row_count - 1,
+            max(1, int(round(0.2 * row_count))),
+        )
+        validation_pool = shuffled_rows[:validation_count]
+        train_pool = shuffled_rows[validation_count:]
+
+    train_count = min(int(max_subsample), len(train_pool))
+    validation_count = min(max(1, int(max_subsample) // 5), len(validation_pool))
+    train_idx = rng.choice(train_pool, size=train_count, replace=False)
+    validation_idx = rng.choice(
+        validation_pool,
+        size=validation_count,
+        replace=False,
+    )
+    return np.asarray(train_idx, dtype=int), np.asarray(validation_idx, dtype=int)
 
 
 def train_mean_forecaster(
@@ -560,9 +768,10 @@ def train_mean_forecaster(
     n_trials: int = 20,
     max_subsample: int = 5000,
     seed: int = 42,
+    episode_ids: Optional[np.ndarray] = None,
     progress_callback: Optional[Callable[[int, int, float], None]] = None,
 ) -> Any:
-    """Train the legacy mean forecaster for next-step injections."""
+    """Train the mean forecaster for injections twelve steps ahead."""
     import joblib
     from sklearn.ensemble import HistGradientBoostingRegressor
     from sklearn.metrics import mean_squared_error
@@ -570,12 +779,17 @@ def train_mean_forecaster(
 
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
-    rng = np.random.default_rng(seed)
 
     if n_trials > 0:
         import optuna
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
+        tune_train_idx, tune_validation_idx = _fixed_tuning_indices(
+            len(X),
+            episode_ids,
+            max_subsample=int(max_subsample),
+            seed=int(seed),
+        )
 
         def objective(trial: Any) -> float:
             params = {
@@ -586,12 +800,10 @@ def train_mean_forecaster(
                 "early_stopping": True,
                 "random_state": seed,
             }
-            sub_n = min(int(max_subsample), len(X))
-            sub_idx = rng.choice(len(X), size=sub_n, replace=False)
             model = MultiOutputRegressor(HistGradientBoostingRegressor(**params))
-            model.fit(X[sub_idx], y[sub_idx])
-            pred = model.predict(X[sub_idx])
-            return float(np.sqrt(mean_squared_error(y[sub_idx], pred)))
+            model.fit(X[tune_train_idx], y[tune_train_idx])
+            pred = model.predict(X[tune_validation_idx])
+            return float(np.sqrt(mean_squared_error(y[tune_validation_idx], pred)))
 
         study = optuna.create_study(direction="minimize")
         total_trials = int(n_trials)
@@ -761,6 +973,74 @@ def _metrics(y_true: np.ndarray, y_pred: np.ndarray,
     }
 
 
+def _split_classifier_rows(
+    dataframe: pd.DataFrame,
+    *,
+    seed: int,
+    test_size: float = 0.2,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, Dict[str, Any]]:
+    """Split classifier rows while keeping each episode in exactly one set."""
+    from sklearn.model_selection import train_test_split
+
+    X = dataframe[CLASSIFIER_FEATURES].copy()
+    y = dataframe["label"].astype(int)
+    if "episode" in dataframe.columns and dataframe["episode"].nunique() >= 2:
+        episodes = pd.to_numeric(dataframe["episode"], errors="raise").astype(int)
+        unique_episodes = np.asarray(sorted(episodes.unique()), dtype=int)
+        episode_has_failure = (
+            pd.DataFrame({"episode": episodes, "label": y})
+            .groupby("episode", sort=True)["label"]
+            .max()
+            .reindex(unique_episodes)
+            .astype(int)
+        )
+        stratify = None
+        class_counts = episode_has_failure.value_counts()
+        if episode_has_failure.nunique() > 1 and int(class_counts.min()) >= 2:
+            stratify = episode_has_failure.to_numpy()
+        train_episodes, test_episodes = train_test_split(
+            unique_episodes,
+            test_size=float(test_size),
+            random_state=int(seed),
+            stratify=stratify,
+        )
+        train_mask = episodes.isin(train_episodes)
+        test_mask = episodes.isin(test_episodes)
+        X_train, X_test = X.loc[train_mask], X.loc[test_mask]
+        y_train, y_test = y.loc[train_mask], y.loc[test_mask]
+        split_info = {
+            "strategy": "episode_grouped",
+            "test_fraction": float(test_size),
+            "train_episodes": int(len(train_episodes)),
+            "test_episodes": int(len(test_episodes)),
+            "train_rows": int(train_mask.sum()),
+            "test_rows": int(test_mask.sum()),
+        }
+    else:
+        stratify = y if int(y.value_counts().min()) >= 2 else None
+        X_train, X_test, y_train, y_test = train_test_split(
+            X,
+            y,
+            test_size=float(test_size),
+            random_state=int(seed),
+            stratify=stratify,
+        )
+        split_info = {
+            "strategy": "row_stratified",
+            "test_fraction": float(test_size),
+            "train_episodes": None,
+            "test_episodes": None,
+            "train_rows": int(len(X_train)),
+            "test_rows": int(len(X_test)),
+        }
+
+    if y_train.nunique() < 2:
+        raise ValueError("Classifier training split does not contain both classes.")
+    if y_test.nunique() < 2:
+        raise ValueError("Classifier test split does not contain both classes.")
+    return X_train, X_test, y_train, y_test, split_info
+
+
 def train_failure_classifier(
     dataframe: pd.DataFrame,
     *,
@@ -773,20 +1053,18 @@ def train_failure_classifier(
 ) -> Tuple[Any, Dict[str, Any]]:
     import joblib
     from sklearn.ensemble import HistGradientBoostingClassifier
-    from sklearn.model_selection import train_test_split
 
     if "label" not in dataframe.columns:
         raise ValueError("Use prepare_classifier_dataframe before training.")
-    X = dataframe[CLASSIFIER_FEATURES].copy()
     y = dataframe["label"].astype(int)
     if y.nunique() < 2:
         raise ValueError("Failure classifier requires both classes.")
     if int(y.value_counts().min()) < 2:
         raise ValueError("Failure classifier needs at least two samples per class.")
 
-    stratify = y if int(y.value_counts().min()) >= 2 else None
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=seed, stratify=stratify
+    X_train, X_test, y_train, y_test, split_info = _split_classifier_rows(
+        dataframe,
+        seed=seed,
     )
     cat_indices = [CLASSIFIER_FEATURES.index("line_id_encoded")]
     model = HistGradientBoostingClassifier(
@@ -811,6 +1089,17 @@ def train_failure_classifier(
         "line_map": dataframe.attrs.get("line_map", {}),
         "failure_class": 1,
         "decision_threshold": float(threshold),
+        "forecast_horizon_steps": HORIZON_STEPS,
+        "forecast_horizon_minutes": HORIZON_STEPS * STEP_MINUTES,
+        "split": split_info,
+        "label_reason_counts": {
+            str(reason): int(count)
+            for reason, count in (
+                dataframe["label_reason"].value_counts().items()
+                if "label_reason" in dataframe.columns
+                else []
+            )
+        },
         "model_params": {
             "class_weight": "balanced",
             "learning_rate": 0.05,
@@ -871,7 +1160,7 @@ class FailureForecastPredictor:
         prob = float(_failure_probability(self.model, X)[0])
         return {
             "failure_prediction": 1 if prob >= self.threshold else 0,
-            "failure_probability": np.round(prob, 3),
+            "failure_probability": prob,
         }
 
     def predict(
@@ -888,10 +1177,70 @@ class FailureForecastPredictor:
         model_enn: Any = None,
         get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
     ) -> Dict[str, Any]:
-        """Run t+12 forecasting, build features, and return failure prediction."""
+        """Score one future line contingency without executing the agent."""
+        prediction = self.predict_many(
+            env,
+            agent,
+            obs,
+            observations,
+            [line],
+            mean_model,
+            aleatoric_model,
+            cfg,
+            model_enn=model_enn,
+            get_uncertainty_fn=get_uncertainty_fn,
+        )[0]
+        return {
+            "failure_prediction": prediction["failure_prediction"],
+            "failure_probability": prediction["failure_probability"],
+        }
+
+    def predict_many(
+        self,
+        env: Any,
+        agent: Any,
+        obs: Any,
+        observations: Sequence[Any],
+        lines: Sequence[Any],
+        mean_model: Any,
+        aleatoric_model: Any,
+        cfg: FailureForecastConfig,
+        *,
+        model_enn: Any = None,
+        get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
+    ) -> List[Dict[str, Any]]:
+
+        """Score all lines independently from one common forecasted base state."""
+        # ``agent`` remains part of the runtime interface for compatibility, but
+        # labels and policy actions are never generated during inference.
+
+        del agent
         forecast = run_t12_forecast(
             env, obs, observations, mean_model, aleatoric_model, cfg,
             model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
         )
-        row = build_feature_row(env, obs, line, forecast, cfg)
-        return self.predict_from_features(row)
+        if forecast["forecast_failed"]:
+            raise RuntimeError(
+                "Cannot predict agent failure because the forecasted future "
+                "power flow did not produce a valid operating state."
+            )
+
+        predictions: List[Dict[str, Any]] = []
+        for line in eligible_lines(env, obs, lines):
+            contingency = simulate_line_contingency(env, forecast, line)
+            if _failure_from_done(
+                contingency["done"], contingency["obs"], contingency["info"]
+            ):
+                # No valid post-contingency state (never a training sample).
+                continue
+            row_forecast = dict(forecast)
+            row_forecast["epistemic_after"] = _get_uncertainty(
+                model_enn, contingency["obs"], get_uncertainty_fn
+            )
+            row = build_feature_row(env, obs, line, row_forecast, cfg,
+                                    scenario_obs=contingency["obs"])
+            predictions.append({
+                "line": _line_name(env, line),
+                **self.predict_from_features(row),
+            })
+        return predictions

@@ -26,6 +26,7 @@ from project_config import (AGENT_FACTORY, AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR
                             configure_grid2op_warnings, ENV_DIR,
                             ENV_NAME,
                             SEED as CONFIG_SEED)
+from src.agent_runtime import call_agent
 
 ROOT = Path(__file__).resolve().parent
 
@@ -99,6 +100,7 @@ def find_artifact_set():
                 "          python training/train_enn.py\n"
                 "        and then re-run this script.")
         cands.sort(key=lambda d: (
+            d != configured_dir,
             _artifact_rank(d),
             -(d / "enn_meta.json").stat().st_mtime,
         ))
@@ -141,6 +143,29 @@ def find_enn_weights(prefer_dir: Path | None = None) -> Path:
     print(f"       auto: ENN weights -> {cands[0].relative_to(ROOT)}"
           + (f"  (candidates: {len(cands)})" if len(cands) > 1 else ""))
     return cands[0]
+
+
+def enn_uncertainty_fn(scaler):
+    """ENN vacuity of a raw observation vector, scaled as in assess_observation."""
+    import torch
+
+    def uncertainty_fn(model, vect):
+        x = scaler.transform(vect).astype(np.float32)
+        with torch.no_grad():
+            return float(model(torch.as_tensor(x))["uncertainty"][0].item())
+
+    return uncertainty_fn
+
+
+def load_enn_uncertainty():
+    """Return ``(enn, uncertainty_fn)`` for failure-forecast ENN features.
+
+    Shared by training and inference so both use the same trained ENN and scaler.
+    """
+    scaler_json, meta_json, _ = find_artifact_set()
+    meta = json.loads(meta_json.read_text())
+    enn = load_enn(find_enn_weights(prefer_dir=meta_json.parent), meta)
+    return enn, enn_uncertainty_fn(scaler_from_json(scaler_json))
 
 
 def find_actions_npy(meta: dict) -> Path:
@@ -355,10 +380,10 @@ def main() -> None:
     )
     mean_model, aleatoric_model = map(joblib.load, failure_paths[:2])
     predictor = FailureForecastPredictor.load(failure_paths[2])
-    line = next(iter(predictor.line_map))
+    lines = list(predictor.line_map)
     failure_cfg = FailureForecastConfig.from_env(
         env, env_name=ENV_NAME, agent_name=AGENT_NAME,
-        artifact_dir=failure_dir, lines_to_test=[line])
+        artifact_dir=failure_dir, lines_to_test=lines)
     print(f"[3/4] ENN ({meta['num_classes']} classes), scaler and "
           f"calibration loaded; failure models loaded")
 
@@ -368,7 +393,6 @@ def main() -> None:
     recommendations = []
     observations = []
     for t in range(N_STEPS):
-        from src.agent_runtime import call_agent
         observations.append(obs)
         action = call_agent(agent, obs, reward=reward, done=done)
         info = assess_recommendation(obs, agent, enn, calibration, action=action)
@@ -377,11 +401,17 @@ def main() -> None:
               f"action_pctile={info['epistemic_uncertainty_action_pctile']}")
         recommendations.append(to_interactiveai(action, info))
         if t == N_STEPS - 1:
-            failure = predictor.predict(
-                env, agent, obs, observations, line,
-                mean_model, aleatoric_model, failure_cfg)
-            recommendations[-1]["kpis"].update(failure)
-            print(f"  t+12 failure on {line}: {failure}")
+            failures = predictor.predict_many(
+                env, agent, obs, observations, lines,
+                mean_model, aleatoric_model, failure_cfg,
+                model_enn=enn, get_uncertainty_fn=enn_uncertainty_fn(calibration.scaler))
+            kpis = recommendations[-1]["kpis"]
+            if failures:
+                worst = max(failures, key=lambda f: f["failure_probability"])
+                kpis["failure_prediction"] = worst["failure_prediction"]
+                kpis["failure_probability"] = worst["failure_probability"]
+            kpis["failure_forecasts"] = failures
+            print(f"  t+12 failure forecasts: {failures}")
             break
         obs, reward, done, _ = env.step(action)
         if done:
