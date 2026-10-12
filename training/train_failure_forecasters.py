@@ -188,11 +188,6 @@ def main() -> None:
 
     print_stage(2, 3, "Training mean forecaster")
 
-    def report_trial(done: int, total: int, best_rmse: float) -> None:
-        """Print the first, every tenth, and final Optuna trial."""
-        if done == 1 or done == total or done % 10 == 0:
-            print(f"[mean] trial {done}/{total} best_rmse={best_rmse:.4f}")
-
     mean_model = train_mean_forecaster(
         X,
         y,
@@ -201,7 +196,6 @@ def main() -> None:
         max_subsample=args.max_subsample,
         seed=args.seed,
         episode_ids=episode_ids,
-        progress_callback=report_trial if args.mean_trials > 0 else None,
     )
     print_stage(3, 3, "Training aleatoric forecaster")
     train_aleatoric_forecaster(X, y, mean_model, model_path=aleatoric_path)

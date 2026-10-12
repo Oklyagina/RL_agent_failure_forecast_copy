@@ -136,9 +136,9 @@ def get_features_with_history(observations: Sequence[Any], obs: Any) -> np.ndarr
         values(past_week, "gen_p", sz_gen_p),
     ]).astype(float)
 
-    hour_cos, hour_sin = convert_to_cos_sin(getattr(obs, "hour_of_day", 0), 23)
-    minute_cos, minute_sin = convert_to_cos_sin(getattr(obs, "minute_of_hour", 0), 59)
-    dow_cos, dow_sin = convert_to_cos_sin(getattr(obs, "day_of_week", 0), 6)
+    hour_cos, hour_sin = convert_to_cos_sin(getattr(obs, "hour_of_day", 0), 24)
+    minute_cos, minute_sin = convert_to_cos_sin(getattr(obs, "minute_of_hour", 0), 60)
+    dow_cos, dow_sin = convert_to_cos_sin(getattr(obs, "day_of_week", 0), 7)
     temporal = np.asarray([
         getattr(obs, "day", 1),
         hour_cos,
@@ -770,9 +770,20 @@ def train_mean_forecaster(
     seed: int = 42,
     episode_ids: Optional[np.ndarray] = None,
     progress_callback: Optional[Callable[[int, int, float], None]] = None,
+    patience: int = 10,
+    min_improvement: float = 0.005,
+    n_jobs: Optional[int] = -1,
 ) -> Any:
-    """Train the mean forecaster for injections twelve steps ahead."""
+    """Train the mean forecaster for injections twelve steps ahead.
+
+    Optuna tuning stops early once the best validation RMSE has not improved
+    by more than ``min_improvement`` (relative) for ``patience`` trials; set
+    ``patience`` to 0 to always run ``n_trials``. ``n_jobs`` parallelises the
+    per-output regressors (-1 = all cores) and does not change the fitted models.
+    """
+    import time
     import joblib
+    from tqdm import tqdm
     from sklearn.ensemble import HistGradientBoostingRegressor
     from sklearn.metrics import mean_squared_error
     from sklearn.multioutput import MultiOutputRegressor
@@ -800,25 +811,47 @@ def train_mean_forecaster(
                 "early_stopping": True,
                 "random_state": seed,
             }
-            model = MultiOutputRegressor(HistGradientBoostingRegressor(**params))
+            model = MultiOutputRegressor(
+                HistGradientBoostingRegressor(**params), n_jobs=n_jobs
+            )
             model.fit(X[tune_train_idx], y[tune_train_idx])
             pred = model.predict(X[tune_validation_idx])
             return float(np.sqrt(mean_squared_error(y[tune_validation_idx], pred)))
 
         study = optuna.create_study(direction="minimize")
         total_trials = int(n_trials)
+        stall = {"best": float("inf"), "trials": 0}
+        bar = tqdm(total=total_trials, desc="[mean] Optuna", unit="trial")
 
         def report_progress(study: Any, trial: Any) -> None:
-            """Report compact Optuna progress without enabling Optuna logs."""
+            """Update the progress bar and stop the study once tuning plateaus."""
+            best = float(study.best_value)
+            if best < stall["best"] * (1.0 - float(min_improvement)):
+                stall["trials"] = 0
+            else:
+                stall["trials"] += 1
+            stall["best"] = min(stall["best"], best)
+            bar.update(1)
+            bar.set_postfix(
+                last=f"{trial.value:.4f}",
+                best=f"{best:.4f}",
+                no_gain=f"{stall['trials']}/{patience}" if patience > 0 else "off",
+            )
             if progress_callback is not None:
-                progress_callback(trial.number + 1, total_trials, float(study.best_value))
+                progress_callback(trial.number + 1, total_trials, best)
+            if patience > 0 and stall["trials"] >= patience:
+                bar.set_description("[mean] Optuna (early stop)")
+                study.stop()
 
-        study.optimize(
-            objective,
-            n_trials=total_trials,
-            show_progress_bar=False,
-            callbacks=[report_progress],
-        )
+        try:
+            study.optimize(
+                objective,
+                n_trials=total_trials,
+                show_progress_bar=False,
+                callbacks=[report_progress],
+            )
+        finally:
+            bar.close()
         params = dict(study.best_params)
         params["early_stopping"] = True
         params["random_state"] = seed
@@ -833,8 +866,11 @@ def train_mean_forecaster(
             "random_state": seed,
         }
 
-    model = MultiOutputRegressor(HistGradientBoostingRegressor(**params))
+    print(f"[mean] final fit on {len(X)} rows, {y.shape[1]} outputs...", flush=True)
+    started = time.perf_counter()
+    model = MultiOutputRegressor(HistGradientBoostingRegressor(**params), n_jobs=n_jobs)
     model.fit(X, y)
+    print(f"[mean] final fit done in {(time.perf_counter() - started) / 60:.1f} min", flush=True)
     path = Path(model_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, path)

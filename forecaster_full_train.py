@@ -134,12 +134,6 @@ def _configure_logging() -> None:
     logging.getLogger("curriculumagent").setLevel(logging.WARNING)
 
 
-def _print_trial_progress(done: int, total: int, best_rmse: float) -> None:
-    """Report the first, every tenth, and final Optuna trial."""
-    if done == 1 or done == total or done % 10 == 0:
-        print(f"[mean] trial {done}/{total} best_rmse={best_rmse:.4f}")
-
-
 def _validate_forecast_arrays(
     X: np.ndarray,
     y: np.ndarray,
@@ -570,7 +564,6 @@ def run_full_forecasting(
         n_trials=int(mean_trials),
         seed=int(seed),
         episode_ids=episode_ids,
-        progress_callback=_print_trial_progress if mean_trials else None,
     )
 
     print("\n[3/6] Train aleatoric injection forecaster")
