@@ -42,7 +42,7 @@ from project_config import (  # noqa: E402
     FAILURE_EPISODES,
     FAILURE_LINES,
     FAILURE_MAX_STEPS,
-    FAILURE_SAMPLING_STRIDE,
+    FAILURE_OUTCOME_STEPS,
     FAILURE_THRESHOLD,
     FORECAST_EPISODES,
     FORECAST_MAX_STEPS,
@@ -143,6 +143,28 @@ def validate_rollouts(path: Path) -> dict[str, int]:
         "input_dim": int(observations.shape[1]),
         "num_classes": int(actions.shape[0]),
     }
+
+
+def validate_failure_rows(path: Path) -> dict[str, int]:
+    """Reject failure rows written by the old simulation-based collector."""
+    import pandas as pd
+    from src.failure_forecast import REQUIRED_DATA_COLUMNS
+
+    df = pd.read_csv(path)
+    missing = sorted(REQUIRED_DATA_COLUMNS | {"event_step", "label_reason"} - set(df.columns))
+    if missing:
+        raise ValueError("failure rows use an old format; missing " + ", ".join(missing))
+    return {"rows": int(len(df)), "positives": int((df["failed"] == 1).sum())}
+
+
+def validate_classifier_metadata(path: Path) -> dict[str, int]:
+    """Reject classifiers trained on a different feature set."""
+    from src.failure_forecast import CLASSIFIER_FEATURES
+
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    if meta.get("features") != CLASSIFIER_FEATURES:
+        raise ValueError("classifier features differ from the current code")
+    return {"features": len(CLASSIFIER_FEATURES)}
 
 
 def _resolve_action_set(meta: dict, meta_path: Path) -> Path:
@@ -266,11 +288,16 @@ def run_pipeline(args: argparse.Namespace) -> None:
         ENV_NAME,
         args.agent_name,
     )
-    rows_check = classify_outputs([rows_csv], provenance_path(rows_csv), ENV_NAME, args.agent_name)
-    classifier_check = classify_outputs(
+    rows_check = _check_with_validator(
+        [rows_csv],
+        rows_csv,
+        lambda: validate_failure_rows(rows_csv),
+        args.agent_name,
+    )
+    classifier_check = _check_with_validator(
         [classifier, classifier_meta],
-        provenance_path(classifier),
-        ENV_NAME,
+        classifier,
+        lambda: validate_classifier_metadata(classifier_meta),
         args.agent_name,
     )
 
@@ -414,7 +441,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             "--agent-name", args.agent_name,
             "--episodes", str(FAILURE_EPISODES),
             "--seed", str(SEED),
-            "--sampling-stride", str(FAILURE_SAMPLING_STRIDE),
+            "--outcome-steps", str(FAILURE_OUTCOME_STEPS),
             "--mean-model", str(failures / "mean_forecaster.pkl"),
             "--aleatoric-model", str(failures / "aleatoric_forecaster.pkl"),
             "--output-csv", str(rows_csv),

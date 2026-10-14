@@ -25,7 +25,7 @@ from project_config import (
     FAILURE_EPISODES,
     FAILURE_LINES,
     FAILURE_MAX_STEPS,
-    FAILURE_SAMPLING_STRIDE,
+    FAILURE_OUTCOME_STEPS,
     FAILURE_THRESHOLD,
     FORECAST_EPISODES,
     FORECAST_MAX_STEPS,
@@ -41,6 +41,7 @@ from src.failure_forecast import (
     FailureForecastPredictor,
     collect_failure_forecast_rows,
     collect_forecaster_training_data,
+    normalize_line_name,
     prepare_classifier_dataframe,
     save_forecaster_training_data,
     train_aleatoric_forecaster,
@@ -283,19 +284,14 @@ def _validate_rows(
             f"collection produced {sorted(labels)}."
         )
     row_lines = list(dict.fromkeys(str(row["line_disconnected"]) for row in rows))
-    if expected_lines is not None and row_lines != [str(line) for line in expected_lines]:
+    # Only lines that were really attacked in the historical episodes have rows.
+    if expected_lines is not None and not set(row_lines) <= {str(line) for line in expected_lines}:
+        raise RuntimeError(f"Failure rows contain unconfigured lines: {row_lines}.")
+    allowed_reasons = {"blackout_after_attack", "survived_after_attack"}
+    label_reasons = {str(row.get("label_reason", "")) for row in rows}
+    if not label_reasons <= allowed_reasons:
         raise RuntimeError(
-            "Failure rows do not contain the configured lines in order: "
-            f"expected {list(expected_lines)}, found {row_lines}."
-        )
-    label_reasons = {
-        str(row.get("label_reason", ""))
-        for row in rows
-    }
-    if "forecast_failed_before_contingency" in label_reasons:
-        raise RuntimeError(
-            "Invalid forecast-base states must be skipped, not labeled as "
-            "forecast_failed_before_contingency."
+            f"Unexpected label reasons (unknown outcomes must be skipped): {label_reasons}"
         )
     return {
         "rows": len(rows),
@@ -342,8 +338,8 @@ def _validate_artifacts(
         )
     if not metadata.get("features") or not metadata.get("line_map"):
         raise RuntimeError("Classifier metadata is missing features or the line map.")
-    if list(metadata["line_map"]) != [str(line) for line in expected_lines]:
-        raise RuntimeError("Classifier metadata does not contain the configured lines in order.")
+    if not set(metadata["line_map"]) <= {normalize_line_name(line) for line in expected_lines}:
+        raise RuntimeError("Classifier metadata contains lines that were not configured.")
     if not np.isclose(float(metadata.get("decision_threshold", np.nan)), threshold):
         raise RuntimeError("Classifier metadata contains the wrong decision threshold.")
     print(f"[artifacts] reopened X={X.shape} y={y.shape} and all model files")
@@ -359,11 +355,7 @@ def _validate_inference(
     aleatoric_model: Any,
     seed: int,
 ) -> list[dict[str, Any]]:
-    """Run one prediction for every line and ensure inference never calls an agent."""
-    class AgentMustNotRun:
-        def act(self, *_args: Any, **_kwargs: Any) -> Any:
-            raise AssertionError("The RL agent must not run during forecast inference.")
-
+    """Run one inference pass; it needs no agent and no simulation."""
     env = _make_environment(env_dir)
     try:
         try:
@@ -383,8 +375,6 @@ def _validate_inference(
             output_dir / "failure_classifier.pkl"
         )
         predictions = predictor.predict_many(
-            env,
-            AgentMustNotRun(),
             obs,
             [obs],
             lines,
@@ -412,7 +402,7 @@ def run_full_forecasting(
     forecast_max_steps: int = FORECAST_MAX_STEPS,
     failure_max_steps: int = FAILURE_MAX_STEPS,
     mean_trials: int = FORECAST_MEAN_TRIALS,
-    sampling_stride: int = FAILURE_SAMPLING_STRIDE,
+    outcome_steps: int = FAILURE_OUTCOME_STEPS,
     lines: Sequence[str] | None = None,
     threshold: float = FAILURE_THRESHOLD,
     seed: int = SEED,
@@ -432,8 +422,8 @@ def run_full_forecasting(
         raise ValueError("forecast_episodes and failure_episodes must be positive.")
     if int(mean_trials) < 0:
         raise ValueError("mean_trials must be zero or positive.")
-    if int(sampling_stride) <= 0:
-        raise ValueError("sampling_stride must be positive.")
+    if int(outcome_steps) <= 0:
+        raise ValueError("outcome_steps must be positive.")
     if not 0.0 <= float(threshold) <= 1.0:
         raise ValueError("threshold must be between zero and one.")
 
@@ -586,7 +576,7 @@ def run_full_forecasting(
         },
     )
 
-    print("\n[4/6] Collect post-contingency failure rows")
+    print("\n[4/6] Collect failure rows from historical agent episodes")
     env = _make_environment(env_dir)
     progress = tqdm(
         total=int(failure_episodes), desc="Failure rows", unit="episode"
@@ -602,25 +592,30 @@ def run_full_forecasting(
             lines_to_test=selected_lines,
         )
 
-        def failure_progress(_episode: int, steps: int, total_rows: int) -> None:
+        def failure_progress(_episode: int, steps: int, stats: Any) -> None:
             progress.update(1)
-            progress.set_postfix(last_steps=steps, rows=total_rows, refresh=False)
+            progress.set_postfix(
+                last_steps=steps, samples=stats["rows"], pos=stats["positive"],
+                neg=stats["negative"], events=stats["attack_events"], refresh=False,
+            )
 
-        rows = collect_failure_forecast_rows(
-            env,
+        rows, collection_stats = collect_failure_forecast_rows(
             agent,
+            env,
             mean_model,
             aleatoric_model,
             cfg,
             episodes=int(failure_episodes),
             seed=int(seed),
-            sampling_stride=int(sampling_stride),
+            outcome_steps=int(outcome_steps),
             max_steps=failure_limit,
             progress_callback=failure_progress,
         )
     finally:
         progress.close()
         env.close()
+    print("[labels] collection stats: " + ", ".join(
+        f"{key}={value}" for key, value in sorted(collection_stats.items())))
     row_dimensions = _validate_rows(rows, selected_lines)
     written = write_rows_csv(rows, paths["failure_rows"])
     if written != len(rows):
@@ -675,12 +670,11 @@ def run_full_forecasting(
     )
     label_reason_counts = classifier_info["label_reason_counts"]
     print(f"[labels] {label_reason_counts}")
-    agent_action_failures = int(label_reason_counts.get("agent_action_blackout", 0))
-    if agent_action_failures < 20:
+    observed_failures = int(label_reason_counts.get("blackout_after_attack", 0))
+    if observed_failures < 20:
         print(
-            "[limitation] only "
-            f"{agent_action_failures} agent_action_blackout rows were collected; "
-            "consider collecting more episodes before relying on this subtype."
+            f"[limitation] only {observed_failures} observed agent failures were "
+            "collected; collect more episodes before relying on the classifier."
         )
 
     print("\n[6/6] Validate per-line inference")
@@ -691,7 +685,7 @@ def run_full_forecasting(
         env_dir,
         output_dir,
         agent_name,
-        selected_lines,
+        list(json.loads(paths["classifier_metadata"].read_text(encoding="utf-8"))["line_map"]),
         mean_model,
         aleatoric_model,
         int(seed),

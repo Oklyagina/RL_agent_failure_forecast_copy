@@ -18,7 +18,7 @@ from project_config import (  # noqa: E402
     ENV_NAME,
     FAILURE_EPISODES,
     FAILURE_LINES,
-    FAILURE_SAMPLING_STRIDE,
+    FAILURE_OUTCOME_STEPS,
     FAILURE_THRESHOLD,
     FORECAST_EPISODES,
     FORECAST_MEAN_TRIALS,
@@ -65,7 +65,7 @@ def main() -> None:
     parser.add_argument("--forecast-episodes", type=int, default=None)
     parser.add_argument("--failure-episodes", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--sampling-stride", type=int, default=FAILURE_SAMPLING_STRIDE)
+    parser.add_argument("--outcome-steps", type=int, default=FAILURE_OUTCOME_STEPS)
     parser.add_argument("--lines", default=FAILURE_LINES or None)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--mean-trials", type=int, default=FORECAST_MEAN_TRIALS)
@@ -144,7 +144,7 @@ def main() -> None:
             "--agent-name", args.agent_name,
             "--episodes", str(failure_episodes),
             "--seed", str(args.seed),
-            "--sampling-stride", str(args.sampling_stride),
+            "--outcome-steps", str(args.outcome_steps),
             "--mean-model", str(mean_model),
             "--aleatoric-model", str(aleatoric_model),
             "--output-csv", str(rows_csv),

@@ -1,4 +1,4 @@
-"""Collect one-hour-ahead line-contingency failure-forecast rows."""
+"""Collect labeled one-hour-ahead failure rows from historical agent episodes."""
 from __future__ import annotations
 
 import argparse
@@ -25,7 +25,7 @@ from project_config import (  # noqa: E402
     FAILURE_EPISODES,
     FAILURE_LINES,
     FAILURE_MAX_STEPS,
-    FAILURE_SAMPLING_STRIDE,
+    FAILURE_OUTCOME_STEPS,
     SEED,
     configure_grid2op_warnings,
 )
@@ -74,7 +74,11 @@ def main() -> None:
     parser.add_argument("--agent-factory", default=AGENT_FACTORY or None)
     parser.add_argument("--episodes", type=int, default=FAILURE_EPISODES)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--sampling-stride", type=int, default=FAILURE_SAMPLING_STRIDE)
+    parser.add_argument("--outcome-steps", type=int, default=FAILURE_OUTCOME_STEPS,
+                        help="steps after an attack in which a blackout counts as failure")
+    parser.add_argument("--perfect-forecast-benchmark", action="store_true",
+                        help="EXPERIMENTAL: use measured t+12 values as forecasts "
+                             "(supervisor option 2); writes a separate CSV")
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -111,29 +115,45 @@ def main() -> None:
         aleatoric_model = joblib.load(args.aleatoric_model)
         enn, uncertainty_fn = load_enn_uncertainty()
 
-        def update(_episode: int, steps: int, total_rows: int) -> None:
+        def update(_episode: int, steps: int, stats) -> None:
             progress.update(1)
-            progress.set_postfix(last_steps=steps, total_rows=total_rows, refresh=False)
+            progress.set_postfix(
+                last_steps=steps,
+                samples=stats["rows"],
+                pos=stats["positive"],
+                neg=stats["negative"],
+                events=stats["attack_events"],
+                refresh=False,
+            )
 
-        rows = collect_failure_forecast_rows(
-            env,
+        rows, stats = collect_failure_forecast_rows(
             agent,
+            env,
             mean_model,
             aleatoric_model,
             cfg,
             episodes=args.episodes,
             seed=args.seed,
-            sampling_stride=args.sampling_stride,
+            outcome_steps=args.outcome_steps,
             max_steps=args.max_steps,
             model_enn=enn,
             get_uncertainty_fn=uncertainty_fn,
+            perfect_forecast=args.perfect_forecast_benchmark,
             progress_callback=update,
         )
     finally:
         progress.close()
         env.close()
 
-    output_csv = args.output_csv or (default_output_dir(args.agent_name) / "failure_forecast_rows.csv")
+    print("[labels] " + ", ".join(f"{key}={value}" for key, value in sorted(stats.items())))
+    if stats["positive"] == 0 or stats["negative"] == 0:
+        raise SystemExit(
+            "Need both observed failures (1) and survivals (0); collect more "
+            "episodes or steps. No unknown outcome is ever labeled 0."
+        )
+    default_name = ("failure_forecast_rows_perfect_forecast.csv"
+                    if args.perfect_forecast_benchmark else "failure_forecast_rows.csv")
+    output_csv = args.output_csv or (default_output_dir(args.agent_name) / default_name)
     count = write_rows_csv(rows, output_csv)
     print(f"[ok] wrote {count} rows -> {output_csv}")
 

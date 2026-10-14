@@ -402,7 +402,7 @@ def main() -> None:
         recommendations.append(to_interactiveai(action, info))
         if t == N_STEPS - 1:
             failures = predictor.predict_many(
-                env, agent, obs, observations, lines,
+                obs, observations, lines,
                 mean_model, aleatoric_model, failure_cfg,
                 model_enn=enn, get_uncertainty_fn=enn_uncertainty_fn(calibration.scaler))
             kpis = recommendations[-1]["kpis"]

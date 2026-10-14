@@ -46,6 +46,8 @@ def main() -> None:
     metrics = info["metrics"]
     print(f"[ok] wrote classifier -> {model_path}")
     print(f"[ok] wrote metadata -> {info['metadata_path']}")
+    print(f"[labels] rows by reason: {info['label_reason_counts']}")
+    print(f"[labels] rows by class: {info['label_counts']}")
     print(
         f"[test] FA={metrics['false_alarm_pct']:.2f}% "
         f"oversight={metrics['oversight_pct']:.2f}% "

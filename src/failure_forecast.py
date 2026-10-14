@@ -1,32 +1,42 @@
 """One-hour-ahead failure forecasting for Grid2Op RL agents.
 
-This module ports the legacy failure-forecast feature path from
-``archive/legacy/old_version/src`` into the active package:
+Pipeline (all labels come from historical RL-agent episodes, no extra
+simulations):
 
-* historical forecast features use current, 1h, 1d, and 1w observation lags;
-* mean and aleatoric forecasters predict only the final t+12 step;
-* predicted injections are written to ``_forecasted_inj`` before a Grid2Op
-  power-flow simulation;
-* labels come from branch simulations of a line disconnection followed by the
-  configured agent response.
+1. ``run_historical_episode`` plays the agent and records every observation.
+2. Forecaster data: pairs ``(features at t, injections at t+12)`` taken from the
+   same episode, twelve real environment steps apart.
+3. Failure labels: each *opponent attack that disconnected a line* is an event.
+   The label says whether the agent survived the following
+   ``outcome_steps`` steps (0) or the episode ended in a blackout (1).
+   Events whose outcome cannot be observed are skipped, never labeled 0.
+4. HGB features for an event at step ``s`` are built at ``t = s - 12`` from the
+   forecast of the t+12 injections plus the grid state at ``t`` only.
+
+Time convention: one step is ``STEP_MINUTES`` minutes; ``observations[k]`` is
+the state at step ``k`` of the episode, before the agent acts.
 """
 from __future__ import annotations
 
-import copy
 import csv
-import datetime as _dt
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 
 from .agent_runtime import call_agent
 
 
 HORIZON_STEPS = 12
 STEP_MINUTES = 5
+DEFAULT_OUTCOME_STEPS = 12
+
+LABEL_BLACKOUT = "blackout_after_attack"
+LABEL_SURVIVED = "survived_after_attack"
 
 CLASSIFIER_FEATURES = [
     "line_id_encoded",
@@ -41,33 +51,31 @@ CLASSIFIER_FEATURES = [
     "fcast_sum_load_p",
     "fcast_sum_load_q",
     "fcast_sum_gen_p",
-    "fcast_var_line_rho",
-    "fcast_avg_line_rho",
-    "fcast_max_line_rho",
-    "fcast_nb_rho_ge_0.95",
     "aleatoric_load_p_mean",
     "aleatoric_load_q_mean",
     "aleatoric_gen_p_mean",
     "epistemic_before",
-    "epistemic_after",
 ]
+
+# Columns derived inside ``prepare_classifier_dataframe`` / the predictor.
+_DERIVED_FEATURES = {"line_id_encoded", "load_gen_ratio"}
 
 REQUIRED_DATA_COLUMNS = {
     "line_disconnected",
     "failed",
-    *(feature for feature in CLASSIFIER_FEATURES
-      if feature not in {"line_id_encoded", "load_gen_ratio"}),
+    *(feature for feature in CLASSIFIER_FEATURES if feature not in _DERIVED_FEATURES),
 }
 
 
 @dataclass
 class FailureForecastConfig:
-    """Grid dimensions and paths needed by the failure forecaster."""
+    """Grid dimensions, line names and paths needed by the failure forecaster."""
 
     env_name: str
     agent_name: str
     no_loads: int
     no_gens: int
+    line_names: Sequence[str]
     lines_to_test: Sequence[Any]
     gen_min: np.ndarray
     gen_max: np.ndarray
@@ -78,19 +86,41 @@ class FailureForecastConfig:
                  artifact_dir: str | Path, lines_to_test: Sequence[Any]) -> "FailureForecastConfig":
         """Build configuration from a live Grid2Op environment instance."""
         no_gens = int(getattr(env, "n_gen"))
-        gen_min = np.asarray(getattr(env, "gen_pmin", np.zeros(no_gens)), dtype=float)
-        gen_max = np.asarray(getattr(env, "gen_pmax", np.full(no_gens, np.inf)), dtype=float)
         return cls(
             env_name=str(env_name),
             agent_name=str(agent_name),
             no_loads=int(getattr(env, "n_load")),
             no_gens=no_gens,
+            line_names=[str(name) for name in getattr(env, "name_line")],
             lines_to_test=list(lines_to_test),
-            gen_min=gen_min,
-            gen_max=gen_max,
+            gen_min=np.asarray(getattr(env, "gen_pmin", np.zeros(no_gens)), dtype=float),
+            gen_max=np.asarray(getattr(env, "gen_pmax", np.full(no_gens, np.inf)), dtype=float),
             artifact_dir=Path(artifact_dir),
         )
 
+    def line_id(self, line: Any) -> int:
+        """Resolve a line index or name (with or without ``line_``) to its index."""
+        if isinstance(line, (int, np.integer)):
+            return int(line)
+        wanted = normalize_line_name(line)
+        for idx, name in enumerate(self.line_names):
+            if normalize_line_name(name) == wanted:
+                return idx
+        raise ValueError(f"Unknown line: {line!r}")
+
+    def line_name(self, line: Any) -> str:
+        """Return the environment name of a line given its index or name."""
+        return str(self.line_names[self.line_id(line)])
+
+
+def normalize_line_name(line: Any) -> str:
+    """Normalize Grid2Op line names for stable classifier metadata keys."""
+    return str(line).replace("line_", "")
+
+
+# --------------------------------------------------------------------------
+# Features from observations
+# --------------------------------------------------------------------------
 
 def convert_to_cos_sin(value: float, period: float) -> Tuple[float, float]:
     """Encode a cyclic scalar as cosine/sine features."""
@@ -99,41 +129,32 @@ def convert_to_cos_sin(value: float, period: float) -> Tuple[float, float]:
     return float(value_cos), float(value_sin)
 
 
-def get_features_with_history(observations: Sequence[Any], obs: Any) -> np.ndarray:
-    """Legacy forecast input: current values plus 1h/1d/1w lags and time."""
-    if not observations:
-        observations = [obs]
+def get_features_with_history(observations: Sequence[Any]) -> np.ndarray:
+    """Build the forecaster input for the LAST observation of ``observations``.
 
-    sz_load_p = len(obs.load_p)
-    sz_load_q = len(obs.load_q)
-    sz_gen_p = len(obs.gen_p)
+    ``observations`` is the episode history up to and including the current
+    step ``t`` (index ``t`` is the last element); nothing after ``t`` is used.
+    Features: current load_p/load_q/gen_p, the same values 1h/1d/1w earlier
+    (NaN when the episode is not that old yet) and calendar encodings.
+    """
+    if not observations:
+        raise ValueError("observations must contain at least the current observation")
+    obs = observations[-1]
     current_idx = len(observations) - 1
 
-    def past(lag_steps: int) -> Optional[Any]:
-        """Return the observation at a fixed lag, or None before history exists."""
+    def values(lag_steps: int, attr: str) -> np.ndarray:
+        """Return ``attr`` at a fixed lag, or NaN padding before history exists."""
         idx = current_idx - lag_steps
-        return observations[idx] if idx >= 0 else None
-
-    def values(past_obs: Optional[Any], attr: str, size: int) -> np.ndarray:
-        """Extract an array from a lagged observation, padding missing history."""
-        if past_obs is None:
+        size = len(getattr(obs, attr))
+        if idx < 0:
             return np.full(size, np.nan, dtype=float)
-        return np.asarray(getattr(past_obs, attr), dtype=float)
+        return np.asarray(getattr(observations[idx], attr), dtype=float)
 
-    past_hour = past(12)
-    past_day = past(288)
-    past_week = past(2016)
     feature_vec = np.concatenate([
         obs.load_p, obs.load_q, obs.gen_p,
-        values(past_hour, "load_p", sz_load_p),
-        values(past_hour, "load_q", sz_load_q),
-        values(past_hour, "gen_p", sz_gen_p),
-        values(past_day, "load_p", sz_load_p),
-        values(past_day, "load_q", sz_load_q),
-        values(past_day, "gen_p", sz_gen_p),
-        values(past_week, "load_p", sz_load_p),
-        values(past_week, "load_q", sz_load_q),
-        values(past_week, "gen_p", sz_gen_p),
+        *(values(lag, attr)
+          for lag in (12, 288, 2016)
+          for attr in ("load_p", "load_q", "gen_p")),
     ]).astype(float)
 
     hour_cos, hour_sin = convert_to_cos_sin(getattr(obs, "hour_of_day", 0), 24)
@@ -141,478 +162,147 @@ def get_features_with_history(observations: Sequence[Any], obs: Any) -> np.ndarr
     dow_cos, dow_sin = convert_to_cos_sin(getattr(obs, "day_of_week", 0), 7)
     temporal = np.asarray([
         getattr(obs, "day", 1),
-        hour_cos,
-        hour_sin,
-        minute_cos,
-        minute_sin,
-        dow_cos,
-        dow_sin,
+        hour_cos, hour_sin,
+        minute_cos, minute_sin,
+        dow_cos, dow_sin,
     ], dtype=float)
     return np.concatenate([feature_vec, temporal]).flatten()
 
 
+def injections_vector(obs: Any) -> np.ndarray:
+    """Return ``[load_p, load_q, gen_p]`` of one observation (forecast target)."""
+    return np.concatenate([obs.load_p, obs.load_q, obs.gen_p]).astype(np.float32)
+
+
 def compute_grid_stats(obs: Any) -> Dict[str, float]:
-    """Legacy compact grid statistics used by the failure classifier."""
-    rho = getattr(obs, "rho", None)
-    if rho is None:
-        var_rho = avg_rho = max_rho = float("nan")
-        nb_rho_095 = 0
-    else:
-        rho = np.asarray(rho, dtype=float)
-        var_rho = float(np.var(rho))
-        avg_rho = float(np.mean(rho))
-        max_rho = float(np.max(rho))
-        nb_rho_095 = int(np.sum(rho >= 0.95))
+    """Compact grid statistics (injection sums and line-loading summary)."""
+    rho = np.asarray(obs.rho, dtype=float)
     return {
         "sum_load_p": float(np.sum(obs.load_p)),
         "sum_load_q": float(np.sum(obs.load_q)),
         "sum_gen_p": float(np.sum(obs.gen_p)),
-        "sum_gen_q": float(np.sum(obs.gen_q)) if hasattr(obs, "gen_q") else float("nan"),
-        "var_line_rho": var_rho,
-        "avg_line_rho": avg_rho,
-        "max_line_rho": max_rho,
-        "nb_rho_ge_0.95": nb_rho_095,
+        "var_line_rho": float(np.var(rho)),
+        "avg_line_rho": float(np.mean(rho)),
+        "max_line_rho": float(np.max(rho)),
+        "nb_rho_ge_0.95": int(np.sum(rho >= 0.95)),
     }
 
 
-def _failure_from_done(done: bool, obs: Any, info: Optional[dict]) -> bool:
-    """Map Grid2Op branch termination to the binary blackout/failure label."""
-    if not done:
-        return False
-    if info and info.get("exception"):
-        return True
-    current_step = getattr(obs, "current_step", None)
-    max_step = getattr(obs, "max_step", None)
-    if current_step is not None and max_step is not None:
-        return int(current_step) < int(max_step)
-    return True
-
-
-def _resolve_line_id(env: Any, line: Any) -> int:
-    """Resolve a line id or name into the integer index expected by Grid2Op."""
-    if isinstance(line, (int, np.integer)):
-        return int(line)
-    normalized = str(line).replace("line_", "")
-    names = getattr(env, "name_line", None)
-    if names is not None:
-        for idx, name in enumerate(names):
-            if str(name).replace("line_", "") == normalized:
-                return int(idx)
-    return int(line)
-
-
-def eligible_lines(env: Any, obs: Any, lines: Sequence[Any]) -> List[Any]:
-    """Keep requested lines that are currently connected (shared by train/inference)."""
-    status = getattr(obs, "line_status", None)
-    if status is None:
-        return list(lines)
-    return [line for line in lines if bool(status[_resolve_line_id(env, line)])]
-
-
-def normalize_line_name(line: Any) -> str:
-    """Normalize Grid2Op line names for stable classifier metadata keys."""
-    return str(line).replace("line_", "")
-
-
-def _line_name(env: Any, line: Any) -> str:
-    """Return the environment line name when a numeric line id was supplied."""
-    if isinstance(line, (int, np.integer)) and hasattr(env, "name_line"):
-        line_id = int(line)
-        if 0 <= line_id < len(env.name_line):
-            return str(env.name_line[line_id])
-    return str(line)
-
-
-def make_disconnect_action(env: Any, line: Any) -> Any:
-    """Create a Grid2Op action that disconnects exactly one candidate line."""
-    line_id = _resolve_line_id(env, line)
-    try:
-        return env.action_space({"set_line_status": [(line_id, -1)]})
-    except Exception:
-        status = np.zeros(int(getattr(env, "n_line")), dtype=int)
-        status[line_id] = -1
-        return env.action_space({"set_line_status": status})
-
-
-def _do_nothing_action(env: Any, obs: Any) -> Any:
-    """Create a no-op action across Grid2Op versions and observation contexts."""
-    try:
-        return env.action_space({})
-    except Exception:
-        return obs._obs_env._helper_action_env({})
-
-
-def _simulate(obs: Any, action: Any) -> Tuple[Any, float, bool, dict]:
-    """Run observation-branch simulation for a single action."""
-    return obs.simulate(action)
-
-
-def clone_agent_for_contingency(agent: Any) -> Any:
-    """Clone the policy at its current state for one contingency evaluation.
-
-    A line branch is allowed to mutate its private policy clone, but it must not
-    change the rollout policy or the clone used for another line.  Policies may
-    expose ``clone_for_contingency()``; otherwise the policy is shallow-copied
-    (sharing heavy read-only resources such as Keras models and action sets) and
-    its mutable containers (lists/dicts, e.g. CurriculumAgent's recovery stack)
-    are deep-copied.
-    """
-    clone_method = getattr(agent, "clone_for_contingency", None)
-    if callable(clone_method):
-        cloned = clone_method()
-    else:
-        cloned = copy.copy(agent)
-        for name, value in vars(agent).items():
-            if isinstance(value, (list, dict, set)):
-                setattr(cloned, name, copy.deepcopy(value))
-    if cloned is agent:
-        raise RuntimeError(
-            "clone_for_contingency() returned the original agent; a distinct "
-            "policy instance is required for each line."
-        )
-    return cloned
-
-
-def _simulator_result(simulator: Any) -> Tuple[Any, float, bool, dict]:
-    """Convert a Grid2Op Simulator state to the observation simulation contract."""
-    converged = bool(simulator.converged)
-    error = getattr(simulator, "error", None)
-    exceptions = [] if converged or error is None else [error]
-    return simulator.current_obs, 0.0, not converged, {"exception": exceptions}
-
-
-class _SimulatorBackedObservation:
-    """Expose a Simulator state through the observation interface used by agents.
-
-    Grid2Op clears ``_obs_env`` on ``Simulator.current_obs``. Agents that call
-    ``obs.simulate(...)`` while selecting an action therefore need simulations
-    routed through the corresponding Simulator instead.
-    """
-
-    def __init__(self, simulator: Any):
-        self._simulator = simulator
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._simulator.current_obs, name)
-
-    def copy(self) -> "_SimulatorBackedObservation":
-        return _SimulatorBackedObservation(self._simulator.copy())
-
-    def get_simulator(self) -> Any:
-        return self._simulator.copy()
-
-    def simulate(self, action: Any, time_step: int = 1) -> Tuple[Any, float, bool, dict]:
-        if int(time_step) != 1:
-            raise ValueError(
-                "Simulator-backed contingency observations support only "
-                "single-step action simulations."
-            )
-        result = self._simulator.copy().predict(action)
-        obs, reward, done, info = _simulator_result(result)
-        info.update({"is_illegal": False, "is_ambiguous": False})
-        return _SimulatorBackedObservation(result), reward, done, info
+def eligible_lines(cfg: FailureForecastConfig, obs: Any, lines: Sequence[Any]) -> List[Any]:
+    """Keep requested lines that are connected in ``obs`` (shared by train/inference)."""
+    return [line for line in lines if bool(obs.line_status[cfg.line_id(line)])]
 
 
 def _get_uncertainty(model_enn: Any, obs: Any,
                      get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]]) -> float:
-    """Compute optional ENN epistemic uncertainty, returning NaN if unavailable."""
+    """ENN epistemic uncertainty of ``obs``; NaN only when no ENN is supplied."""
     if model_enn is None:
         return float("nan")
+    if get_uncertainty_fn is None:
+        raise ValueError("get_uncertainty_fn is required when model_enn is given")
     input_dim = int(getattr(model_enn, "input_dim", len(obs.to_vect())))
     vect = np.asarray(obs.to_vect(), dtype=np.float32)[:input_dim].reshape(1, -1)
-    if get_uncertainty_fn is not None:
-        return float(get_uncertainty_fn(model_enn, vect))
-    try:
-        import torch
-
-        with torch.no_grad():
-            out = model_enn(torch.as_tensor(vect, dtype=torch.float32))
-        if isinstance(out, dict) and "uncertainty" in out:
-            return float(np.asarray(out["uncertainty"].detach().cpu()).reshape(-1)[0])
-    except Exception:
-        pass
-    return float("nan")
+    return float(get_uncertainty_fn(model_enn, vect))
 
 
-def run_t12_forecast(
-    env: Any,
-    obs: Any,
-    observations: Sequence[Any],
-    mean_model: Any,
-    aleatoric_model: Any,
-    cfg: FailureForecastConfig,
-    *,
-    model_enn: Any = None,
-    get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
-) -> Dict[str, Any]:
-    """Predict t+12 injections and solve the common future base-state PF."""
-    x_t12 = get_features_with_history(observations, obs)
-    y_pred = np.asarray(mean_model.predict([x_t12])[0], dtype=float)
-    z_pred = np.asarray(aleatoric_model.predict([x_t12])[0], dtype=float)
+# --------------------------------------------------------------------------
+# Historical episodes
+# --------------------------------------------------------------------------
 
-    load_p_t12 = y_pred[:cfg.no_loads]
-    load_q_t12 = y_pred[cfg.no_loads: cfg.no_loads * 2]
-    gen_p_t12 = np.clip(y_pred[cfg.no_loads * 2:], cfg.gen_min, cfg.gen_max)
-    sigma = np.sqrt(np.expm1(np.clip(z_pred, 0.0, None)) + 1e-12)
+@dataclass
+class EpisodeTrace:
+    """Everything observed while the RL agent played one episode.
 
-    now_ts = obs.get_time_stamp()
-    next_ts = now_ts + _dt.timedelta(minutes=HORIZON_STEPS * STEP_MINUTES)
-    simulator_factory = getattr(obs, "get_simulator", None)
-    simulator = None
-    if callable(simulator_factory):
-        simulator = simulator_factory().predict(
-            _do_nothing_action(env, obs),
-            new_gen_p=gen_p_t12,
-            new_gen_v=obs.gen_v,
-            new_load_p=load_p_t12,
-            new_load_q=load_q_t12,
-        )
-        forecast_obs, _, done, info = _simulator_result(simulator)
-    else:
-        obs_copy = obs.copy()
-        obs_copy._forecasted_inj = [
-            (now_ts, {"injection": {
-                "load_p": obs.load_p,
-                "load_q": obs.load_q,
-                "prod_p": obs.gen_p,
-                "prod_v": obs.gen_v,
-            }}),
-            (next_ts, {"injection": {
-                "load_p": load_p_t12,
-                "load_q": load_q_t12,
-                "prod_p": gen_p_t12,
-                "prod_v": obs.gen_v,
-            }}),
-        ]
-        forecast_obs, _, done, info = _simulate(
-            obs_copy, _do_nothing_action(env, obs)
-        )
-    return {
-        "simulator": simulator,
-        "forecast_obs": forecast_obs,
-        "forecast_done": bool(done),
-        "forecast_failed": _failure_from_done(bool(done), forecast_obs, info),
-        "forecast_info": info or {},
-        "forecast_grid_stats": compute_grid_stats(forecast_obs),
-        "aleatoric_load_p_mean": float(np.mean(sigma[:cfg.no_loads])),
-        "aleatoric_load_q_mean": float(np.mean(sigma[cfg.no_loads: cfg.no_loads * 2])),
-        "aleatoric_gen_p_mean": float(np.mean(sigma[cfg.no_loads * 2:])),
-        "epistemic_before": _get_uncertainty(model_enn, obs, get_uncertainty_fn),
-        "epistemic_after": _get_uncertainty(model_enn, forecast_obs, get_uncertainty_fn),
-        "forecast_input": x_t12,
-        "predicted_load_p": load_p_t12,
-        "predicted_load_q": load_q_t12,
-        "predicted_gen_p": gen_p_t12,
-    }
-
-
-def build_feature_row(
-    env: Any,
-    obs: Any,
-    line: Any,
-    forecast: Dict[str, Any],
-    cfg: FailureForecastConfig,
-    *,
-    scenario_obs: Any,
-) -> Dict[str, Any]:
-    """Combine current and forecast post-contingency (t+12) features in one row.
-
-    Shared by training and inference; ``scenario_obs`` must be a valid
-    post-contingency observation.
+    ``observations[k]`` is the state at step ``k`` (before the agent acts).
+    ``attacked_lines[k]`` holds the lines the opponent attacked in the env step
+    that produced ``observations[k]`` (empty for ``k == 0``).  If the episode
+    ended in a blackout, the game-over step is NOT in ``observations`` (its
+    state is invalid); it has index ``len(observations)`` and its attacked
+    lines are in ``terminal_attacked_lines``.
     """
-    current = compute_grid_stats(obs)
-    fcast = compute_grid_stats(scenario_obs)
-    sum_load = float(current.get("sum_load_p", np.nan))
-    sum_gen = float(current.get("sum_gen_p", np.nan))
-    row = {
-        "step": int(getattr(obs, "current_step", -1)),
-        "horizon_steps": HORIZON_STEPS,
-        "horizon_minutes": HORIZON_STEPS * STEP_MINUTES,
-        "line_disconnected": _line_name(env, line),
-        "line_id": _resolve_line_id(env, line),
-        "aleatoric_load_p_mean": float(forecast.get("aleatoric_load_p_mean", np.nan)),
-        "aleatoric_load_q_mean": float(forecast.get("aleatoric_load_q_mean", np.nan)),
-        "aleatoric_gen_p_mean": float(forecast.get("aleatoric_gen_p_mean", np.nan)),
-        "epistemic_before": float(forecast.get("epistemic_before", np.nan)),
-        "epistemic_after": float(forecast.get("epistemic_after", np.nan)),
-        "sum_load_p": sum_load,
-        "sum_load_q": float(current.get("sum_load_q", np.nan)),
-        "sum_gen_p": sum_gen,
-        "var_line_rho": float(current.get("var_line_rho", np.nan)),
-        "avg_line_rho": float(current.get("avg_line_rho", np.nan)),
-        "max_line_rho": float(current.get("max_line_rho", np.nan)),
-        "nb_rho_ge_0.95": float(current.get("nb_rho_ge_0.95", np.nan)),
-        "load_gen_ratio": sum_load / (sum_gen + 1e-6),
-        "fcast_sum_load_p": float(fcast.get("sum_load_p", np.nan)),
-        "fcast_sum_load_q": float(fcast.get("sum_load_q", np.nan)),
-        "fcast_sum_gen_p": float(fcast.get("sum_gen_p", np.nan)),
-        "fcast_var_line_rho": float(fcast.get("var_line_rho", np.nan)),
-        "fcast_avg_line_rho": float(fcast.get("avg_line_rho", np.nan)),
-        "fcast_max_line_rho": float(fcast.get("max_line_rho", np.nan)),
-        "fcast_nb_rho_ge_0.95": float(fcast.get("nb_rho_ge_0.95", np.nan)),
-    }
-    return row
+
+    observations: List[Any]
+    attacked_lines: List[frozenset]
+    ended_in_blackout: bool
+    terminal_attacked_lines: frozenset = frozenset()
 
 
-def simulate_line_contingency(
-    env: Any,
-    forecast: Dict[str, Any],
-    line: Any,
-) -> Dict[str, Any]:
-    """Disconnect one line from the common future state in an isolated branch."""
-    disconnect_action = make_disconnect_action(env, line)
-    simulator = forecast.get("simulator")
-    if simulator is not None:
-        contingency_simulator = simulator.copy().predict(disconnect_action)
-        scenario_obs, _, done, info = _simulator_result(contingency_simulator)
-    else:
-        contingency_simulator = None
-        scenario_obs, _, done, info = _simulate(
-            forecast["forecast_obs"], disconnect_action
-        )
-    return {
-        "simulator": contingency_simulator,
-        "obs": scenario_obs,
-        "done": bool(done),
-        "info": info or {},
-    }
+def reset_environment(env: Any, seed: int) -> Any:
+    """Reset the environment with a seed across Grid2Op versions."""
+    try:
+        return env.reset(seed=seed)
+    except TypeError:
+        env.seed(seed)
+        return env.reset()
 
 
-def evaluate_line_failure(
-    env: Any,
-    agent: Any,
-    obs: Any,
-    observations: Sequence[Any],
-    line: Any,
-    mean_model: Any,
-    aleatoric_model: Any,
-    cfg: FailureForecastConfig,
-    *,
-    forecast: Optional[Dict[str, Any]] = None,
-    model_enn: Any = None,
-    get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Create one labeled legacy-compatible row for one line contingency."""
-    if forecast is None:
-        forecast = run_t12_forecast(
-            env, obs, observations, mean_model, aleatoric_model, cfg,
-            model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
-        )
-    if forecast["forecast_failed"]:
-        # Without a valid future base state there is no contingency scenario
-        # from which to derive a meaningful agent-failure label.
-        return None
+def is_blackout(done: bool, info: Optional[dict]) -> bool:
+    """True when a finished env step is a game over (blackout).
 
-    contingency = simulate_line_contingency(env, forecast, line)
-    attacked_simulator = contingency["simulator"]
-    attacked_obs = contingency["obs"]
-    disconnect_done = contingency["done"]
-    disconnect_info = contingency["info"]
-
-    if _failure_from_done(bool(disconnect_done), attacked_obs, disconnect_info):
-        # The contingency PF itself diverged: there is no valid post-contingency
-        # state and the agent never acts, so this is not a labeled sample.
-        return None
-
-    row_forecast = dict(forecast)
-    row_forecast["epistemic_after"] = _get_uncertainty(
-        model_enn, attacked_obs, get_uncertainty_fn
-    )
-    row = build_feature_row(env, obs, line, row_forecast, cfg,
-                            scenario_obs=attacked_obs)
-    row["forecast_failed"] = False
-
-    contingency_agent = clone_agent_for_contingency(agent)
-    agent_obs = (
-        _SimulatorBackedObservation(attacked_simulator)
-        if attacked_simulator is not None
-        else attacked_obs
-    )
-    agent_action = call_agent(contingency_agent, agent_obs, reward=0.0, done=False)
-    if attacked_simulator is not None:
-        action_obs, _, action_done, action_info = _simulator_result(
-            attacked_simulator.copy().predict(agent_action)
-        )
-    else:
-        action_obs, _, action_done, action_info = _simulate(
-            attacked_obs, agent_action
-        )
-    failed = _failure_from_done(bool(action_done), action_obs, action_info)
-    row.update({
-        "failed": 1 if failed else 0,
-        "label_reason": "agent_action_blackout" if failed else "survived_agent_action",
-    })
-    return row
+    Assumption: Grid2Op reports a game over with a non-empty ``info["exception"]``;
+    reaching the end of the scenario ends the episode with no exception.
+    """
+    return bool(done) and bool((info or {}).get("exception"))
 
 
-def collect_failure_forecast_rows(
-    env: Any,
-    agent: Any,
-    mean_model: Any,
-    aleatoric_model: Any,
-    cfg: FailureForecastConfig,
-    *,
-    episodes: int,
-    seed: int = 0,
-    sampling_stride: int = 20,
-    max_steps: Optional[int] = None,
-    model_enn: Any = None,
-    get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
-    progress_callback: Optional[Callable[[int, int, int], None]] = None,
-) -> List[Dict[str, Any]]:
-    if episodes <= 0:
-        raise ValueError("episodes must be positive")
-    if sampling_stride <= 0:
-        raise ValueError("sampling_stride must be positive")
-    rows: List[Dict[str, Any]] = []
-    for episode in range(episodes):
-        try:
-            obs = env.reset(seed=seed + episode)
-        except TypeError:
-            if hasattr(env, "seed"):
-                env.seed(seed + episode)
-            obs = env.reset()
-        observations: List[Any] = []
-        reward = getattr(env, "reward_range", (0.0, 0.0))[0]
-        done = False
-        step = 0
-        if hasattr(agent, "reset"):
-            try:
-                agent.reset(obs)
-            except Exception:
-                pass
-        while not done and (max_steps is None or step < max_steps):
-            observations.append(obs)
-            current_step = int(getattr(obs, "current_step", step))
-            if current_step >= HORIZON_STEPS and current_step % sampling_stride == 0:
-                forecast = run_t12_forecast(
-                    env,
-                    obs,
-                    observations,
-                    mean_model,
-                    aleatoric_model,
-                    cfg,
-                    model_enn=model_enn,
-                    get_uncertainty_fn=get_uncertainty_fn,
-                )
-                if not forecast["forecast_failed"]:
-                    for line in eligible_lines(env, obs, cfg.lines_to_test):
-                        row = evaluate_line_failure(
-                            env, agent, obs, observations, line, mean_model,
-                            aleatoric_model, cfg, forecast=forecast,
-                            model_enn=model_enn,
-                            get_uncertainty_fn=get_uncertainty_fn,
-                        )
-                        if row is None:
-                            continue
-                        row["episode"] = int(episode)
-                        rows.append(row)
-            action = call_agent(agent, obs, reward=float(reward), done=done)
-            obs, reward, done, _ = env.step(action)
-            step += 1
-        if progress_callback:
-            progress_callback(episode, step, len(rows))
-    return rows
+def _attacked_lines(info: Optional[dict]) -> frozenset:
+    """Line indices attacked by the opponent in one env step (from ``info``)."""
+    attack = (info or {}).get("opponent_attack_line")
+    if attack is None:
+        return frozenset()
+    return frozenset(int(idx) for idx in np.flatnonzero(np.asarray(attack)))
+
+
+def run_historical_episode(env: Any, agent: Any, seed: int,
+                           max_steps: Optional[int] = None) -> EpisodeTrace:
+    """Play one episode with the agent and record what happened.
+
+    At most ``max_steps`` environment steps are played (``None`` = until the
+    episode ends).  If the step limit is hit the trace is simply shorter: the
+    episode is neither a blackout nor completed.
+    """
+    obs = reset_environment(env, seed)
+    if hasattr(agent, "reset"):
+        agent.reset(obs)
+    observations = [obs]
+    attacked = [frozenset()]
+    reward = getattr(env, "reward_range", (0.0, 0.0))[0]
+    steps = 0
+    while max_steps is None or steps < max_steps:
+        action = call_agent(agent, observations[-1], reward=float(reward), done=False)
+        obs, reward, done, info = env.step(action)
+        steps += 1
+        if done:
+            return EpisodeTrace(
+                observations, attacked,
+                ended_in_blackout=is_blackout(done, info),
+                terminal_attacked_lines=_attacked_lines(info),
+            )
+        observations.append(obs)
+        attacked.append(_attacked_lines(info))
+    return EpisodeTrace(observations, attacked, ended_in_blackout=False)
+
+
+# --------------------------------------------------------------------------
+# Forecaster training data (t -> t+12)
+# --------------------------------------------------------------------------
+
+def build_forecast_pairs(observations: Sequence[Any], *, stride: int,
+                         offset: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Build ``(X_t, injections_{t+12})`` pairs from ONE episode.
+
+    Origins are ``offset, offset + stride, ...`` and need ``t + 12`` to exist in
+    the same episode, so no pair crosses an episode boundary.  ``X_t`` only uses
+    observations up to ``t``.  Returns arrays with zero rows if nothing fits.
+    """
+    last_origin = len(observations) - 1 - HORIZON_STEPS
+    origins = range(offset, last_origin + 1, stride)
+    rows_x = [get_features_with_history(observations[: t + 1]) for t in origins]
+    rows_y = [injections_vector(observations[t + HORIZON_STEPS]) for t in origins]
+    if not rows_x:
+        return np.empty((0, 0), dtype=np.float32), np.empty((0, 0), dtype=np.float32)
+    return (np.stack(rows_x).astype(np.float32),
+            np.stack(rows_y).astype(np.float32))
 
 
 def collect_forecaster_training_data(
@@ -628,65 +318,262 @@ def collect_forecaster_training_data(
 ) -> Any:
     """Collect hourly-stratified pairs ``X_t -> injections at t+12``.
 
-    One origin is retained per ``sampling_stride`` steps.  The origin offset
-    rotates by episode so an on-demand runtime remains represented at every
-    five-minute phase without storing twelve overlapping rows per hour.
+    One origin is kept per ``sampling_stride`` steps.  The origin offset
+    rotates by episode so every five-minute phase is represented without
+    storing twelve overlapping rows per hour.  ``progress_callback`` receives
+    ``(episode, steps_played, total_rows)``.
     """
     if episodes <= 0:
         raise ValueError("episodes must be positive")
     if sampling_stride <= 0:
         raise ValueError("sampling_stride must be positive")
-    rows_x: List[np.ndarray] = []
-    rows_y: List[np.ndarray] = []
-    row_episode_ids: List[int] = []
+    all_x: List[np.ndarray] = []
+    all_y: List[np.ndarray] = []
+    episode_ids: List[np.ndarray] = []
+    total_rows = 0
     for episode in range(episodes):
-        try:
-            obs = env.reset(seed=seed + episode)
-        except TypeError:
-            if hasattr(env, "seed"):
-                env.seed(seed + episode)
-            obs = env.reset()
-        observations: List[Any] = []
-        pending_features: Dict[int, np.ndarray] = {}
-        reward = getattr(env, "reward_range", (0.0, 0.0))[0]
-        done = False
-        step = 0
-        if hasattr(agent, "reset"):
-            try:
-                agent.reset(obs)
-            except Exception:
-                pass
-        while not done and (max_steps is None or step < max_steps):
-            observations.append(obs)
-            origin_offset = episode % sampling_stride
-            current_idx = len(observations) - 1
-            if current_idx % sampling_stride == origin_offset:
-                pending_features[current_idx] = get_features_with_history(
-                    observations, obs
-                )
-            origin_idx = current_idx - HORIZON_STEPS
-            if origin_idx in pending_features:
-                y = np.concatenate([obs.load_p, obs.load_q, obs.gen_p], axis=0)
-                rows_x.append(
-                    np.asarray(pending_features.pop(origin_idx), dtype=np.float32)
-                )
-                rows_y.append(np.asarray(y, dtype=np.float32))
-                row_episode_ids.append(int(episode))
-            action = call_agent(agent, obs, reward=float(reward), done=done)
-            next_obs, reward, done, _ = env.step(action)
-            if done:
-                break
-            obs = next_obs
-            step += 1
+        trace = run_historical_episode(env, agent, seed + episode, max_steps)
+        X, y = build_forecast_pairs(
+            trace.observations, stride=sampling_stride,
+            offset=episode % sampling_stride,
+        )
+        if len(X):
+            all_x.append(X)
+            all_y.append(y)
+            episode_ids.append(np.full(len(X), episode, dtype=np.int32))
+            total_rows += len(X)
         if progress_callback:
-            progress_callback(episode, step, len(rows_x))
-    if not rows_x:
+            progress_callback(episode, len(trace.observations), total_rows)
+    if not all_x:
         raise RuntimeError("Forecast data collection produced no rows.")
-    X = np.stack(rows_x).astype(np.float32)
-    y = np.stack(rows_y).astype(np.float32)
+    X = np.concatenate(all_x).astype(np.float32)
+    y = np.concatenate(all_y).astype(np.float32)
     if return_episode_ids:
-        return X, y, np.asarray(row_episode_ids, dtype=np.int32)
+        return X, y, np.concatenate(episode_ids)
     return X, y
+
+
+# --------------------------------------------------------------------------
+# Forecasts and HGB feature rows
+# --------------------------------------------------------------------------
+
+def forecast_injections(
+    observations: Sequence[Any],
+    mean_model: Any,
+    aleatoric_model: Any,
+    cfg: FailureForecastConfig,
+    *,
+    model_enn: Any = None,
+    get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
+) -> Dict[str, Any]:
+    """Forecast load_p, load_q and gen_p at ``t + 12`` from history up to ``t``.
+
+    ``observations[-1]`` is the current observation ``t``.  No power flow is
+    run.  Returns the forecast, its uncertainty summaries and the ENN
+    uncertainty of the current observation.
+    """
+    x_t = get_features_with_history(observations)
+    y_pred = np.asarray(mean_model.predict([x_t])[0], dtype=float)
+    z_pred = np.asarray(aleatoric_model.predict([x_t])[0], dtype=float)
+    n_load = cfg.no_loads
+    sigma = np.sqrt(np.expm1(np.clip(z_pred, 0.0, None)) + 1e-12)
+    return {
+        "load_p": y_pred[:n_load],
+        "load_q": y_pred[n_load: 2 * n_load],
+        "gen_p": np.clip(y_pred[2 * n_load:], cfg.gen_min, cfg.gen_max),
+        "aleatoric_load_p_mean": float(np.mean(sigma[:n_load])),
+        "aleatoric_load_q_mean": float(np.mean(sigma[n_load: 2 * n_load])),
+        "aleatoric_gen_p_mean": float(np.mean(sigma[2 * n_load:])),
+        "epistemic_before": _get_uncertainty(model_enn, observations[-1], get_uncertainty_fn),
+    }
+
+
+def measured_future_as_forecast(
+    observations: Sequence[Any],
+    origin: int,
+    *,
+    model_enn: Any = None,
+    get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
+) -> Dict[str, Any]:
+    """EXPERIMENTAL benchmark (supervisor option 2): perfect forecast.
+
+    Uses the measured injections at ``origin + 12`` as the "forecast".  This
+    reads the future, so it must never be used for real training or inference.
+    """
+    future = observations[origin + HORIZON_STEPS]
+    return {
+        "load_p": np.asarray(future.load_p, dtype=float),
+        "load_q": np.asarray(future.load_q, dtype=float),
+        "gen_p": np.asarray(future.gen_p, dtype=float),
+        "aleatoric_load_p_mean": 0.0,
+        "aleatoric_load_q_mean": 0.0,
+        "aleatoric_gen_p_mean": 0.0,
+        "epistemic_before": _get_uncertainty(model_enn, observations[origin], get_uncertainty_fn),
+    }
+
+
+def build_feature_row(obs: Any, line: Any, forecast: Dict[str, Any],
+                      cfg: FailureForecastConfig) -> Dict[str, Any]:
+    """Combine the state at ``t`` with the t+12 forecast for one candidate line.
+
+    Shared by training and inference so both see identical features.
+    """
+    current = compute_grid_stats(obs)
+    sum_load = current["sum_load_p"]
+    sum_gen = current["sum_gen_p"]
+    return {
+        "horizon_steps": HORIZON_STEPS,
+        "horizon_minutes": HORIZON_STEPS * STEP_MINUTES,
+        "line_disconnected": cfg.line_name(line),
+        "line_id": cfg.line_id(line),
+        "sum_load_p": sum_load,
+        "sum_load_q": current["sum_load_q"],
+        "sum_gen_p": sum_gen,
+        "var_line_rho": current["var_line_rho"],
+        "avg_line_rho": current["avg_line_rho"],
+        "max_line_rho": current["max_line_rho"],
+        "nb_rho_ge_0.95": float(current["nb_rho_ge_0.95"]),
+        "load_gen_ratio": sum_load / (sum_gen + 1e-6),
+        "fcast_sum_load_p": float(np.sum(forecast["load_p"])),
+        "fcast_sum_load_q": float(np.sum(forecast["load_q"])),
+        "fcast_sum_gen_p": float(np.sum(forecast["gen_p"])),
+        "aleatoric_load_p_mean": forecast["aleatoric_load_p_mean"],
+        "aleatoric_load_q_mean": forecast["aleatoric_load_q_mean"],
+        "aleatoric_gen_p_mean": forecast["aleatoric_gen_p_mean"],
+        "epistemic_before": forecast["epistemic_before"],
+    }
+
+
+# --------------------------------------------------------------------------
+# Historical failure labels
+# --------------------------------------------------------------------------
+
+def find_attack_events(trace: EpisodeTrace, cfg: FailureForecastConfig,
+                       lines: Sequence[Any]) -> List[Tuple[int, int]]:
+    """Return ``(step, line_id)`` for each attack that really disconnected a line.
+
+    An event needs the opponent to attack the line at ``step`` AND the line to
+    go from connected (step - 1) to disconnected (step).  Plain trips, planned
+    maintenance and the agent's own switching are not events.
+    """
+    wanted = {cfg.line_id(line) for line in lines}
+    events = []
+    for step in range(1, len(trace.observations)):
+        before, after = trace.observations[step - 1], trace.observations[step]
+        for line_id in sorted(trace.attacked_lines[step] & wanted):
+            if bool(before.line_status[line_id]) and not bool(after.line_status[line_id]):
+                events.append((step, line_id))
+    return events
+
+
+def label_attack_event(trace: EpisodeTrace, step: int, line_id: int,
+                       outcome_steps: int) -> Tuple[Optional[int], str]:
+    """Label one attack event from what the agent did next in the episode.
+
+    The agent sees the attacked grid at ``step`` and acts at ``step`` ..
+    ``step + outcome_steps - 1``.  Returns ``(label, reason)``:
+
+    * ``(1, blackout_after_attack)``: the episode ended in a blackout within
+      ``outcome_steps`` steps after the attack;
+    * ``(0, survived_after_attack)``: the episode was still running (no
+      blackout) ``outcome_steps`` steps after the attack;
+    * ``(None, reason)``: no reliable label - another attack interferes, or the
+      episode stopped (end of data / step limit) before the outcome was known.
+    """
+    n_obs = len(trace.observations)
+    window_end = step + outcome_steps
+    for other_step in range(step, min(window_end, n_obs - 1) + 1):
+        others = set(trace.attacked_lines[other_step])
+        if other_step == step:
+            others.discard(line_id)
+        if others:
+            return None, "overlapping_attack"
+    blackout_step = n_obs  # index of the game-over step, if any
+
+    if trace.ended_in_blackout and blackout_step <= window_end:
+        if trace.terminal_attacked_lines:
+            return None, "overlapping_attack"
+        return 1, LABEL_BLACKOUT
+    if window_end <= n_obs - 1:
+        return 0, LABEL_SURVIVED
+    return None, "outcome_not_observed"
+
+
+def collect_failure_forecast_rows(
+    agent: Any,
+    env: Any,
+    mean_model: Any,
+    aleatoric_model: Any,
+    cfg: FailureForecastConfig,
+    *,
+    episodes: int,
+    seed: int = 0,
+    outcome_steps: int = DEFAULT_OUTCOME_STEPS,
+    max_steps: Optional[int] = None,
+    model_enn: Any = None,
+    get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
+    perfect_forecast: bool = False,
+    progress_callback: Optional[Callable[[int, int, Counter], None]] = None,
+) -> Tuple[List[Dict[str, Any]], Counter]:
+    """Collect labeled HGB rows from historical agent episodes.
+
+    For every labeled attack event at step ``s`` on line ``l`` one row is built
+    at the forecast origin ``t = s - 12`` using only observations up to ``t``
+    plus the forecast of the t+12 injections.  ``perfect_forecast=True`` is the
+    experimental "measured values as forecasts" benchmark.
+
+    Returns ``(rows, stats)``; ``stats`` counts episodes, attack events, rows,
+    positives/negatives and every skip reason.  ``progress_callback`` receives
+    ``(episode, steps_played, stats)``.
+    """
+    if episodes <= 0:
+        raise ValueError("episodes must be positive")
+    if outcome_steps <= 0:
+        raise ValueError("outcome_steps must be positive")
+    rows: List[Dict[str, Any]] = []
+    stats: Counter = Counter()
+    for episode in range(episodes):
+        trace = run_historical_episode(env, agent, seed + episode, max_steps)
+        stats["episodes"] += 1
+        stats["blackout_episodes"] += int(trace.ended_in_blackout)
+        for step, line_id in find_attack_events(trace, cfg, cfg.lines_to_test):
+            stats["attack_events"] += 1
+            origin = step - HORIZON_STEPS
+            label, reason = label_attack_event(trace, step, line_id, outcome_steps)
+            if label is None:
+                stats["skipped_" + reason] += 1
+                continue
+            if origin < 0:
+                stats["skipped_no_forecast_origin"] += 1
+                continue
+            if not bool(trace.observations[origin].line_status[line_id]):
+                stats["skipped_line_down_at_origin"] += 1
+                continue
+            history = trace.observations[: origin + 1]
+            if perfect_forecast:
+                forecast = measured_future_as_forecast(
+                    trace.observations, origin,
+                    model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn)
+            else:
+                forecast = forecast_injections(
+                    history, mean_model, aleatoric_model, cfg,
+                    model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn)
+            row = build_feature_row(history[-1], line_id, forecast, cfg)
+            row.update({
+                "episode": episode,
+                "step": origin,
+                "event_step": step,
+                "failed": label,
+                "label_reason": reason,
+                "outcome_steps": outcome_steps,
+                "forecast_source": "measured_future" if perfect_forecast else "forecaster",
+            })
+            rows.append(row)
+            stats["rows"] += 1
+            stats["positive" if label else "negative"] += 1
+        if progress_callback:
+            progress_callback(episode, len(trace.observations), stats)
+    return rows, stats
 
 
 def save_forecaster_training_data(
@@ -921,7 +808,7 @@ def write_rows_csv(rows: Iterable[Dict[str, Any]], output_path: str | Path) -> i
         path.write_text("", encoding="utf-8")
         return 0
     preferred = [
-        "episode", "step", "horizon_steps", "horizon_minutes",
+        "episode", "step", "event_step", "horizon_steps", "horizon_minutes",
         "line_disconnected", "line_id", "failed", "label_reason",
     ]
     fieldnames = preferred + sorted(
@@ -1128,6 +1015,18 @@ def train_failure_classifier(
         "forecast_horizon_steps": HORIZON_STEPS,
         "forecast_horizon_minutes": HORIZON_STEPS * STEP_MINUTES,
         "split": split_info,
+        "outcome_steps": (
+            int(dataframe["outcome_steps"].iloc[0])
+            if "outcome_steps" in dataframe.columns and len(dataframe) else None
+        ),
+        "label_definition": (
+            "1 = opponent attack disconnected the line and the agent's episode "
+            "ended in a blackout within outcome_steps; 0 = agent still running "
+            "after outcome_steps; unknown outcomes are excluded"
+        ),
+        "label_counts": {
+            str(label): int(count) for label, count in y.value_counts().items()
+        },
         "label_reason_counts": {
             str(reason): int(count)
             for reason, count in (
@@ -1149,13 +1048,24 @@ def train_failure_classifier(
     return model, {"metadata_path": str(metadata_path), **metadata}
 
 
+
 class FailureForecastPredictor:
-    """Runtime predictor returning binary failure class and probability."""
+    """Runtime predictor returning a binary failure class and probability.
+
+    Scores "the agent fails if line l is lost around t+12".  It uses only the
+    observation history up to ``t`` and the saved forecasting models; no
+    simulation and no agent call is made.
+    """
 
     def __init__(self, model: Any, metadata: Dict[str, Any]):
         self.model = model
         self.metadata = metadata
-        self.features = list(metadata.get("features", CLASSIFIER_FEATURES))
+        self.features = list(metadata.get("features", []))
+        if self.features != CLASSIFIER_FEATURES:
+            raise ValueError(
+                "Classifier features do not match this code version; "
+                "retrain the failure classifier."
+            )
         self.line_map = {
             str(k): int(v) for k, v in metadata.get("line_map", {}).items()
         }
@@ -1174,7 +1084,11 @@ class FailureForecastPredictor:
         return cls(model, metadata)
 
     def features_from_row(self, row: Dict[str, Any] | pd.Series) -> pd.DataFrame:
-        """Convert one feature row into the exact dataframe expected by the model."""
+        """Convert one feature row into the exact dataframe the model expects.
+
+        Raises if a feature is missing (NaN is only a valid *value*, e.g. when
+        no ENN is used, never a stand-in for a missing column).
+        """
         import pandas as pd
 
         row_dict = dict(row)
@@ -1183,12 +1097,14 @@ class FailureForecastPredictor:
             if line_name not in self.line_map:
                 raise ValueError(f"Unknown line for failure classifier: {line_name!r}")
             row_dict["line_id_encoded"] = self.line_map[line_name]
-        if "load_gen_ratio" not in row_dict:
+        if "load_gen_ratio" not in row_dict and {"sum_load_p", "sum_gen_p"} <= set(row_dict):
             row_dict["load_gen_ratio"] = (
                 float(row_dict["sum_load_p"]) / (float(row_dict["sum_gen_p"]) + 1e-6)
             )
-        return pd.DataFrame([{feature: row_dict.get(feature, np.nan)
-                              for feature in self.features}])
+        missing = [feature for feature in self.features if feature not in row_dict]
+        if missing:
+            raise ValueError("Feature row is missing: " + ", ".join(missing))
+        return pd.DataFrame([{feature: row_dict[feature] for feature in self.features}])
 
     def predict_from_features(self, row: Dict[str, Any] | pd.Series) -> Dict[str, Any]:
         """Predict failure directly from an already-built feature row."""
@@ -1201,8 +1117,6 @@ class FailureForecastPredictor:
 
     def predict(
         self,
-        env: Any,
-        agent: Any,
         obs: Any,
         observations: Sequence[Any],
         line: Any,
@@ -1213,18 +1127,10 @@ class FailureForecastPredictor:
         model_enn: Any = None,
         get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
     ) -> Dict[str, Any]:
-        """Score one future line contingency without executing the agent."""
+        """Score one line; see ``predict_many``."""
         prediction = self.predict_many(
-            env,
-            agent,
-            obs,
-            observations,
-            [line],
-            mean_model,
-            aleatoric_model,
-            cfg,
-            model_enn=model_enn,
-            get_uncertainty_fn=get_uncertainty_fn,
+            obs, observations, [line], mean_model, aleatoric_model, cfg,
+            model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
         )[0]
         return {
             "failure_prediction": prediction["failure_prediction"],
@@ -1233,8 +1139,6 @@ class FailureForecastPredictor:
 
     def predict_many(
         self,
-        env: Any,
-        agent: Any,
         obs: Any,
         observations: Sequence[Any],
         lines: Sequence[Any],
@@ -1245,38 +1149,23 @@ class FailureForecastPredictor:
         model_enn: Any = None,
         get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
     ) -> List[Dict[str, Any]]:
+        """Score each requested, currently connected line from one t+12 forecast.
 
-        """Score all lines independently from one common forecasted base state."""
-        # ``agent`` remains part of the runtime interface for compatibility, but
-        # labels and policy actions are never generated during inference.
-
-        del agent
-        forecast = run_t12_forecast(
-            env, obs, observations, mean_model, aleatoric_model, cfg,
+        ``observations`` is the episode history up to the current step and its
+        last element must be ``obs``.  Lines the classifier never saw during
+        training raise an error.
+        """
+        if not observations or observations[-1] is not obs:
+            raise ValueError("observations must end with the current observation")
+        forecast = forecast_injections(
+            observations, mean_model, aleatoric_model, cfg,
             model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
         )
-        if forecast["forecast_failed"]:
-            raise RuntimeError(
-                "Cannot predict agent failure because the forecasted future "
-                "power flow did not produce a valid operating state."
-            )
-
         predictions: List[Dict[str, Any]] = []
-        for line in eligible_lines(env, obs, lines):
-            contingency = simulate_line_contingency(env, forecast, line)
-            if _failure_from_done(
-                contingency["done"], contingency["obs"], contingency["info"]
-            ):
-                # No valid post-contingency state (never a training sample).
-                continue
-            row_forecast = dict(forecast)
-            row_forecast["epistemic_after"] = _get_uncertainty(
-                model_enn, contingency["obs"], get_uncertainty_fn
-            )
-            row = build_feature_row(env, obs, line, row_forecast, cfg,
-                                    scenario_obs=contingency["obs"])
+        for line in eligible_lines(cfg, obs, lines):
+            row = build_feature_row(obs, line, forecast, cfg)
             predictions.append({
-                "line": _line_name(env, line),
+                "line": cfg.line_name(line),
                 **self.predict_from_features(row),
             })
         return predictions

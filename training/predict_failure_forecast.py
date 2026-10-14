@@ -102,7 +102,7 @@ def main() -> None:
         )
         enn, uncertainty_fn = load_enn_uncertainty()
         print(predictor.predict_many(
-            env, agent, obs, observations, lines,
+            obs, observations, lines,
             mean_model, aleatoric_model, cfg,
             model_enn=enn, get_uncertainty_fn=uncertainty_fn,
         ))
