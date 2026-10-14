@@ -44,6 +44,8 @@ DEFAULTS = {
     "FAILURE_MAX_STEPS": "0",
     "FAILURE_OUTCOME_STEPS": "12",
     "FAILURE_LINES": "62_58_180,62_63_160,48_50_136,48_53_141,41_48_131,39_41_121,43_44_125,44_45_126,34_35_110,54_58_154",
+    "FAILURE_FORECAST_DIR": "",
+    "FAILURE_PERFECT_FORECAST_BENCHMARK": "false",
     "FAILURE_THRESHOLD": "0.5",
 
     "EXAMPLE_N_STEPS": "5",
@@ -79,8 +81,27 @@ def get_float(name: str) -> float:
     return float(get_config(name))
 
 
+def get_bool(name: str) -> bool:
+    value = get_config(name).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value, got {value!r}")
+
+
 def get_path(name: str) -> Path:
     path = Path(get_config(name))
+    if path.is_absolute():
+        return path
+    return ROOT / path
+
+
+def get_optional_path(name: str) -> Path | None:
+    value = get_config(name).strip()
+    if not value:
+        return None
+    path = Path(value)
     if path.is_absolute():
         return path
     return ROOT / path
@@ -155,6 +176,8 @@ FAILURE_EPISODES = get_int("FAILURE_EPISODES")
 FAILURE_MAX_STEPS = get_int("FAILURE_MAX_STEPS")
 FAILURE_OUTCOME_STEPS = get_int("FAILURE_OUTCOME_STEPS")
 FAILURE_LINES = get_config("FAILURE_LINES")
+FAILURE_FORECAST_DIR = get_optional_path("FAILURE_FORECAST_DIR")
+FAILURE_PERFECT_FORECAST_BENCHMARK = get_bool("FAILURE_PERFECT_FORECAST_BENCHMARK")
 FAILURE_THRESHOLD = get_float("FAILURE_THRESHOLD")
 
 EXAMPLE_N_STEPS = get_int("EXAMPLE_N_STEPS")

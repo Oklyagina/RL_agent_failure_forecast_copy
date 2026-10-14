@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -43,11 +44,19 @@ def split_lines(raw: str | None) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
-def stage(number: int, total: int, name: str, command: list[str]) -> None:
+def stage(
+    number: int,
+    total: int,
+    name: str,
+    command: list[str],
+    *,
+    environment: dict[str, str] | None = None,
+) -> None:
     """Print and run one pipeline stage using the current Python interpreter."""
     print(f"\n=== [{number}/{total}] {name} ===")
     print(" ".join(command))
-    subprocess.run(command, cwd=ROOT, check=True)
+    process_env = None if environment is None else {**os.environ, **environment}
+    subprocess.run(command, cwd=ROOT, check=True, env=process_env)
 
 
 def main() -> None:
@@ -138,22 +147,22 @@ def main() -> None:
         current += 1
 
     if not args.skip_row_collection:
-        cmd = [
-            sys.executable,
-            "training/collect_failure_forecast.py",
-            "--agent-name", args.agent_name,
-            "--episodes", str(failure_episodes),
-            "--seed", str(args.seed),
-            "--outcome-steps", str(args.outcome_steps),
-            "--mean-model", str(mean_model),
-            "--aleatoric-model", str(aleatoric_model),
-            "--output-csv", str(rows_csv),
-        ]
-        if args.max_steps is not None:
-            cmd.extend(["--max-steps", str(args.max_steps)])
-        if args.lines:
-            cmd.extend(["--lines", args.lines])
-        stage(current, total, "Collect failure-forecast rows", cmd)
+        collector_env = {
+            "AGENT_NAME": args.agent_name,
+            "FAILURE_EPISODES": str(failure_episodes),
+            "FAILURE_FORECAST_DIR": str(out_dir),
+            "FAILURE_LINES": args.lines or "",
+            "FAILURE_MAX_STEPS": str(args.max_steps or 0),
+            "FAILURE_OUTCOME_STEPS": str(args.outcome_steps),
+            "SEED": str(args.seed),
+        }
+        stage(
+            current,
+            total,
+            "Collect failure-forecast rows",
+            [sys.executable, "training/collect_failure_forecast.py"],
+            environment=collector_env,
+        )
         current += 1
 
     if not args.skip_classifier:

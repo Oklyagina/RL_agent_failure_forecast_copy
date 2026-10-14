@@ -39,8 +39,15 @@ Run the local example:
 python run_example.py
 ```
 
-The original `run_pipeline.py` workflow is archived under
-`archive/legacy/old_version/` and is not part of the active training path.
+To run all active ENN and failure-forecast training stages from `.env`, use:
+
+```bash
+python run_pipeline.py
+```
+
+The original pipeline implementation is archived under
+`archive/legacy/old_version/`; the root `run_pipeline.py` is the active
+orchestrator.
 
 ## Rollout Collection
 
@@ -163,21 +170,29 @@ only when the tiny sample does not contain both classifier labels.
 
 ## Failure Forecasting
 
-The failure forecast predicts whether the configured RL agent will fail one
-hour ahead after a candidate line disconnection. Forecast inputs contain the
-current, 1-hour, 1-day, and 1-week grid values plus time features. Collection
-stores one origin every 12 steps, rotates the five-minute offset by episode,
-and pairs each origin with its actual `t+12` injections. The resulting
-`forecast_X.npy`, `forecast_y.npy`, and `forecast_episode_ids.npy` files support
-an episode-separated tuning split for the mean forecaster.
+The failure forecast estimates whether the configured RL agent will fail if a
+candidate line is lost one hour ahead. Forecast inputs contain the current,
+1-hour, 1-day, and 1-week grid values plus time features. Collection stores one
+origin every 12 steps, rotates the five-minute offset by episode, and pairs
+each origin with its actual `t+12` injections. The resulting `forecast_X.npy`,
+`forecast_y.npy`, and `forecast_episode_ids.npy` files support an
+episode-separated tuning split for the mean forecaster.
 
-Failure-row collection builds one common forecasted `t+12` state and evaluates
-each currently connected selected line in an isolated contingency branch. The
-agent action used for the label is requested from the post-contingency state;
-runtime prediction does not execute the agent. During row collection, forecast
-or contingency states whose power flow does not converge are omitted because
-they do not provide a valid classifier feature row. Runtime raises for an
-invalid forecast base state and skips invalid contingency branches.
+Classifier rows currently come from opponent attacks observed while the agent
+runs historical episodes. For an attack at step `s` that actually disconnects
+a configured line, the feature origin is `t = s - 12`. The row combines grid
+statistics and ENN uncertainty at `t` with aggregate forecast injections and
+aleatoric uncertainty at `t+12`. The label is failure when the episode ends in
+a blackout within `FAILURE_OUTCOME_STEPS`; it is survival when the episode
+remains active through that window. Events with overlapping attacks or an
+unobserved outcome are skipped, and collection must produce both classes before
+training.
+
+This historical-label implementation does not run a future-hour power flow or
+simulate a line disconnection during row collection. Runtime likewise does not
+execute the agent or a contingency simulation: it makes one injection forecast
+and builds the same classifier features for each requested, currently connected
+line represented in the classifier metadata.
 
 Run the full pipeline:
 
@@ -201,12 +216,20 @@ python training/train_failure_forecasters.py \
 Collect rows:
 
 ```bash
-python training/collect_failure_forecast.py \
-  --mean-model artifacts/<ENV_NAME>/<AGENT_NAME>/failure_forecast/mean_forecaster.pkl \
-  --aleatoric-model artifacts/<ENV_NAME>/<AGENT_NAME>/failure_forecast/aleatoric_forecaster.pkl \
-  --episodes 50 \
-  --lines line_a,line_b
+python training/collect_failure_forecast.py
 ```
+
+The collector reads its settings from `.env`. Configure `FAILURE_EPISODES`,
+`FAILURE_MAX_STEPS`, `FAILURE_OUTCOME_STEPS`, `FAILURE_LINES`, and the other
+`FAILURE_*` values there. By default it loads the forecasters and writes the
+collected rows under
+`artifacts/<ENV_NAME>/<AGENT_NAME>/failure_forecast`; set
+`FAILURE_FORECAST_DIR` to override that directory.
+
+`FAILURE_PERFECT_FORECAST_BENCHMARK=true` is an experimental benchmark that
+uses measured `t+12` injections instead of model forecasts. It reads future
+data, writes `failure_forecast_rows_perfect_forecast.csv`, and must not be used
+for production training or inference.
 
 Train the classifier:
 

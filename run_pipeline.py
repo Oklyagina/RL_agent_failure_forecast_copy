@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -83,13 +84,19 @@ def default_policy_dir() -> Path:
     return ASSETS_DIR / ENV_NAME
 
 
-def execute(command: list[str], *, verbose: bool = False) -> None:
+def execute(
+    command: list[str],
+    *,
+    verbose: bool = False,
+    environment: dict[str, str] | None = None,
+) -> None:
     """Run one stage with the current interpreter and repository root."""
     print("\n" + "=" * 72)
     print(" ".join(command))
     print("=" * 72)
+    process_env = None if environment is None else {**os.environ, **environment}
     if verbose:
-        subprocess.run(command, cwd=ROOT, check=True)
+        subprocess.run(command, cwd=ROOT, check=True, env=process_env)
         return
 
     process = subprocess.Popen(
@@ -99,6 +106,7 @@ def execute(command: list[str], *, verbose: bool = False) -> None:
         stderr=None,
         text=True,
         bufsize=1,
+        env=process_env,
     )
     assert process.stdout is not None
     for line in process.stdout:
@@ -435,24 +443,21 @@ def run_pipeline(args: argparse.Namespace) -> None:
         )
 
     if collect_rows:
-        command = [
-            sys.executable,
-            "training/collect_failure_forecast.py",
-            "--agent-name", args.agent_name,
-            "--episodes", str(FAILURE_EPISODES),
-            "--seed", str(SEED),
-            "--outcome-steps", str(FAILURE_OUTCOME_STEPS),
-            "--mean-model", str(failures / "mean_forecaster.pkl"),
-            "--aleatoric-model", str(failures / "aleatoric_forecaster.pkl"),
-            "--output-csv", str(rows_csv),
-        ]
-        if FAILURE_MAX_STEPS > 0:
-            command.extend(["--max-steps", str(FAILURE_MAX_STEPS)])
-        if FAILURE_LINES:
-            command.extend(["--lines", FAILURE_LINES])
-        if AGENT_FACTORY:
-            command.extend(["--agent-factory", AGENT_FACTORY])
-        execute(command, verbose=args.verbose)
+        collector_env = {
+            "AGENT_FACTORY": AGENT_FACTORY,
+            "AGENT_NAME": args.agent_name,
+            "FAILURE_EPISODES": str(FAILURE_EPISODES),
+            "FAILURE_FORECAST_DIR": str(failures),
+            "FAILURE_LINES": FAILURE_LINES,
+            "FAILURE_MAX_STEPS": str(FAILURE_MAX_STEPS),
+            "FAILURE_OUTCOME_STEPS": str(FAILURE_OUTCOME_STEPS),
+            "SEED": str(SEED),
+        }
+        execute(
+            [sys.executable, "training/collect_failure_forecast.py"],
+            verbose=args.verbose,
+            environment=collector_env,
+        )
         _write_stage("failure_rows", rows_csv, [rows_csv], {}, args.agent_name)
 
     if train_classifier:
