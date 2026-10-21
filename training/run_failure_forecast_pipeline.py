@@ -132,7 +132,7 @@ def main() -> None:
     if not args.skip_forecasters:
         cmd = [
             sys.executable,
-            "training/train_failure_forecasters.py",
+            "training/train_mean_and_aleatoric.py",
             "--env-dir", str(args.env_dir),
             "--agent-name", args.agent_name,
             "--agent-artifact-dir", str(agent_artifacts),
@@ -170,7 +170,7 @@ def main() -> None:
     if not args.skip_classifier:
         cmd = [
             sys.executable,
-            "training/train_failure_forecast.py",
+            "training/train_faillure_classifyer.py",
             "--agent-name", args.agent_name,
             "--input-csv", str(rows_csv),
             "--model-path", str(classifier),

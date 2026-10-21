@@ -418,7 +418,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if train_forecasters:
         command = [
             sys.executable,
-            "training/train_failure_forecasters.py",
+            "training/train_mean_and_aleatoric.py",
             "--agent-name", args.agent_name,
             "--env-dir", str(ENV_DIR),
             "--agent-artifact-dir", str(agent_root),
@@ -464,7 +464,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if train_classifier:
         command = [
             sys.executable,
-            "training/train_failure_forecast.py",
+            "training/train_faillure_classifyer.py",
             "--agent-name", args.agent_name,
             "--input-csv", str(rows_csv),
             "--model-path", str(classifier),

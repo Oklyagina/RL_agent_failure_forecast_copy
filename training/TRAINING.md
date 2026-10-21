@@ -211,7 +211,7 @@ python training/run_failure_forecast_pipeline.py \
 Train the mean and aleatoric forecast models:
 
 ```bash
-python training/train_failure_forecasters.py \
+python training/train_mean_and_aleatoric.py \
   --agent-artifact-dir artifacts/<ENV_NAME>/<AGENT_NAME> \
   --episodes 50
 ```
@@ -233,7 +233,7 @@ collected rows under
 Train the classifier:
 
 ```bash
-python training/train_failure_forecast.py
+python training/train_failure_classifyer.py
 ```
 
 Smoke-test one prediction:
@@ -253,7 +253,7 @@ For the production failure-forecast bundle, configure `.env` and run the
 in-process trainer:
 
 ```bash
-python forecaster_full_train.py
+python forecaster_full_training_pipeline.py
 ```
 
 This script collects and validates genuine `t -> t+12` pairs, trains both
