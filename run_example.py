@@ -404,6 +404,7 @@ def main() -> None:
             failures = predictor.predict_many(
                 obs, observations, lines,
                 mean_model, aleatoric_model, failure_cfg,
+                env=env,
                 model_enn=enn, get_uncertainty_fn=enn_uncertainty_fn(calibration.scaler))
             kpis = recommendations[-1]["kpis"]
             if failures:

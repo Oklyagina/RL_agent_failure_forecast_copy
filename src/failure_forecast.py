@@ -1,17 +1,18 @@
 """One-hour-ahead failure forecasting for Grid2Op RL agents.
 
-Pipeline (all labels come from historical RL-agent episodes, no extra
-simulations):
+Pipeline (legacy logic, horizon corrected from t+1 to t+12):
 
 1. ``run_historical_episode`` plays the agent and records every observation.
-2. Forecaster data: pairs ``(features at t, injections at t+12)`` taken from the
-   same episode, twelve real environment steps apart.
-3. Failure labels: each *opponent attack that disconnected a line* is an event.
-   The label says whether the agent survived the following
-   ``outcome_steps`` steps (0) or the episode ended in a blackout (1).
-   Events whose outcome cannot be observed are skipped, never labeled 0.
-4. HGB features for an event at step ``s`` are built at ``t = s - 12`` from the
-   forecast of the t+12 injections plus the grid state at ``t`` only.
+2. Forecaster data: pairs ``(features at t, injections at t+12)`` for every
+   step ``t`` of the episode (sampling stride 1, as in the legacy code).
+3. Failure labels (``analyze_disconnection_effect``): at sampled steps ``t`` the
+   agent plays 12 real steps in a copy of the environment; at t+12 each
+   candidate line is disconnected in a further copy and ``failed`` is the
+   Grid2Op ``done`` flag of that step (``failed=1`` for every line when the
+   episode already ended before t+12).
+4. HGB features: grid state at ``t``, summary of the powerflow simulated with
+   the forecast t+12 injections, forecaster aleatoric uncertainty and ENN
+   epistemic uncertainty before/after.
 
 Time convention: one step is ``STEP_MINUTES`` minutes; ``observations[k]`` is
 the state at step ``k`` of the episode, before the agent acts.
@@ -19,6 +20,7 @@ the state at step ``k`` of the episode, before the agent acts.
 from __future__ import annotations
 
 import csv
+import datetime
 import json
 from collections import Counter
 from dataclasses import dataclass
@@ -33,10 +35,20 @@ from .agent_runtime import call_agent
 
 HORIZON_STEPS = 12
 STEP_MINUTES = 5
-DEFAULT_OUTCOME_STEPS = 12
+DEFAULT_SAMPLE_EVERY = 20
+DEFAULT_MIN_STEP = 12
+DEFAULT_CLASSIFIER_TRIALS = 500
+DEFAULT_SEED_START = 700
+MIN_GROUPED_EPISODES = 6
+LABEL_DISCONNECTION_TEST = "forced_disconnection_at_t12"
+LABEL_EPISODE_ENDED = "episode_ended_before_t12"
 
-LABEL_BLACKOUT = "blackout_after_attack"
-LABEL_SURVIVED = "survived_after_attack"
+# Legacy simulation phases: (name, opponent attack cooldown or None = env default).
+LEGACY_PHASES: Tuple[Tuple[str, Optional[int]], ...] = (
+    ("Standard", None),
+    ("HeavyAttack_1", 288),
+    ("HeavyAttack_2", 128),
+)
 
 CLASSIFIER_FEATURES = [
     "line_id_encoded",
@@ -51,10 +63,15 @@ CLASSIFIER_FEATURES = [
     "fcast_sum_load_p",
     "fcast_sum_load_q",
     "fcast_sum_gen_p",
+    "fcast_var_line_rho",
+    "fcast_avg_line_rho",
+    "fcast_max_line_rho",
+    "fcast_nb_rho_ge_0.95",
     "aleatoric_load_p_mean",
     "aleatoric_load_q_mean",
     "aleatoric_gen_p_mean",
     "epistemic_before",
+    "epistemic_after",
 ]
 
 # Columns derived inside ``prepare_classifier_dataframe`` / the predictor.
@@ -312,15 +329,15 @@ def collect_forecaster_training_data(
     episodes: int,
     seed: int = 0,
     max_steps: Optional[int] = None,
-    sampling_stride: int = HORIZON_STEPS,
+    sampling_stride: int = 1,
     return_episode_ids: bool = False,
     progress_callback: Optional[Callable[[int, int, int], None]] = None,
 ) -> Any:
-    """Collect hourly-stratified pairs ``X_t -> injections at t+12``.
+    """Collect pairs ``X_t -> injections at t+12`` for every step ``t``.
 
-    One origin is kept per ``sampling_stride`` steps.  The origin offset
-    rotates by episode so every five-minute phase is represented without
-    storing twelve overlapping rows per hour.  ``progress_callback`` receives
+    Legacy behaviour: ``sampling_stride=1`` keeps every origin.  A larger
+    stride keeps one origin per ``sampling_stride`` steps with the offset
+    rotating by episode.  ``progress_callback`` receives
     ``(episode, steps_played, total_rows)``.
     """
     if episodes <= 0:
@@ -388,28 +405,51 @@ def forecast_injections(
     }
 
 
-def measured_future_as_forecast(
-    observations: Sequence[Any],
-    origin: int,
+def simulate_forecast_state(
+    obs: Any,
+    forecast: Dict[str, Any],
+    env: Any,
     *,
     model_enn: Any = None,
     get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
 ) -> Dict[str, Any]:
-    """EXPERIMENTAL benchmark (supervisor option 2): perfect forecast.
+    """Run a powerflow with the forecast t+12 injections (legacy behaviour).
 
-    Uses the measured injections at ``origin + 12`` as the "forecast".  This
-    reads the future, so it must never be used for real training or inference.
+    The forecast is injected through ``obs._forecasted_inj`` (timestamp
+    ``t + 60 min``) and a do-nothing action is simulated.  The resulting
+    observation gives the ``fcast_*`` grid statistics and ``epistemic_after``.
+    Any failure leaves them NaN, as in the legacy code.
     """
-    future = observations[origin + HORIZON_STEPS]
-    return {
-        "load_p": np.asarray(future.load_p, dtype=float),
-        "load_q": np.asarray(future.load_q, dtype=float),
-        "gen_p": np.asarray(future.gen_p, dtype=float),
-        "aleatoric_load_p_mean": 0.0,
-        "aleatoric_load_q_mean": 0.0,
-        "aleatoric_gen_p_mean": 0.0,
-        "epistemic_before": _get_uncertainty(model_enn, observations[origin], get_uncertainty_fn),
+    stats: Dict[str, Any] = {
+        "fcast_sum_load_p": np.nan,
+        "fcast_sum_load_q": np.nan,
+        "fcast_sum_gen_p": np.nan,
+        "fcast_var_line_rho": np.nan,
+        "fcast_avg_line_rho": np.nan,
+        "fcast_max_line_rho": np.nan,
+        "fcast_nb_rho_ge_0.95": np.nan,
+        "epistemic_after": float("nan"),
     }
+    try:
+        now_ts = obs.get_time_stamp()
+        next_ts = now_ts + datetime.timedelta(minutes=HORIZON_STEPS * STEP_MINUTES)
+        obs_copy = obs.copy()
+        obs_copy._forecasted_inj = [
+            (now_ts, {"injection": {
+                "load_p": obs.load_p, "load_q": obs.load_q,
+                "prod_p": obs.gen_p, "prod_v": obs.gen_v}}),
+            (next_ts, {"injection": {
+                "load_p": forecast["load_p"], "load_q": forecast["load_q"],
+                "prod_p": forecast["gen_p"], "prod_v": obs.gen_v}}),
+        ]
+        sim_obs, _, _, _ = obs_copy.simulate(env.action_space({}))
+        sim_stats = compute_grid_stats(sim_obs)
+        for key, value in sim_stats.items():
+            stats["fcast_" + key] = value
+        stats["epistemic_after"] = _get_uncertainty(model_enn, sim_obs, get_uncertainty_fn)
+    except Exception as exc:  # legacy: report and continue with NaN statistics
+        print(f"[ERROR] Forecast / Powerflow Injection: {exc}")
+    return stats
 
 
 def build_feature_row(obs: Any, line: Any, forecast: Dict[str, Any],
@@ -434,69 +474,134 @@ def build_feature_row(obs: Any, line: Any, forecast: Dict[str, Any],
         "max_line_rho": current["max_line_rho"],
         "nb_rho_ge_0.95": float(current["nb_rho_ge_0.95"]),
         "load_gen_ratio": sum_load / (sum_gen + 1e-6),
-        "fcast_sum_load_p": float(np.sum(forecast["load_p"])),
-        "fcast_sum_load_q": float(np.sum(forecast["load_q"])),
-        "fcast_sum_gen_p": float(np.sum(forecast["gen_p"])),
+        "fcast_sum_load_p": forecast["fcast_sum_load_p"],
+        "fcast_sum_load_q": forecast["fcast_sum_load_q"],
+        "fcast_sum_gen_p": forecast["fcast_sum_gen_p"],
+        "fcast_var_line_rho": forecast["fcast_var_line_rho"],
+        "fcast_avg_line_rho": forecast["fcast_avg_line_rho"],
+        "fcast_max_line_rho": forecast["fcast_max_line_rho"],
+        "fcast_nb_rho_ge_0.95": forecast["fcast_nb_rho_ge_0.95"],
         "aleatoric_load_p_mean": forecast["aleatoric_load_p_mean"],
         "aleatoric_load_q_mean": forecast["aleatoric_load_q_mean"],
         "aleatoric_gen_p_mean": forecast["aleatoric_gen_p_mean"],
         "epistemic_before": forecast["epistemic_before"],
+        "epistemic_after": forecast["epistemic_after"],
     }
 
 
 # --------------------------------------------------------------------------
-# Historical failure labels
+# Legacy failure labels: forced line disconnection at t+12
 # --------------------------------------------------------------------------
 
-def find_attack_events(trace: EpisodeTrace, cfg: FailureForecastConfig,
-                       lines: Sequence[Any]) -> List[Tuple[int, int]]:
-    """Return ``(step, line_id)`` for each attack that really disconnected a line.
+def analyze_disconnection_effect(
+    env: Any,
+    agent: Any,
+    obs: Any,
+    observations: Sequence[Any],
+    episode: int,
+    mean_model: Any,
+    aleatoric_model: Any,
+    cfg: FailureForecastConfig,
+    lines: Sequence[Any],
+    *,
+    model_enn: Any = None,
+    get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
+) -> List[Dict[str, Any]]:
+    """Build one labeled row per candidate line for the current step ``t``.
 
-    An event needs the opponent to attack the line at ``step`` AND the line to
-    go from connected (step - 1) to disconnected (step).  Plain trips, planned
-    maintenance and the agent's own switching are not events.
+    1. Forecast t+12 injections and simulate a powerflow with them
+       (``fcast_*`` statistics and ``epistemic_after``).
+    2. Let the agent play ``HORIZON_STEPS`` real steps in ``env.copy()``.  At
+       t+12 disconnect each line in a further copy; ``failed`` is the ``done``
+       flag of that step.  If the episode ended before t+12 every line gets
+       ``failed=1`` (legacy behaviour).
+
+    ``observations`` is the episode history up to ``t`` (last element ``obs``).
+    Lines already disconnected at ``t`` are skipped.
     """
-    wanted = {cfg.line_id(line) for line in lines}
-    events = []
-    for step in range(1, len(trace.observations)):
-        before, after = trace.observations[step - 1], trace.observations[step]
-        for line_id in sorted(trace.attacked_lines[step] & wanted):
-            if bool(before.line_status[line_id]) and not bool(after.line_status[line_id]):
-                events.append((step, line_id))
-    return events
+    try:
+        forecast = forecast_injections(
+            observations, mean_model, aleatoric_model, cfg,
+            model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn)
+    except Exception as exc:  # legacy: continue with zero sigma / NaN stats
+        print(f"[ERROR] Forecast: {exc}")
+        forecast = {
+            "load_p": np.zeros(cfg.no_loads), "load_q": np.zeros(cfg.no_loads),
+            "gen_p": np.zeros(cfg.no_gens),
+            "aleatoric_load_p_mean": 0.0, "aleatoric_load_q_mean": 0.0,
+            "aleatoric_gen_p_mean": 0.0,
+            "epistemic_before": float("nan"),
+        }
+        forecast["epistemic_before"] = _get_uncertainty_safe(model_enn, obs, get_uncertainty_fn)
+    else:
+        forecast.update(simulate_forecast_state(
+            obs, forecast, env, model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn))
+    for key in ("fcast_sum_load_p", "fcast_sum_load_q", "fcast_sum_gen_p",
+                "fcast_var_line_rho", "fcast_avg_line_rho", "fcast_max_line_rho",
+                "fcast_nb_rho_ge_0.95", "epistemic_after"):
+        forecast.setdefault(key, float("nan"))
+
+    agent_env = env.copy()
+    current_obs = obs
+    reached_t12 = True
+    reward = env.reward_range[0]
+    done = False
+    for _ in range(HORIZON_STEPS):
+        try:
+            action = call_agent(agent, current_obs, reward=float(reward), done=done)
+        except Exception:
+            action = agent_env.action_space({})
+        current_obs, reward, done, _ = agent_env.step(action)
+        if done:
+            reached_t12 = False
+            break
+
+    rows: List[Dict[str, Any]] = []
+    for line in eligible_lines(cfg, obs, lines):
+        line_id = cfg.line_id(line)
+        if reached_t12:
+            test_env = agent_env.copy()
+            _, _, failed, _ = test_env.step(
+                env.action_space({"set_line_status": [(line_id, -1)]}))
+            test_env.close()
+            reason = LABEL_DISCONNECTION_TEST
+        else:
+            failed = True
+            reason = LABEL_EPISODE_ENDED
+        row = build_feature_row(obs, line_id, forecast, cfg)
+        row.update({
+            "episode": episode,
+            "step": int(obs.current_step),
+            "event_step": int(obs.current_step) + HORIZON_STEPS,
+            "failed": 1 if failed else 0,
+            "label_reason": reason,
+        })
+        rows.append(row)
+    agent_env.close()
+    return rows
 
 
-def label_attack_event(trace: EpisodeTrace, step: int, line_id: int,
-                       outcome_steps: int) -> Tuple[Optional[int], str]:
-    """Label one attack event from what the agent did next in the episode.
+def _get_uncertainty_safe(model_enn: Any, obs: Any,
+                          get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]]) -> float:
+    try:
+        return _get_uncertainty(model_enn, obs, get_uncertainty_fn)
+    except Exception as exc:
+        print(f"[ERROR] ENN Epistemic Calculation (Before): {exc}")
+        return float("nan")
 
-    The agent sees the attacked grid at ``step`` and acts at ``step`` ..
-    ``step + outcome_steps - 1``.  Returns ``(label, reason)``:
 
-    * ``(1, blackout_after_attack)``: the episode ended in a blackout within
-      ``outcome_steps`` steps after the attack;
-    * ``(0, survived_after_attack)``: the episode was still running (no
-      blackout) ``outcome_steps`` steps after the attack;
-    * ``(None, reason)``: no reliable label - another attack interferes, or the
-      episode stopped (end of data / step limit) before the outcome was known.
-    """
-    n_obs = len(trace.observations)
-    window_end = step + outcome_steps
-    for other_step in range(step, min(window_end, n_obs - 1) + 1):
-        others = set(trace.attacked_lines[other_step])
-        if other_step == step:
-            others.discard(line_id)
-        if others:
-            return None, "overlapping_attack"
-    blackout_step = n_obs  # index of the game-over step, if any
+def opponent_env_kwargs(lines: Sequence[Any], cooldown: int, seed: int = 42) -> Dict[str, Any]:
+    """Grid2Op ``make`` kwargs of the legacy attack phases (random line opponent)."""
+    from grid2op.Action import PowerlineSetAction
+    from grid2op.Opponent import BaseActionBudget, RandomLineOpponent
 
-    if trace.ended_in_blackout and blackout_step <= window_end:
-        if trace.terminal_attacked_lines:
-            return None, "overlapping_attack"
-        return 1, LABEL_BLACKOUT
-    if window_end <= n_obs - 1:
-        return 0, LABEL_SURVIVED
-    return None, "outcome_not_observed"
+    return {
+        "opponent_action_class": PowerlineSetAction,
+        "opponent_class": RandomLineOpponent,
+        "opponent_budget_class": BaseActionBudget,
+        "kwargs_opponent": {"lines_attacked": list(lines), "seed": seed},
+        "opponent_attack_cooldown": int(cooldown),
+    }
 
 
 def collect_failure_forecast_rows(
@@ -508,72 +613,116 @@ def collect_failure_forecast_rows(
     *,
     episodes: int,
     seed: int = 0,
-    outcome_steps: int = DEFAULT_OUTCOME_STEPS,
     max_steps: Optional[int] = None,
+    sample_every: int = DEFAULT_SAMPLE_EVERY,
+    min_step: int = DEFAULT_MIN_STEP,
+    phase: str = "Standard",
     model_enn: Any = None,
     get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
-    perfect_forecast: bool = False,
     progress_callback: Optional[Callable[[int, int, Counter], None]] = None,
 ) -> Tuple[List[Dict[str, Any]], Counter]:
-    """Collect labeled HGB rows from historical agent episodes.
+    """Collect labeled HGB rows for ONE simulation phase (legacy procedure).
 
-    For every labeled attack event at step ``s`` on line ``l`` one row is built
-    at the forecast origin ``t = s - 12`` using only observations up to ``t``
-    plus the forecast of the t+12 injections.  ``perfect_forecast=True`` is the
-    experimental "measured values as forecasts" benchmark.
+    Episode ``seed + k`` is played by the agent; at every step with
+    ``current_step > min_step`` and ``current_step % sample_every == 0`` the
+    forced-disconnection analysis of ``analyze_disconnection_effect`` runs for
+    ``cfg.lines_to_test``.  Observations whose vector length differs from the
+    ENN input dimension are skipped (legacy sanity check).
 
-    Returns ``(rows, stats)``; ``stats`` counts episodes, attack events, rows,
-    positives/negatives and every skip reason.  ``progress_callback`` receives
+    Returns ``(rows, stats)`` with counters for episodes, sample points, rows
+    and positives/negatives; ``progress_callback`` receives
     ``(episode, steps_played, stats)``.
     """
     if episodes <= 0:
         raise ValueError("episodes must be positive")
-    if outcome_steps <= 0:
-        raise ValueError("outcome_steps must be positive")
+    if sample_every <= 0:
+        raise ValueError("sample_every must be positive")
+    expected_dim = getattr(model_enn, "input_dim", None) if model_enn is not None else None
     rows: List[Dict[str, Any]] = []
     stats: Counter = Counter()
     for episode in range(episodes):
-        trace = run_historical_episode(env, agent, seed + episode, max_steps)
+        obs = reset_environment(env, seed + episode)
+        if hasattr(agent, "reset"):
+            agent.reset(obs)
+        observations = [obs]
+        reward = getattr(env, "reward_range", (0.0, 0.0))[0]
+        steps = 0
         stats["episodes"] += 1
-        stats["blackout_episodes"] += int(trace.ended_in_blackout)
-        for step, line_id in find_attack_events(trace, cfg, cfg.lines_to_test):
-            stats["attack_events"] += 1
-            origin = step - HORIZON_STEPS
-            label, reason = label_attack_event(trace, step, line_id, outcome_steps)
-            if label is None:
-                stats["skipped_" + reason] += 1
-                continue
-            if origin < 0:
-                stats["skipped_no_forecast_origin"] += 1
-                continue
-            if not bool(trace.observations[origin].line_status[line_id]):
-                stats["skipped_line_down_at_origin"] += 1
-                continue
-            history = trace.observations[: origin + 1]
-            if perfect_forecast:
-                forecast = measured_future_as_forecast(
-                    trace.observations, origin,
-                    model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn)
-            else:
-                forecast = forecast_injections(
-                    history, mean_model, aleatoric_model, cfg,
-                    model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn)
-            row = build_feature_row(history[-1], line_id, forecast, cfg)
-            row.update({
-                "episode": episode,
-                "step": origin,
-                "event_step": step,
-                "failed": label,
-                "label_reason": reason,
-                "outcome_steps": outcome_steps,
-                "forecast_source": "measured_future" if perfect_forecast else "forecaster",
-            })
-            rows.append(row)
-            stats["rows"] += 1
-            stats["positive" if label else "negative"] += 1
+        while max_steps is None or steps < max_steps:
+            try:
+                action = call_agent(agent, obs, reward=float(reward), done=False)
+            except Exception:
+                action = env.action_space({})
+            if obs.current_step > min_step and obs.current_step % sample_every == 0:
+                if expected_dim is not None and len(obs.to_vect()) != int(expected_dim):
+                    stats["skipped_dimension_mismatch"] += 1
+                else:
+                    stats["sample_points"] += 1
+                    new_rows = analyze_disconnection_effect(
+                        env, agent, obs, observations, seed + episode,
+                        mean_model, aleatoric_model, cfg, cfg.lines_to_test,
+                        model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn)
+                    for row in new_rows:
+                        row["phase"] = phase
+                        stats["rows"] += 1
+                        stats["positive" if row["failed"] else "negative"] += 1
+                    rows.extend(new_rows)
+            obs, reward, done, info = env.step(action)
+            steps += 1
+            if done:
+                stats["blackout_episodes"] += int(is_blackout(done, info))
+                break
+            observations.append(obs)
         if progress_callback:
-            progress_callback(episode, len(trace.observations), stats)
+            progress_callback(episode, steps, stats)
     return rows, stats
+
+
+def collect_failure_forecast_phases(
+    agent: Any,
+    make_env: Callable[..., Any],
+    mean_model: Any,
+    aleatoric_model: Any,
+    cfg: FailureForecastConfig,
+    *,
+    episodes: int,
+    seed: int = DEFAULT_SEED_START,
+    max_steps: Optional[int] = None,
+    phases: Sequence[Tuple[str, Optional[int]]] = LEGACY_PHASES,
+    model_enn: Any = None,
+    get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
+    progress_callback: Optional[Callable[[int, int, Counter], None]] = None,
+) -> Tuple[List[Dict[str, Any]], Counter]:
+    """Run every legacy phase (Standard + random-opponent heavy attacks).
+
+    ``make_env(**kwargs)`` must return a fresh Grid2Op environment; kwargs are
+    empty for the standard phase and ``opponent_env_kwargs`` otherwise.  As in
+    the legacy code every phase replays the same episode seeds.  The progress
+    callback receives cumulative stats over all phases.
+    """
+    all_rows: List[Dict[str, Any]] = []
+    total: Counter = Counter()
+    for name, cooldown in phases:
+        kwargs = {} if cooldown is None else opponent_env_kwargs(cfg.lines_to_test, cooldown)
+        phase_env = make_env(**kwargs)
+        try:
+            done_before = Counter(total)
+
+            def relay(episode: int, steps: int, stats: Counter) -> None:
+                if progress_callback:
+                    progress_callback(episode, steps, done_before + stats)
+
+            rows, stats = collect_failure_forecast_rows(
+                agent, phase_env, mean_model, aleatoric_model, cfg,
+                episodes=episodes, seed=seed, max_steps=max_steps, phase=name,
+                model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
+                progress_callback=relay,
+            )
+        finally:
+            phase_env.close()
+        all_rows.extend(rows)
+        total.update(stats)
+    return all_rows, total
 
 
 def save_forecaster_training_data(
@@ -808,7 +957,7 @@ def write_rows_csv(rows: Iterable[Dict[str, Any]], output_path: str | Path) -> i
         path.write_text("", encoding="utf-8")
         return 0
     preferred = [
-        "episode", "step", "event_step", "horizon_steps", "horizon_minutes",
+        "phase", "episode", "step", "event_step", "horizon_steps", "horizon_minutes",
         "line_disconnected", "line_id", "failed", "label_reason",
     ]
     fieldnames = preferred + sorted(
@@ -900,14 +1049,32 @@ def _split_classifier_rows(
     dataframe: pd.DataFrame,
     *,
     seed: int,
-    test_size: float = 0.2,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, Dict[str, Any]]:
-    """Split classifier rows while keeping each episode in exactly one set."""
+    val_size: float = 0.15,
+    test_size: float = 0.15,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series,
+           Optional[pd.Series], Dict[str, Any]]:
+    """Legacy 70/15/15 train/validation/test split, episode-grouped when possible.
+
+    Episode grouping (every episode in exactly one set) is kept from the
+    current implementation; with fewer than ``MIN_GROUPED_EPISODES`` episodes
+    the legacy row-level stratified split is used.  Returns
+    ``(X_train, X_val, X_test, y_train, y_val, y_test, groups_train, info)``.
+    """
     from sklearn.model_selection import train_test_split
 
     X = dataframe[CLASSIFIER_FEATURES].copy()
     y = dataframe["label"].astype(int)
-    if "episode" in dataframe.columns and dataframe["episode"].nunique() >= 2:
+    holdout = float(val_size) + float(test_size)
+    test_share = float(test_size) / holdout
+
+    def stratified(values: np.ndarray, labels: Optional[np.ndarray], fraction: float,
+                   ) -> Tuple[np.ndarray, np.ndarray]:
+        counts = pd.Series(labels).value_counts() if labels is not None else None
+        use = labels is not None and len(counts) > 1 and int(counts.min()) >= 2
+        return train_test_split(values, test_size=fraction, random_state=int(seed),
+                                stratify=labels if use else None)
+
+    if "episode" in dataframe.columns and dataframe["episode"].nunique() >= MIN_GROUPED_EPISODES:
         episodes = pd.to_numeric(dataframe["episode"], errors="raise").astype(int)
         unique_episodes = np.asarray(sorted(episodes.unique()), dtype=int)
         episode_has_failure = (
@@ -917,51 +1084,133 @@ def _split_classifier_rows(
             .reindex(unique_episodes)
             .astype(int)
         )
-        stratify = None
-        class_counts = episode_has_failure.value_counts()
-        if episode_has_failure.nunique() > 1 and int(class_counts.min()) >= 2:
-            stratify = episode_has_failure.to_numpy()
-        train_episodes, test_episodes = train_test_split(
-            unique_episodes,
-            test_size=float(test_size),
-            random_state=int(seed),
-            stratify=stratify,
-        )
-        train_mask = episodes.isin(train_episodes)
-        test_mask = episodes.isin(test_episodes)
-        X_train, X_test = X.loc[train_mask], X.loc[test_mask]
-        y_train, y_test = y.loc[train_mask], y.loc[test_mask]
+        flags = episode_has_failure.to_numpy()
+        train_ep, temp_ep = stratified(unique_episodes, flags, holdout)
+        temp_flags = episode_has_failure.reindex(temp_ep).to_numpy()
+        val_ep, test_ep = stratified(np.asarray(temp_ep), temp_flags, test_share)
+        masks = {
+            "train": episodes.isin(train_ep),
+            "val": episodes.isin(val_ep),
+            "test": episodes.isin(test_ep),
+        }
+        X_train, X_val, X_test = (X.loc[masks[k]] for k in ("train", "val", "test"))
+        y_train, y_val, y_test = (y.loc[masks[k]] for k in ("train", "val", "test"))
+        groups_train = episodes.loc[masks["train"]]
         split_info = {
             "strategy": "episode_grouped",
+            "val_fraction": float(val_size),
             "test_fraction": float(test_size),
-            "train_episodes": int(len(train_episodes)),
-            "test_episodes": int(len(test_episodes)),
-            "train_rows": int(train_mask.sum()),
-            "test_rows": int(test_mask.sum()),
+            "train_episodes": int(len(train_ep)),
+            "val_episodes": int(len(val_ep)),
+            "test_episodes": int(len(test_ep)),
         }
     else:
-        stratify = y if int(y.value_counts().min()) >= 2 else None
-        X_train, X_test, y_train, y_test = train_test_split(
-            X,
-            y,
-            test_size=float(test_size),
-            random_state=int(seed),
-            stratify=stratify,
-        )
+        index = np.arange(len(X))
+        labels = y.to_numpy()
+        train_idx, temp_idx = stratified(index, labels, holdout)
+        val_idx, test_idx = stratified(np.asarray(temp_idx), labels[temp_idx], test_share)
+        X_train, X_val, X_test = (X.iloc[i] for i in (train_idx, val_idx, test_idx))
+        y_train, y_val, y_test = (y.iloc[i] for i in (train_idx, val_idx, test_idx))
+        groups_train = None
         split_info = {
             "strategy": "row_stratified",
+            "val_fraction": float(val_size),
             "test_fraction": float(test_size),
             "train_episodes": None,
+            "val_episodes": None,
             "test_episodes": None,
-            "train_rows": int(len(X_train)),
-            "test_rows": int(len(X_test)),
         }
+    split_info.update({
+        "train_rows": int(len(X_train)),
+        "val_rows": int(len(X_val)),
+        "test_rows": int(len(X_test)),
+    })
 
-    if y_train.nunique() < 2:
-        raise ValueError("Classifier training split does not contain both classes.")
-    if y_test.nunique() < 2:
-        raise ValueError("Classifier test split does not contain both classes.")
-    return X_train, X_test, y_train, y_test, split_info
+    for name, labels_part in (("training", y_train), ("validation", y_val), ("test", y_test)):
+        if labels_part.nunique() < 2:
+            raise ValueError(f"Classifier {name} split does not contain both classes.")
+    return X_train, X_val, X_test, y_train, y_val, y_test, groups_train, split_info
+
+
+def _classifier_class_weight(choice: str) -> Any:
+    """Decode the legacy string choices of the class-weight search space."""
+    weights = {"none": None, "balanced": "balanced",
+               "w3": {0: 1, 1: 3}, "w5": {0: 1, 1: 5}, "w10": {0: 1, 1: 10}}
+    if choice not in weights:
+        raise ValueError(f"Unknown class_weight_choice: {choice}")
+    return weights[choice]
+
+
+def _classifier_risk(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Legacy risk: 0.4 * false-alarm % + 0.6 * oversight % (oversights hurt more)."""
+    from sklearn.metrics import confusion_matrix
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    fa = (fp / (tn + fp) * 100.0) if (tn + fp) else 0.0
+    ovr = (fn / (tp + fn) * 100.0) if (tp + fn) else 0.0
+    return 0.4 * fa + 0.6 * ovr
+
+
+def _optimize_classifier(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    groups_train: Optional[pd.Series],
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    cat_indices: List[int],
+    *,
+    n_trials: int,
+    seed: int,
+    n_jobs: int,
+) -> Tuple[Dict[str, Any], float, float]:
+    """Legacy Optuna search over HGB parameters, class weight and threshold.
+
+    Each trial is fitted on the five folds of the TRAINING split and scored on
+    the validation split with the legacy risk (the sampled threshold is tuned
+    but, as in the legacy code, not used by the risk).  Folds are built from
+    the training split only and grouped by episode when available.
+    """
+    import optuna
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    min_class = int(y_train.value_counts().min())
+    n_splits = max(2, min(5, min_class))
+    if groups_train is not None and groups_train.nunique() >= n_splits:
+        folds = list(StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+                     .split(X_train, y_train, groups_train))
+    else:
+        folds = list(StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+                     .split(X_train, y_train))
+
+    def objective(trial: Any) -> float:
+        choice = trial.suggest_categorical(
+            "class_weight_choice", ["none", "balanced", "w3", "w5", "w10"])
+        params = {
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.2, log=True),
+            "max_iter": trial.suggest_int("max_iter", 100, 800),
+            "max_leaf_nodes": trial.suggest_int("max_leaf_nodes", 15, 255),
+            "min_samples_leaf": trial.suggest_int("min_samples_leaf", 10, 100),
+            "l2_regularization": trial.suggest_float("l2_regularization", 1e-6, 5.0, log=True),
+            "class_weight": _classifier_class_weight(choice),
+            "random_state": seed,
+        }
+        trial.suggest_float("threshold", 0.10, 0.90)
+        scores = []
+        for train_idx, _ in folds:
+            model = HistGradientBoostingClassifier(categorical_features=cat_indices, **params)
+            model.fit(X_train.iloc[train_idx], y_train.iloc[train_idx])
+            scores.append(_classifier_risk(y_val.to_numpy(), model.predict(X_val)))
+        return float(np.mean(scores))
+
+    study = optuna.create_study(direction="minimize")
+    study.optimize(objective, n_trials=int(n_trials), n_jobs=int(n_jobs))
+    best = dict(study.best_params)
+    optuna_threshold = float(best.pop("threshold"))
+    best["class_weight"] = _classifier_class_weight(best.pop("class_weight_choice"))
+    best["random_state"] = seed
+    return best, optuna_threshold, float(study.best_value)
 
 
 def train_failure_classifier(
@@ -972,8 +1221,15 @@ def train_failure_classifier(
     seed: int = 42,
     env_name: str = "",
     agent_name: str = "",
-    max_iter: int = 300,
+    n_trials: int = DEFAULT_CLASSIFIER_TRIALS,
+    n_jobs: int = -1,
 ) -> Tuple[Any, Dict[str, Any]]:
+    """Train the failure classifier with the legacy Optuna procedure.
+
+    ``n_trials <= 0`` skips the search and fits fixed balanced HGB parameters.
+    The final model is fitted on the training split only (as in the legacy
+    code) and evaluated on the test split with ``threshold``.
+    """
     import joblib
     from sklearn.ensemble import HistGradientBoostingClassifier
 
@@ -985,18 +1241,19 @@ def train_failure_classifier(
     if int(y.value_counts().min()) < 2:
         raise ValueError("Failure classifier needs at least two samples per class.")
 
-    X_train, X_test, y_train, y_test, split_info = _split_classifier_rows(
-        dataframe,
-        seed=seed,
-    )
+    (X_train, X_val, X_test, y_train, y_val, y_test,
+     groups_train, split_info) = _split_classifier_rows(dataframe, seed=seed)
     cat_indices = [CLASSIFIER_FEATURES.index("line_id_encoded")]
-    model = HistGradientBoostingClassifier(
-        categorical_features=cat_indices,
-        class_weight="balanced",
-        learning_rate=0.05,
-        max_iter=int(max_iter),
-        random_state=seed,
-    )
+    optuna_threshold = None
+    optuna_best_risk = None
+    if n_trials > 0:
+        params, optuna_threshold, optuna_best_risk = _optimize_classifier(
+            X_train, y_train, groups_train, X_val, y_val, cat_indices,
+            n_trials=int(n_trials), seed=int(seed), n_jobs=int(n_jobs))
+    else:
+        params = {"class_weight": "balanced", "learning_rate": 0.05,
+                  "max_iter": 300, "random_state": int(seed)}
+    model = HistGradientBoostingClassifier(categorical_features=cat_indices, **params)
     model.fit(X_train, y_train)
     probs = _failure_probability(model, X_test)
     preds = (probs >= float(threshold)).astype(int)
@@ -1005,6 +1262,10 @@ def train_failure_classifier(
     model_path = Path(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(model, model_path)
+    serializable = dict(params)
+    if isinstance(serializable.get("class_weight"), dict):
+        serializable["class_weight"] = {
+            str(k): v for k, v in serializable["class_weight"].items()}
     metadata = {
         "environment": env_name,
         "agent": agent_name,
@@ -1015,14 +1276,11 @@ def train_failure_classifier(
         "forecast_horizon_steps": HORIZON_STEPS,
         "forecast_horizon_minutes": HORIZON_STEPS * STEP_MINUTES,
         "split": split_info,
-        "outcome_steps": (
-            int(dataframe["outcome_steps"].iloc[0])
-            if "outcome_steps" in dataframe.columns and len(dataframe) else None
-        ),
         "label_definition": (
-            "1 = opponent attack disconnected the line and the agent's episode "
-            "ended in a blackout within outcome_steps; 0 = agent still running "
-            "after outcome_steps; unknown outcomes are excluded"
+            "1 = Grid2Op episode ended (done) on the step that forcibly "
+            "disconnects the line after the agent has played 12 steps (t+12), "
+            "or the episode ended before t+12; 0 = the grid survived the "
+            "disconnection"
         ),
         "label_counts": {
             str(label): int(count) for label, count in y.value_counts().items()
@@ -1035,11 +1293,11 @@ def train_failure_classifier(
                 else []
             )
         },
-        "model_params": {
-            "class_weight": "balanced",
-            "learning_rate": 0.05,
-            "max_iter": int(max_iter),
-            "random_state": int(seed),
+        "model_params": serializable,
+        "optuna": {
+            "n_trials": int(n_trials),
+            "best_risk": optuna_best_risk,
+            "best_threshold_unused": optuna_threshold,
         },
         "metrics": metrics,
     }
@@ -1054,7 +1312,8 @@ class FailureForecastPredictor:
 
     Scores "the agent fails if line l is lost around t+12".  It uses only the
     observation history up to ``t`` and the saved forecasting models; no
-    simulation and no agent call is made.
+    agent call is made; one do-nothing powerflow with the forecast injections
+    supplies the ``fcast_*`` features (legacy behaviour).
     """
 
     def __init__(self, model: Any, metadata: Dict[str, Any]):
@@ -1124,13 +1383,14 @@ class FailureForecastPredictor:
         aleatoric_model: Any,
         cfg: FailureForecastConfig,
         *,
+        env: Any,
         model_enn: Any = None,
         get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
     ) -> Dict[str, Any]:
         """Score one line; see ``predict_many``."""
         prediction = self.predict_many(
             obs, observations, [line], mean_model, aleatoric_model, cfg,
-            model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
+            env=env, model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
         )[0]
         return {
             "failure_prediction": prediction["failure_prediction"],
@@ -1146,14 +1406,16 @@ class FailureForecastPredictor:
         aleatoric_model: Any,
         cfg: FailureForecastConfig,
         *,
+        env: Any,
         model_enn: Any = None,
         get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
     ) -> List[Dict[str, Any]]:
         """Score each requested, currently connected line from one t+12 forecast.
 
         ``observations`` is the episode history up to the current step and its
-        last element must be ``obs``.  Lines the classifier never saw during
-        training raise an error.
+        last element must be ``obs``.  ``env`` supplies the action space for the
+        forecast-injection powerflow (``simulate_forecast_state``).  Lines the
+        classifier never saw during training raise an error.
         """
         if not observations or observations[-1] is not obs:
             raise ValueError("observations must end with the current observation")
@@ -1161,6 +1423,10 @@ class FailureForecastPredictor:
             observations, mean_model, aleatoric_model, cfg,
             model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
         )
+        forecast.update(simulate_forecast_state(
+            obs, forecast, env,
+            model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
+        ))
         predictions: List[Dict[str, Any]] = []
         for line in eligible_lines(cfg, obs, lines):
             row = build_feature_row(obs, line, forecast, cfg)

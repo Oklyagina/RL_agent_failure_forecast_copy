@@ -40,10 +40,11 @@ from project_config import (  # noqa: E402
     ENN_VAL_FRAC,
     ENV_DIR,
     ENV_NAME,
+    FAILURE_CLASSIFIER_TRIALS,
     FAILURE_EPISODES,
     FAILURE_LINES,
     FAILURE_MAX_STEPS,
-    FAILURE_OUTCOME_STEPS,
+    FAILURE_SEED_START,
     FAILURE_THRESHOLD,
     FORECAST_EPISODES,
     FORECAST_MAX_STEPS,
@@ -450,7 +451,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             "FAILURE_FORECAST_DIR": str(failures),
             "FAILURE_LINES": FAILURE_LINES,
             "FAILURE_MAX_STEPS": str(FAILURE_MAX_STEPS),
-            "FAILURE_OUTCOME_STEPS": str(FAILURE_OUTCOME_STEPS),
+            "FAILURE_SEED_START": str(FAILURE_SEED_START),
             "SEED": str(SEED),
         }
         execute(
@@ -468,6 +469,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             "--input-csv", str(rows_csv),
             "--model-path", str(classifier),
             "--threshold", str(FAILURE_THRESHOLD),
+            "--trials", str(FAILURE_CLASSIFIER_TRIALS),
             "--seed", str(SEED),
         ]
         execute(command, verbose=args.verbose)

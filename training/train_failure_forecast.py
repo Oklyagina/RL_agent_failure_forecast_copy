@@ -1,4 +1,4 @@
-"""Train the one-hour-ahead failure classifier from collected rows."""
+"""Train the t+12 failure classifier from collected rows (legacy Optuna search)."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from project_config import AGENT_NAME, ARTIFACTS_DIR, ENV_NAME, SEED  # noqa: E402
+from project_config import (  # noqa: E402
+    AGENT_NAME,
+    ARTIFACTS_DIR,
+    ENV_NAME,
+    FAILURE_CLASSIFIER_TRIALS,
+    SEED,
+)
 from src.failure_forecast import (  # noqa: E402
     prepare_classifier_dataframe,
     train_failure_classifier,
@@ -27,7 +33,8 @@ def main() -> None:
     parser.add_argument("--model-path", type=Path, default=None)
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--max-iter", type=int, default=300)
+    parser.add_argument("--trials", type=int, default=FAILURE_CLASSIFIER_TRIALS,
+                        help="Optuna trials (0 = fixed parameters, no search)")
     args = parser.parse_args()
 
     out_dir = default_dir(args.agent_name)
@@ -41,7 +48,7 @@ def main() -> None:
         seed=args.seed,
         env_name=ENV_NAME,
         agent_name=args.agent_name,
-        max_iter=args.max_iter,
+        n_trials=args.trials,
     )
     metrics = info["metrics"]
     print(f"[ok] wrote classifier -> {model_path}")

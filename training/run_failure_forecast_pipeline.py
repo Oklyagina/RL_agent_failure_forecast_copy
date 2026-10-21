@@ -17,9 +17,10 @@ from project_config import (  # noqa: E402
     ASSETS_DIR,
     ENV_DIR,
     ENV_NAME,
+    FAILURE_CLASSIFIER_TRIALS,
     FAILURE_EPISODES,
     FAILURE_LINES,
-    FAILURE_OUTCOME_STEPS,
+    FAILURE_SEED_START,
     FAILURE_THRESHOLD,
     FORECAST_EPISODES,
     FORECAST_MEAN_TRIALS,
@@ -74,7 +75,8 @@ def main() -> None:
     parser.add_argument("--forecast-episodes", type=int, default=None)
     parser.add_argument("--failure-episodes", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--outcome-steps", type=int, default=FAILURE_OUTCOME_STEPS)
+    parser.add_argument("--seed-start", type=int, default=FAILURE_SEED_START)
+    parser.add_argument("--trials", type=int, default=FAILURE_CLASSIFIER_TRIALS)
     parser.add_argument("--lines", default=FAILURE_LINES or None)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--mean-trials", type=int, default=FORECAST_MEAN_TRIALS)
@@ -153,7 +155,7 @@ def main() -> None:
             "FAILURE_FORECAST_DIR": str(out_dir),
             "FAILURE_LINES": args.lines or "",
             "FAILURE_MAX_STEPS": str(args.max_steps or 0),
-            "FAILURE_OUTCOME_STEPS": str(args.outcome_steps),
+            "FAILURE_SEED_START": str(args.seed_start),
             "SEED": str(args.seed),
         }
         stage(
@@ -173,6 +175,7 @@ def main() -> None:
             "--input-csv", str(rows_csv),
             "--model-path", str(classifier),
             "--threshold", str(args.threshold),
+            "--trials", str(args.trials),
             "--seed", str(args.seed),
         ]
         stage(current, total, "Train failure classifier", cmd)

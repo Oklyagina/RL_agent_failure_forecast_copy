@@ -104,7 +104,7 @@ def main() -> None:
         print(predictor.predict_many(
             obs, observations, lines,
             mean_model, aleatoric_model, cfg,
-            model_enn=enn, get_uncertainty_fn=uncertainty_fn,
+            env=env, model_enn=enn, get_uncertainty_fn=uncertainty_fn,
         ))
     finally:
         env.close()

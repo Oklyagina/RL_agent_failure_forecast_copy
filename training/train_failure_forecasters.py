@@ -29,7 +29,6 @@ from project_config import (  # noqa: E402
 )
 from src.agent_runtime import build_agent  # noqa: E402
 from src.failure_forecast import (  # noqa: E402
-    HORIZON_STEPS,
     collect_forecaster_training_data,
     save_forecaster_training_data,
     train_aleatoric_forecaster,
@@ -131,7 +130,7 @@ def main() -> None:
     print(f"  output        : {out_dir}")
     print(f"  episodes      : {args.episodes}")
     print(f"  mean_trials   : {args.mean_trials}")
-    print(f"  sample cadence: every {HORIZON_STEPS} steps with rotated episode offsets")
+    print("  sample cadence: every step (legacy), target t+12")
 
     if (
         args.reuse_data
@@ -176,7 +175,7 @@ def main() -> None:
                 episodes=args.episodes,
                 seed=args.seed,
                 max_steps=args.max_steps,
-                sampling_stride=HORIZON_STEPS,
+                sampling_stride=1,
                 return_episode_ids=True,
                 progress_callback=update,
             )

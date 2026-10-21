@@ -172,27 +172,30 @@ only when the tiny sample does not contain both classifier labels.
 
 The failure forecast estimates whether the configured RL agent will fail if a
 candidate line is lost one hour ahead. Forecast inputs contain the current,
-1-hour, 1-day, and 1-week grid values plus time features. Collection stores one
-origin every 12 steps, rotates the five-minute offset by episode, and pairs
-each origin with its actual `t+12` injections. The resulting `forecast_X.npy`,
-`forecast_y.npy`, and `forecast_episode_ids.npy` files support an
-episode-separated tuning split for the mean forecaster.
+1-hour, 1-day, and 1-week grid values plus time features. Collection keeps
+every step as a forecast origin (legacy behaviour) and pairs each origin with
+its actual `t+12` injections (12 five-minute Grid2Op steps = one hour). The
+resulting `forecast_X.npy`, `forecast_y.npy`, and `forecast_episode_ids.npy`
+files support an episode-separated tuning split for the mean forecaster.
 
-Classifier rows currently come from opponent attacks observed while the agent
-runs historical episodes. For an attack at step `s` that actually disconnects
-a configured line, the feature origin is `t = s - 12`. The row combines grid
-statistics and ENN uncertainty at `t` with aggregate forecast injections and
-aleatoric uncertainty at `t+12`. The label is failure when the episode ends in
-a blackout within `FAILURE_OUTCOME_STEPS`; it is survival when the episode
-remains active through that window. Events with overlapping attacks or an
-unobserved outcome are skipped, and collection must produce both classes before
-training.
+Classifier rows follow the legacy forced-disconnection procedure. The agent
+plays episodes in three phases (`Standard`, `HeavyAttack_1` with opponent
+cooldown 288, `HeavyAttack_2` with cooldown 128) using seeds starting at
+`FAILURE_SEED_START`. At every step with `step > 12` and `step % 20 == 0`, the
+`t+12` injections are forecast and fed to one do-nothing power flow (the
+`fcast_*` features and `epistemic_after`); the agent then plays 12 steps in a
+copy of the environment, and each configured connected line is forcibly
+disconnected at `t+12` in a further copy. The label is 1 when that step ends
+the episode (`done`), and 1 for every line when the episode ended before
+`t+12`. The 21 classifier features and the Optuna search (`FAILURE_CLASSIFIER_TRIALS`
+trials, risk = 0.4 x false-alarm % + 0.6 x oversight %) follow the legacy
+classifier; the train/validation/test split and the cross-validation folds are
+grouped by episode so no episode leaks across sets.
 
-This historical-label implementation does not run a future-hour power flow or
-simulate a line disconnection during row collection. Runtime likewise does not
-execute the agent or a contingency simulation: it makes one injection forecast
-and builds the same classifier features for each requested, currently connected
-line represented in the classifier metadata.
+Runtime does not execute the agent or the forced-disconnection simulation: it
+forecasts the injections, runs one do-nothing power flow with them (hence the
+`env` argument of the predictor) and builds the same features for each
+requested, currently connected line represented in the classifier metadata.
 
 Run the full pipeline:
 
@@ -220,16 +223,12 @@ python training/collect_failure_forecast.py
 ```
 
 The collector reads its settings from `.env`. Configure `FAILURE_EPISODES`,
-`FAILURE_MAX_STEPS`, `FAILURE_OUTCOME_STEPS`, `FAILURE_LINES`, and the other
+`FAILURE_MAX_STEPS`, `FAILURE_SEED_START`, `FAILURE_CLASSIFIER_TRIALS`,
+`FAILURE_LINES`, and the other
 `FAILURE_*` values there. By default it loads the forecasters and writes the
 collected rows under
 `artifacts/<ENV_NAME>/<AGENT_NAME>/failure_forecast`; set
 `FAILURE_FORECAST_DIR` to override that directory.
-
-`FAILURE_PERFECT_FORECAST_BENCHMARK=true` is an experimental benchmark that
-uses measured `t+12` injections instead of model forecasts. It reads future
-data, writes `failure_forecast_rows_perfect_forecast.csv`, and must not be used
-for production training or inference.
 
 Train the classifier:
 

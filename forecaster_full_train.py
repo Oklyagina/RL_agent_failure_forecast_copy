@@ -22,10 +22,11 @@ from project_config import (
     ASSETS_DIR,
     ENV_DIR,
     ENV_NAME,
+    FAILURE_CLASSIFIER_TRIALS,
     FAILURE_EPISODES,
     FAILURE_LINES,
     FAILURE_MAX_STEPS,
-    FAILURE_OUTCOME_STEPS,
+    FAILURE_SEED_START,
     FAILURE_THRESHOLD,
     FORECAST_EPISODES,
     FORECAST_MAX_STEPS,
@@ -36,10 +37,13 @@ from project_config import (
 from src.agent_runtime import build_agent
 from src.failure_forecast import (
     HORIZON_STEPS,
+    LABEL_DISCONNECTION_TEST,
+    LABEL_EPISODE_ENDED,
+    LEGACY_PHASES,
     STEP_MINUTES,
     FailureForecastConfig,
     FailureForecastPredictor,
-    collect_failure_forecast_rows,
+    collect_failure_forecast_phases,
     collect_forecaster_training_data,
     normalize_line_name,
     prepare_classifier_dataframe,
@@ -56,12 +60,12 @@ from src.pipeline_artifacts import (
 )
 
 
-def _make_environment(env_dir: Path) -> Any:
+def _make_environment(env_dir: Path, **make_kwargs: Any) -> Any:
     """Create the configured Grid2Op environment with the production backend."""
     import grid2op
     from lightsim2grid import LightSimBackend
 
-    return grid2op.make(str(env_dir), backend=LightSimBackend())
+    return grid2op.make(str(env_dir), backend=LightSimBackend(), **make_kwargs)
 
 
 def _valid_policy_dir(path: Path) -> bool:
@@ -192,7 +196,7 @@ def _forecast_data_dimensions(
         "seed": int(seed),
         "horizon_steps": int(HORIZON_STEPS),
         "horizon_minutes": int(HORIZON_STEPS * STEP_MINUTES),
-        "forecast_sampling_stride": int(HORIZON_STEPS),
+        "forecast_sampling_stride": 1,
     })
     return dimensions
 
@@ -229,7 +233,7 @@ def _load_forecast_data_cache(
         "seed": int(seed),
         "horizon_steps": int(HORIZON_STEPS),
         "horizon_minutes": int(HORIZON_STEPS * STEP_MINUTES),
-        "forecast_sampling_stride": int(HORIZON_STEPS),
+        "forecast_sampling_stride": 1,
     }
     if metadata.get("stage") != "forecast_data":
         return None, "forecast data provenance has the wrong stage"
@@ -262,7 +266,7 @@ def _load_forecast_data_cache(
     for key, actual in actual_dimensions.items():
         if recorded_dimensions.get(key) != actual:
             return None, f"forecast data provenance has incompatible {key}"
-    return (X, y, episode_ids), "compatible hourly-stratified t+12 forecast data"
+    return (X, y, episode_ids), "compatible every-step t+12 forecast data"
 
 
 def _validate_rows(
@@ -284,15 +288,13 @@ def _validate_rows(
             f"collection produced {sorted(labels)}."
         )
     row_lines = list(dict.fromkeys(str(row["line_disconnected"]) for row in rows))
-    # Only lines that were really attacked in the historical episodes have rows.
+    # Only the configured lines are disconnected in the forced-disconnection test.
     if expected_lines is not None and not set(row_lines) <= {str(line) for line in expected_lines}:
         raise RuntimeError(f"Failure rows contain unconfigured lines: {row_lines}.")
-    allowed_reasons = {"blackout_after_attack", "survived_after_attack"}
+    allowed_reasons = {LABEL_DISCONNECTION_TEST, LABEL_EPISODE_ENDED}
     label_reasons = {str(row.get("label_reason", "")) for row in rows}
     if not label_reasons <= allowed_reasons:
-        raise RuntimeError(
-            f"Unexpected label reasons (unknown outcomes must be skipped): {label_reasons}"
-        )
+        raise RuntimeError(f"Unexpected label reasons: {label_reasons}")
     return {
         "rows": len(rows),
         "lines": len(row_lines),
@@ -381,6 +383,7 @@ def _validate_inference(
             mean_model,
             aleatoric_model,
             cfg,
+            env=env,
         )
     finally:
         env.close()
@@ -402,7 +405,8 @@ def run_full_forecasting(
     forecast_max_steps: int = FORECAST_MAX_STEPS,
     failure_max_steps: int = FAILURE_MAX_STEPS,
     mean_trials: int = FORECAST_MEAN_TRIALS,
-    outcome_steps: int = FAILURE_OUTCOME_STEPS,
+    classifier_trials: int = FAILURE_CLASSIFIER_TRIALS,
+    failure_seed_start: int = FAILURE_SEED_START,
     lines: Sequence[str] | None = None,
     threshold: float = FAILURE_THRESHOLD,
     seed: int = SEED,
@@ -422,8 +426,8 @@ def run_full_forecasting(
         raise ValueError("forecast_episodes and failure_episodes must be positive.")
     if int(mean_trials) < 0:
         raise ValueError("mean_trials must be zero or positive.")
-    if int(outcome_steps) <= 0:
-        raise ValueError("outcome_steps must be positive.")
+    if int(classifier_trials) < 0:
+        raise ValueError("classifier_trials must be zero or positive.")
     if not 0.0 <= float(threshold) <= 1.0:
         raise ValueError("threshold must be between zero and one.")
 
@@ -456,9 +460,10 @@ def run_full_forecasting(
     print(f"  environment       : {ENV_NAME} ({env_dir})")
     print(f"  agent             : {agent_name}")
     print(f"  forecast episodes : {forecast_episodes}")
-    print(f"  forecast cadence  : every {HORIZON_STEPS} steps, offset rotated by episode")
+    print("  forecast cadence  : every step (legacy), target t+12")
     print(f"  mean trials       : {mean_trials}")
-    print(f"  failure episodes  : {failure_episodes}")
+    print(f"  classifier trials : {classifier_trials}")
+    print(f"  failure episodes  : {failure_episodes} x {len(LEGACY_PHASES)} phases")
     print(f"  forecast max steps: {forecast_limit or 'full episode'}")
     print(f"  failure max steps : {failure_limit or 'full episode'}")
     print(f"  reuse forecast data: {bool(reuse_forecast_data)}")
@@ -516,7 +521,7 @@ def run_full_forecasting(
                 episodes=int(forecast_episodes),
                 seed=int(seed),
                 max_steps=forecast_limit,
-                sampling_stride=HORIZON_STEPS,
+                sampling_stride=1,
                 return_episode_ids=True,
                 progress_callback=forecast_progress,
             )
@@ -576,10 +581,11 @@ def run_full_forecasting(
         },
     )
 
-    print("\n[4/6] Collect failure rows from historical agent episodes")
+    print("\n[4/6] Collect forced-disconnection failure rows (legacy phases)")
     env = _make_environment(env_dir)
     progress = tqdm(
-        total=int(failure_episodes), desc="Failure rows", unit="episode"
+        total=int(failure_episodes) * len(LEGACY_PHASES),
+        desc="Failure rows", unit="episode",
     )
     try:
         agent = _make_agent(env, agent_factory, policy_agent_dir)
@@ -593,21 +599,24 @@ def run_full_forecasting(
         )
 
         def failure_progress(_episode: int, steps: int, stats: Any) -> None:
-            progress.update(1)
+            progress.n = stats["episodes"]
             progress.set_postfix(
                 last_steps=steps, samples=stats["rows"], pos=stats["positive"],
-                neg=stats["negative"], events=stats["attack_events"], refresh=False,
+                neg=stats["negative"], points=stats["sample_points"], refresh=False,
             )
+            progress.refresh()
 
-        rows, collection_stats = collect_failure_forecast_rows(
+        def make_phase_env(**kwargs: Any) -> Any:
+            return _make_environment(env_dir, **kwargs)
+
+        rows, collection_stats = collect_failure_forecast_phases(
             agent,
-            env,
+            make_phase_env,
             mean_model,
             aleatoric_model,
             cfg,
             episodes=int(failure_episodes),
-            seed=int(seed),
-            outcome_steps=int(outcome_steps),
+            seed=int(failure_seed_start),
             max_steps=failure_limit,
             progress_callback=failure_progress,
         )
@@ -643,6 +652,7 @@ def run_full_forecasting(
         seed=int(seed),
         env_name=ENV_NAME,
         agent_name=agent_name,
+        n_trials=int(classifier_trials),
     )
     write_provenance(
         provenance_path(paths["failure_classifier"]),
@@ -666,14 +676,15 @@ def run_full_forecasting(
     print(
         f"[split] {split['strategy']} "
         f"train_episodes={split['train_episodes']} "
+        f"val_episodes={split['val_episodes']} "
         f"test_episodes={split['test_episodes']}"
     )
     label_reason_counts = classifier_info["label_reason_counts"]
     print(f"[labels] {label_reason_counts}")
-    observed_failures = int(label_reason_counts.get("blackout_after_attack", 0))
+    observed_failures = int(classifier_info["label_counts"].get("1", 0))
     if observed_failures < 20:
         print(
-            f"[limitation] only {observed_failures} observed agent failures were "
+            f"[limitation] only {observed_failures} failure rows were "
             "collected; collect more episodes before relying on the classifier."
         )
 

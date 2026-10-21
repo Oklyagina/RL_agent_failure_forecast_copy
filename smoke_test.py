@@ -24,7 +24,7 @@ SMOKE = {
     "FORECAST_MEAN_TRIALS": "1",
     "FAILURE_EPISODES": "2",
     "FAILURE_MAX_STEPS": "500",
-    "FAILURE_OUTCOME_STEPS": "12",
+    "FAILURE_CLASSIFIER_TRIALS": "2",
 }
 os.environ.update(SMOKE)
 

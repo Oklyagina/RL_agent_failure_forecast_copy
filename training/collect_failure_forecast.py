@@ -1,4 +1,4 @@
-"""Collect labeled one-hour-ahead failure rows from historical agent episodes."""
+"""Collect labeled forced-disconnection failure rows (legacy procedure, t+12)."""
 from __future__ import annotations
 
 import logging
@@ -18,8 +18,9 @@ import project_config as config  # noqa: E402
 from run_example import load_enn_uncertainty  # noqa: E402
 from src.agent_runtime import build_agent  # noqa: E402
 from src.failure_forecast import (  # noqa: E402
+    LEGACY_PHASES,
     FailureForecastConfig,
-    collect_failure_forecast_rows,
+    collect_failure_forecast_phases,
     write_rows_csv,
 )
 
@@ -69,7 +70,7 @@ def main() -> None:
     configure_quiet_logging()
     env = grid2op.make(str(config.ENV_DIR), backend=LightSimBackend())
     progress = tqdm(
-        total=config.FAILURE_EPISODES,
+        total=config.FAILURE_EPISODES * len(LEGACY_PHASES),
         desc="Collecting failure rows",
         unit="episode",
     )
@@ -94,29 +95,31 @@ def main() -> None:
         enn, uncertainty_fn = load_enn_uncertainty()
 
         def update(_episode: int, steps: int, stats) -> None:
-            progress.update(1)
+            progress.n = stats["episodes"]
             progress.set_postfix(
                 last_steps=steps,
                 samples=stats["rows"],
                 pos=stats["positive"],
                 neg=stats["negative"],
-                events=stats["attack_events"],
+                points=stats["sample_points"],
                 refresh=False,
             )
+            progress.refresh()
 
-        rows, stats = collect_failure_forecast_rows(
+        def make_env(**kwargs):
+            return grid2op.make(str(config.ENV_DIR), backend=LightSimBackend(), **kwargs)
+
+        rows, stats = collect_failure_forecast_phases(
             agent,
-            env,
+            make_env,
             mean_model,
             aleatoric_model,
             cfg,
             episodes=config.FAILURE_EPISODES,
-            seed=config.SEED,
-            outcome_steps=config.FAILURE_OUTCOME_STEPS,
+            seed=config.FAILURE_SEED_START,
             max_steps=config.FAILURE_MAX_STEPS or None,
             model_enn=enn,
             get_uncertainty_fn=uncertainty_fn,
-            perfect_forecast=config.FAILURE_PERFECT_FORECAST_BENCHMARK,
             progress_callback=update,
         )
     finally:
@@ -126,15 +129,10 @@ def main() -> None:
     print("[labels] " + ", ".join(f"{key}={value}" for key, value in sorted(stats.items())))
     if stats["positive"] == 0 or stats["negative"] == 0:
         raise SystemExit(
-            "Need both observed failures (1) and survivals (0); collect more "
-            "episodes or steps. No unknown outcome is ever labeled 0."
+            "Need both failures (1) and survivals (0) after the forced line "
+            "disconnection; collect more episodes or steps."
         )
-    default_name = (
-        "failure_forecast_rows_perfect_forecast.csv"
-        if config.FAILURE_PERFECT_FORECAST_BENCHMARK
-        else "failure_forecast_rows.csv"
-    )
-    output_csv = configured_output_dir() / default_name
+    output_csv = configured_output_dir() / "failure_forecast_rows.csv"
     count = write_rows_csv(rows, output_csv)
     print(f"[ok] wrote {count} rows -> {output_csv}")
 
