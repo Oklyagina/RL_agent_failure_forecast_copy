@@ -1,127 +1,170 @@
-"""Synthetic checks for the active failure-forecast module.
+"""Synthetic checks for the legacy-logic failure-forecast module (t+12 horizon).
 
 Run with:
-    python tests/test_failure_forecast.py
+    python -m pytest tests/test_failure_forecast.py
 """
 from __future__ import annotations
 
-import datetime as dt
+import copy
+import datetime
 import sys
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 import numpy as np
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.failure_forecast import (  # noqa: E402
     CLASSIFIER_FEATURES,
+    HORIZON_STEPS,
+    LABEL_DISCONNECTION_TEST,
+    LABEL_EPISODE_ENDED,
+    LEGACY_PHASES,
     FailureForecastConfig,
     FailureForecastPredictor,
+    _fit_multioutput_with_progress,
+    _classifier_risk,
+    _fixed_tuning_indices,
+    _split_classifier_rows,
+    build_forecast_pairs,
+    collect_failure_forecast_phases,
     collect_failure_forecast_rows,
+    collect_forecaster_training_data,
+    forecast_injections,
     get_features_with_history,
     prepare_classifier_dataframe,
-    run_t12_forecast,
+    run_historical_episode,
     train_failure_classifier,
+    train_mean_forecaster,
 )
 
-
-class FakeAction:
-    def __init__(self, kind="noop", line_id=None):
-        self.kind = kind
-        self.line_id = line_id
-
-    def to_vect(self):
-        code = {"noop": 0, "disconnect": 1, "agent": 2}[self.kind]
-        return np.asarray([code, -1 if self.line_id is None else self.line_id], dtype=np.float32)
-
-
-class FakeActionSpace:
-    def __call__(self, payload):
-        if not payload:
-            return FakeAction()
-        status = payload["set_line_status"]
-        if isinstance(status, list):
-            line_id = int(status[0][0])
-        else:
-            line_id = int(np.flatnonzero(np.asarray(status) == -1)[0])
-        return FakeAction("disconnect", line_id)
+LINE_NAMES = ["line_ok", "line_bad", "line_trip"]
+START = datetime.datetime(2020, 1, 1)
 
 
 class FakeObs:
-    def __init__(self, step=0, *, attacked=False):
+    """Observation whose injections encode the step, so alignment is checkable."""
+
+    gen_v = np.asarray([1.0], dtype=np.float32)
+
+    def __init__(self, step, line_status):
+        self.step = step
         self.current_step = step
-        self.max_step = 100
         self.load_p = np.asarray([10.0 + step], dtype=np.float32)
         self.load_q = np.asarray([2.0 + step], dtype=np.float32)
         self.gen_p = np.asarray([20.0 + step], dtype=np.float32)
-        self.gen_q = np.asarray([3.0], dtype=np.float32)
-        self.gen_v = np.asarray([142.0], dtype=np.float32)
-        self.rho = np.asarray([0.40, 0.96 if attacked else 0.50], dtype=np.float32)
+        self.rho = np.asarray([0.4, 0.5, 0.97], dtype=np.float32)
+        self.line_status = np.asarray(line_status, dtype=bool)
         self.day = 7
         self.hour_of_day = 10
         self.minute_of_hour = 5
         self.day_of_week = 2
         self._forecasted_inj = []
-        self.attacked = attacked
 
     def to_vect(self):
-        return np.asarray([self.current_step, *self.rho], dtype=np.float32)
-
-    def copy(self):
-        copied = FakeObs(self.current_step, attacked=self.attacked)
-        copied._forecasted_inj = list(self._forecasted_inj)
-        return copied
+        return np.asarray([self.step, *self.rho], dtype=np.float32)
 
     def get_time_stamp(self):
-        return dt.datetime(2026, 1, 1, self.hour_of_day, self.minute_of_hour)
+        return START + datetime.timedelta(minutes=5 * self.step)
+
+    def copy(self):
+        return copy.copy(self)
 
     def simulate(self, action):
-        if action.kind == "noop":
-            obs = FakeObs(self.current_step + 12)
-            obs._forecasted_inj = list(self._forecasted_inj)
-            return obs, 0.0, False, {"exception": []}
-        if action.kind == "disconnect":
-            return FakeObs(self.current_step + 1, attacked=True), 0.0, False, {"exception": []}
-        if action.kind == "agent":
-            return FakeObs(self.current_step + 1, attacked=True), 0.0, True, {
-                "exception": [RuntimeError("blackout")]
-            }
-        raise AssertionError(action.kind)
+        """Powerflow stand-in: the state takes the injected t+12 injections."""
+        del action
+        injection = self._forecasted_inj[1][1]["injection"]
+        sim = FakeObs(self.step + 1, self.line_status)
+        sim.load_p = np.asarray(injection["load_p"], dtype=np.float32)
+        sim.load_q = np.asarray(injection["load_q"], dtype=np.float32)
+        sim.gen_p = np.asarray(injection["prod_p"], dtype=np.float32)
+        sim.rho = np.asarray([0.5, 0.6, 0.99], dtype=np.float32)
+        return sim, 0.0, False, {}
 
 
 class FakeEnv:
-    action_space = FakeActionSpace()
+    """Scripted episode with copy() and forced line disconnection.
+
+    ``fragile`` lines blackout the grid when forcibly disconnected;
+    ``trips`` maps step -> line ids that go down by themselves.  The episode
+    ends with a blackout at ``blackout_at`` or naturally at ``natural_end``.
+    ``forced_at`` records the step at which a disconnection was forced.
+    """
+
     reward_range = (0.0, 1.0)
     n_load = 1
     n_gen = 1
-    n_line = 2
     gen_pmin = np.asarray([0.0])
     gen_pmax = np.asarray([50.0])
-    name_line = ["line_ok", "line_bad"]
+    name_line = LINE_NAMES
+
+    def __init__(self, fragile=(), trips=None, blackout_at=None, natural_end=None):
+        self.fragile = set(fragile)
+        self.trips = trips or {}
+        self.blackout_at = blackout_at
+        self.natural_end = natural_end
+        self.t = 0
+        self.down = set()
+        self.forced_at = []
+        self.closed = False
+
+    def action_space(self, content):
+        return dict(content)
+
+    def copy(self):
+        clone = copy.copy(self)
+        clone.down = set(self.down)
+        return clone
+
+    def close(self):
+        self.closed = True
 
     def reset(self, seed=None):
-        del seed
-        self.step_count = 0
-        return FakeObs(0)
+        self.t = 0
+        self.down = set()
+        return FakeObs(0, [True] * 3)
 
     def step(self, action):
-        del action
-        self.step_count += 1
-        return FakeObs(self.step_count), 0.0, self.step_count >= 14, {"exception": []}
+        self.t += 1
+        self.down.update(self.trips.get(self.t, []))
+        done, info = False, {"exception": []}
+        forced = action.get("set_line_status", []) if isinstance(action, dict) else []
+        for line_id, _ in forced:
+            self.forced_at.append(self.t)
+            self.down.add(line_id)
+            if line_id in self.fragile:
+                done, info["exception"] = True, [RuntimeError("blackout")]
+        if self.t == self.blackout_at:
+            done, info["exception"] = True, [RuntimeError("blackout")]
+        elif self.t == self.natural_end:
+            done = True
+        status = [i not in self.down for i in range(3)]
+        return FakeObs(self.t, status), 0.0, done, info
 
 
 class FakeAgent:
+    def __init__(self):
+        self.resets = 0
+
+    def reset(self, obs):
+        self.resets += 1
+
     def act(self, obs, reward=0.0, done=False):
-        del obs, reward, done
-        return FakeAction("agent")
+        return "noop"
 
 
-class FakeMeanModel:
+class RecordingMeanModel:
+    def __init__(self):
+        self.inputs = []
+
     def predict(self, rows):
         assert len(rows) == 1
+        self.inputs.append(np.asarray(rows[0]))
         return np.asarray([[11.0, 4.0, 99.0]], dtype=np.float32)
 
 
@@ -131,100 +174,420 @@ class FakeAleatoricModel:
         return np.log1p(np.asarray([[1.0, 4.0, 9.0]], dtype=np.float32))
 
 
-def _cfg():
+class RecordingClassifier:
+    classes_ = np.asarray([0, 1])
+
+    def __init__(self):
+        self.rows = []
+
+    def predict_proba(self, rows):
+        self.rows.append(rows.copy())
+        return np.asarray([[0.25, 0.75]], dtype=float)
+
+
+def make_cfg(lines=("line_bad",)):
     return FailureForecastConfig.from_env(
-        FakeEnv(),
-        env_name="fake_grid",
-        agent_name="curriculum",
-        artifact_dir=Path("unused"),
-        lines_to_test=["line_bad"],
+        FakeEnv(), env_name="fake", agent_name="agent",
+        artifact_dir=Path("unused"), lines_to_test=list(lines),
     )
 
 
-def _check_history_features_and_forecast_injection():
-    obs = FakeObs(2016)
-    observations = [FakeObs(i) for i in range(2017)]
-    x = get_features_with_history(observations, obs)
-    assert x.shape == (19,)
-    assert x[0] == obs.load_p[0]
-    assert x[3] == observations[2004].load_p[0]
-    assert x[6] == observations[1728].load_p[0]
-    assert x[9] == observations[0].load_p[0]
-
-    forecast = run_t12_forecast(
-        FakeEnv(), obs, observations, FakeMeanModel(), FakeAleatoricModel(), _cfg()
-    )
-    assert forecast["predicted_gen_p"][0] == 50.0
-    injections = forecast["forecast_obs"]._forecasted_inj
-    assert len(injections) == 2
-    assert injections[1][0] - injections[0][0] == dt.timedelta(minutes=60)
-    assert injections[1][1]["injection"]["prod_p"][0] == 50.0
-    assert forecast["aleatoric_gen_p_mean"] > forecast["aleatoric_load_p_mean"]
+def collect(env, lines=("line_bad",), **kwargs):
+    kwargs.setdefault("episodes", 1)
+    mean_model = kwargs.pop("mean_model", RecordingMeanModel())
+    rows, stats = collect_failure_forecast_rows(
+        FakeAgent(), env, mean_model, FakeAleatoricModel(), make_cfg(lines), **kwargs)
+    return rows, stats, mean_model
 
 
-def _check_collection_labels_agent_response_blackout():
-    rows = collect_failure_forecast_rows(
-        FakeEnv(),
-        FakeAgent(),
-        FakeMeanModel(),
-        FakeAleatoricModel(),
-        _cfg(),
-        episodes=1,
-        sampling_stride=12,
-        max_steps=13,
-    )
-    assert len(rows) == 1
-    assert rows[0]["failed"] == 1
-    assert rows[0]["label_reason"] == "agent_action_blackout"
-    assert rows[0]["line_disconnected"] == "line_bad"
+class ForecastPairTests(unittest.TestCase):
+    def test_pairs_are_twelve_steps_apart(self):
+        observations = [FakeObs(i, [True] * 3) for i in range(40)]
+        X, y = build_forecast_pairs(observations, stride=12, offset=0)
+        self.assertEqual(HORIZON_STEPS, 12)
+        self.assertEqual(X.shape, (3, 19))
+        self.assertEqual(y.shape, (3, 3))
+        for row, (origin, target) in enumerate(zip(X[:, 0], y[:, 0])):
+            self.assertEqual(target - origin, 12)
+            self.assertEqual(y[row, 2], origin + 22)  # gen_p = 20 + (t + 12), origin = 10 + t
+        self.assertEqual(list(X[:, 0] - 10), [0, 12, 24])
+
+    def test_every_step_is_a_forecast_origin_with_stride_one(self):
+        observations = [FakeObs(i, [True] * 3) for i in range(30)]
+        X, y = build_forecast_pairs(observations, stride=1, offset=0)
+        self.assertEqual(len(X), 30 - HORIZON_STEPS)
+        np.testing.assert_array_equal(y[:, 0] - X[:, 0], np.full(len(X), 12.0))
+
+    def test_short_episode_gives_no_pairs(self):
+        observations = [FakeObs(i, [True] * 3) for i in range(12)]
+        X, _ = build_forecast_pairs(observations, stride=12, offset=0)
+        self.assertEqual(len(X), 0)
+
+    def test_collection_defaults_to_every_step_and_never_crosses_episodes(self):
+        X, y, episode_ids = collect_forecaster_training_data(
+            FakeEnv(natural_end=30), FakeAgent(), episodes=3, return_episode_ids=True)
+        self.assertEqual(len(X), 3 * (30 - HORIZON_STEPS))
+        for x_row, y_row in zip(X, y):
+            self.assertEqual(y_row[0] - x_row[0], 12)
+            self.assertLessEqual(y_row[0] - 10, 29)  # last valid observation
+        self.assertEqual(sorted(set(episode_ids.tolist())), [0, 1, 2])
+
+    def test_history_features_use_only_the_past(self):
+        observations = [FakeObs(i, [True] * 3) for i in range(2017)]
+        x = get_features_with_history(observations)
+        self.assertEqual(x[0], observations[2016].load_p[0])
+        self.assertEqual(x[3], observations[2004].load_p[0])
+        self.assertEqual(x[6], observations[1728].load_p[0])
+        self.assertEqual(x[9], observations[0].load_p[0])
+        early = get_features_with_history(observations[:5])
+        self.assertTrue(np.isnan(early[3:12]).all())
 
 
-def _check_classifier_metadata_and_prediction_round_trip():
-    import pandas as pd
+class EpisodeTraceTests(unittest.TestCase):
+    def test_blackout_episode_excludes_invalid_final_observation(self):
+        trace = run_historical_episode(FakeEnv(blackout_at=20), FakeAgent(), seed=0)
+        self.assertTrue(trace.ended_in_blackout)
+        self.assertEqual(len(trace.observations), 20)
 
-    rows = []
-    for i in range(30):
-        line = "line_bad" if i % 2 else "line_ok"
-        failed = 1 if i >= 15 else 0
-        row = {
-            "line_disconnected": line,
-            "failed": failed,
-        }
-        for j, feature in enumerate(CLASSIFIER_FEATURES):
-            if feature in {"line_id_encoded", "load_gen_ratio"}:
-                continue
-            row[feature] = float(i + j)
-        rows.append(row)
-    df = prepare_classifier_dataframe(pd.DataFrame(rows))
+    def test_natural_end_is_not_a_blackout(self):
+        trace = run_historical_episode(FakeEnv(natural_end=20), FakeAgent(), seed=0)
+        self.assertFalse(trace.ended_in_blackout)
 
-    with TemporaryDirectory() as raw_tmp:
-        model_path = Path(raw_tmp) / "failure_classifier.pkl"
-        _, info = train_failure_classifier(
-            df,
-            model_path=model_path,
-            threshold=0.4,
-            seed=0,
-            env_name="fake_grid",
-            agent_name="curriculum",
-            max_iter=20,
+    def test_agent_is_reset_with_first_observation(self):
+        agent = FakeAgent()
+        run_historical_episode(FakeEnv(natural_end=5), agent, seed=0)
+        self.assertEqual(agent.resets, 1)
+
+
+class LabelTests(unittest.TestCase):
+    def test_survived_forced_disconnection_is_negative(self):
+        rows, stats, _ = collect(FakeEnv(natural_end=80))
+        self.assertEqual([r["step"] for r in rows], [20, 40, 60])
+        self.assertEqual({(r["failed"], r["label_reason"]) for r in rows},
+                         {(0, LABEL_DISCONNECTION_TEST)})
+        self.assertEqual((stats["positive"], stats["negative"]), (0, 3))
+        self.assertEqual(stats["sample_points"], 3)
+
+    def test_fragile_line_blackout_after_forced_disconnection_is_positive(self):
+        rows, stats, _ = collect(FakeEnv(fragile={1}, natural_end=80))
+        self.assertEqual({(r["failed"], r["label_reason"]) for r in rows},
+                         {(1, LABEL_DISCONNECTION_TEST)})
+        self.assertEqual(stats["positive"], 3)
+
+    def test_disconnection_is_forced_at_t_plus_12(self):
+        env = FakeEnv(natural_end=80)
+        collect(env)
+        # copies share the log: origin 20/40/60 -> 12 agent steps + the forced step
+        self.assertEqual(env.forced_at, [33, 53, 73])
+    def test_episode_ended_before_t12_labels_every_line_failed(self):
+        rows, stats, _ = collect(FakeEnv(blackout_at=25),
+                                 lines=("line_ok", "line_bad"))
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({(r["failed"], r["label_reason"]) for r in rows},
+                         {(1, LABEL_EPISODE_ENDED)})
+        self.assertEqual(stats["blackout_episodes"], 1)
+
+    def test_lines_down_at_t_are_skipped(self):
+        rows, _, _ = collect(FakeEnv(trips={15: [1]}, natural_end=80),
+                             lines=("line_ok", "line_bad"))
+        self.assertEqual({r["line_disconnected"] for r in rows}, {"line_ok"})
+
+    def test_sampling_only_after_min_step_every_sample_every(self):
+        rows, _, _ = collect(FakeEnv(natural_end=100), sample_every=10, min_step=12)
+        self.assertEqual([r["step"] for r in rows], [20, 30, 40, 50, 60, 70, 80, 90])
+
+    def test_row_carries_phase_episode_and_horizon(self):
+        rows, _, _ = collect(FakeEnv(natural_end=80), phase="HeavyAttack_1", seed=700)
+        row = rows[0]
+        self.assertEqual(row["phase"], "HeavyAttack_1")
+        self.assertEqual(row["episode"], 700)
+        self.assertEqual(row["horizon_steps"], 12)
+        self.assertEqual(row["horizon_minutes"], 60)
+        self.assertEqual(row["event_step"] - row["step"], HORIZON_STEPS)
+
+    def test_stats_and_progress_callback(self):
+        calls = []
+        _, stats, _ = collect(
+            FakeEnv(blackout_at=25), episodes=2,
+            progress_callback=lambda ep, steps, st: calls.append((ep, steps, st["rows"])))
+        self.assertEqual(stats["episodes"], 2)
+        self.assertEqual(calls, [(0, 25, 1), (1, 25, 2)])
+
+
+class PhaseTests(unittest.TestCase):
+    def test_every_legacy_phase_is_collected_with_its_env_kwargs(self):
+        self.assertEqual([name for name, _ in LEGACY_PHASES],
+                         ["Standard", "HeavyAttack_1", "HeavyAttack_2"])
+        made = []
+
+        def make_env(**kwargs):
+            made.append(kwargs)
+            return FakeEnv(natural_end=40)
+
+        with mock.patch("src.failure_forecast.opponent_env_kwargs",
+                        side_effect=lambda lines, cooldown: {"cooldown": cooldown}):
+            rows, stats = collect_failure_forecast_phases(
+                FakeAgent(), make_env, RecordingMeanModel(), FakeAleatoricModel(),
+                make_cfg(), episodes=1, seed=700)
+        self.assertEqual(made, [{}, {"cooldown": 288}, {"cooldown": 128}])
+        self.assertEqual([r["phase"] for r in rows],
+                         ["Standard", "HeavyAttack_1", "HeavyAttack_2"])
+        self.assertEqual({r["episode"] for r in rows}, {700})
+        self.assertEqual(stats["episodes"], 3)
+
+
+class RowConstructionTests(unittest.TestCase):
+    def setUp(self):
+        self.rows, _, self.mean_model = collect(FakeEnv(natural_end=80))
+
+    def test_features_cover_the_legacy_set(self):
+        row = self.rows[0]
+        for feature in CLASSIFIER_FEATURES:
+            if feature != "line_id_encoded":
+                self.assertIn(feature, row)
+        self.assertEqual(len(CLASSIFIER_FEATURES), 21)
+
+    def test_no_future_leakage_and_forecast_comes_from_the_simulation(self):
+        row = self.rows[0]
+        origin = row["step"]
+        self.assertEqual(self.mean_model.inputs[0][0], 10.0 + origin)
+        self.assertEqual(row["sum_gen_p"], 20.0 + origin)
+        self.assertEqual(row["max_line_rho"], np.float32(0.97))
+        self.assertEqual(row["fcast_sum_gen_p"], 50.0)  # forecast, clipped, via simulate
+        self.assertAlmostEqual(row["fcast_max_line_rho"], 0.99, places=5)
+        self.assertEqual(row["fcast_nb_rho_ge_0.95"], 1)
+        self.assertTrue(np.isnan(row["epistemic_after"]))
+
+    def test_features_do_not_change_when_the_future_changes(self):
+        trace = run_historical_episode(FakeEnv(natural_end=80), FakeAgent(), 0)
+        origin = 18
+        before = get_features_with_history(trace.observations[: origin + 1])
+        for obs in trace.observations[origin + 1:]:
+            obs.load_p = obs.load_p * 1000
+        after = get_features_with_history(trace.observations[: origin + 1])
+        np.testing.assert_array_equal(before, after)
+
+
+class ForecastTests(unittest.TestCase):
+    def test_forecast_shapes_and_clipping(self):
+        observations = [FakeObs(i, [True] * 3) for i in range(20)]
+        forecast = forecast_injections(
+            observations, RecordingMeanModel(), FakeAleatoricModel(), make_cfg())
+        self.assertEqual(forecast["load_p"].shape, (1,))
+        self.assertEqual(forecast["gen_p"][0], 50.0)
+        self.assertGreater(forecast["aleatoric_gen_p_mean"], forecast["aleatoric_load_p_mean"])
+        self.assertTrue(np.isnan(forecast["epistemic_before"]))
+
+    def test_enn_requires_an_uncertainty_function(self):
+        observations = [FakeObs(0, [True] * 3)]
+        with self.assertRaises(ValueError):
+            forecast_injections(observations, RecordingMeanModel(), FakeAleatoricModel(),
+                                make_cfg(), model_enn=object())
+
+
+class PredictorTests(unittest.TestCase):
+    def make_predictor(self, classifier=None):
+        metadata = {"features": CLASSIFIER_FEATURES,
+                    "line_map": {"ok": 0, "bad": 1}, "decision_threshold": 0.5}
+        return FailureForecastPredictor(classifier or RecordingClassifier(), metadata)
+
+    def predict_many(self, predictor, obs, history, lines, cfg=None, mean_model=None):
+        return predictor.predict_many(
+            obs, history, lines, mean_model or RecordingMeanModel(),
+            FakeAleatoricModel(), cfg or make_cfg(lines), env=FakeEnv())
+
+    def test_inference_matches_training_features(self):
+        rows, _, _ = collect(FakeEnv(natural_end=80))
+        trace = run_historical_episode(FakeEnv(natural_end=80), FakeAgent(), 0)
+        history = trace.observations[: rows[0]["step"] + 1]
+        classifier = RecordingClassifier()
+        predictor = self.make_predictor(classifier)
+        predictions = self.predict_many(predictor, history[-1], history, ["line_bad"])
+        self.assertEqual(predictions, [{
+            "line": "line_bad", "failure_prediction": 1, "failure_probability": 0.75}])
+        used = classifier.rows[0]
+        self.assertEqual(list(used.columns), CLASSIFIER_FEATURES)
+        training = predictor.features_from_row(rows[0])
+        pd.testing.assert_frame_equal(used.reset_index(drop=True), training, check_dtype=False)
+
+    def test_one_forecast_serves_all_lines_and_skips_disconnected_ones(self):
+        mean_model = RecordingMeanModel()
+        obs = FakeObs(30, [True, True, False])
+        predictions = self.predict_many(
+            self.make_predictor(), obs, [obs], ["line_ok", "line_bad"], mean_model=mean_model)
+        self.assertEqual([p["line"] for p in predictions], ["line_ok", "line_bad"])
+        self.assertEqual(len(mean_model.inputs), 1)
+        obs_down = FakeObs(30, [True, False, True])
+        self.assertEqual(
+            self.predict_many(self.make_predictor(), obs_down, [obs_down], ["line_bad"]), [])
+
+    def test_unknown_line_raises(self):
+        obs = FakeObs(30, [True] * 3)
+        with self.assertRaises(ValueError):
+            self.predict_many(self.make_predictor(), obs, [obs], ["line_trip"])
+
+    def test_history_must_end_with_current_observation(self):
+        obs = FakeObs(30, [True] * 3)
+        with self.assertRaises(ValueError):
+            self.predict_many(self.make_predictor(), obs, [FakeObs(29, [True] * 3)],
+                              ["line_bad"])
+
+    def test_missing_feature_and_old_artifacts_are_rejected(self):
+        predictor = self.make_predictor()
+        with self.assertRaises(ValueError):
+            predictor.features_from_row({"line_disconnected": "line_bad"})
+        with self.assertRaises(ValueError):
+            FailureForecastPredictor(RecordingClassifier(), {"features": ["old"]})
+
+
+class ForecasterTrainingTests(unittest.TestCase):
+    @staticmethod
+    def arrays():
+        rng = np.random.default_rng(7)
+        X = rng.normal(size=(60, 4)).astype(np.float32)
+        y = rng.normal(size=(60, 2)).astype(np.float32)
+        episode_ids = np.repeat(np.arange(6), 10)
+        return X, y, episode_ids
+
+    def test_checkpoint_survives_failed_final_fit_and_skips_retuning(self):
+        X, y, episode_ids = self.arrays()
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            params_path = directory / "mean_forecaster_best_params.json"
+            model_path = directory / "mean_forecaster.pkl"
+
+            def fail_only_full_fit(*args, **kwargs):
+                if len(args[1]) == len(X):
+                    raise RuntimeError("simulated full-fit failure")
+                return _fit_multioutput_with_progress(*args, **kwargs)
+
+            with mock.patch(
+                "src.failure_forecast._fit_multioutput_with_progress",
+                side_effect=fail_only_full_fit,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated"):
+                    train_mean_forecaster(
+                        X,
+                        y,
+                        model_path=model_path,
+                        n_trials=1,
+                        max_subsample=20,
+                        seed=3,
+                        episode_ids=episode_ids,
+                        native_threads=1,
+                        best_params_path=params_path,
+                    )
+            self.assertTrue(params_path.is_file())
+            self.assertFalse(model_path.exists())
+
+            with mock.patch(
+                "optuna.create_study",
+                side_effect=AssertionError("Optuna must not run on resume"),
+            ):
+                model = train_mean_forecaster(
+                    X,
+                    y,
+                    model_path=model_path,
+                    n_trials=1,
+                    max_subsample=20,
+                    seed=3,
+                    episode_ids=episode_ids,
+                    native_threads=1,
+                    best_params_path=params_path,
+                )
+            self.assertEqual(len(model.estimators_), y.shape[1])
+            self.assertTrue(model_path.is_file())
+
+    def test_progress_fit_limits_openmp_and_blas_threads(self):
+        from sklearn.ensemble import HistGradientBoostingRegressor
+
+        X, y, _ = self.arrays()
+        limiter = mock.MagicMock()
+        limiter.return_value.__enter__.return_value = None
+        with mock.patch("threadpoolctl.threadpool_limits", limiter):
+            model = _fit_multioutput_with_progress(
+                HistGradientBoostingRegressor(max_iter=2),
+                X,
+                y,
+                native_threads=4,
+                description="test",
+            )
+        self.assertEqual(len(model.estimators_), 2)
+        self.assertIn(
+            mock.call(limits=4, user_api="openmp"), limiter.call_args_list
         )
-        predictor = FailureForecastPredictor.load(model_path, info["metadata_path"])
-        out = predictor.predict_from_features(df.iloc[-1].to_dict())
-        assert set(out) == {"failure_prediction", "failure_probability"}
-        assert out["failure_prediction"] in {0, 1}
-        assert 0.0 <= out["failure_probability"] <= 1.0
-        assert predictor.metadata["environment"] == "fake_grid"
+        self.assertIn(mock.call(limits=1, user_api="blas"), limiter.call_args_list)
 
 
-class FailureForecastTests(unittest.TestCase):
-    def test_history_features_and_forecast_injection(self):
-        _check_history_features_and_forecast_injection()
+class ClassifierTests(unittest.TestCase):
+    @staticmethod
+    def synthetic_rows(episodes=20, per_episode=4):
+        rng = np.random.default_rng(0)
+        rows = []
+        for episode in range(episodes):
+            for _ in range(per_episode):
+                failed = int(episode % 2 == 0)
+                row = {name: float(rng.normal()) + failed for name in CLASSIFIER_FEATURES
+                       if name not in ("line_id_encoded", "load_gen_ratio")}
+                row.update({
+                    "episode": episode, "line_disconnected": "line_bad",
+                    "failed": failed, "label_reason": LABEL_DISCONNECTION_TEST,
+                })
+                rows.append(row)
+        return pd.DataFrame(rows)
 
-    def test_collection_labels_agent_response_blackout(self):
-        _check_collection_labels_agent_response_blackout()
+    def test_legacy_risk_weights_oversights_more(self):
+        self.assertAlmostEqual(_classifier_risk(np.array([0, 0, 1, 1]),
+                                                np.array([1, 0, 0, 1])), 50.0)
+        self.assertAlmostEqual(_classifier_risk(np.array([0, 0, 1, 1]),
+                                                np.array([1, 0, 1, 1])), 20.0)
+        self.assertAlmostEqual(_classifier_risk(np.array([0, 0, 1, 1]),
+                                                np.array([0, 0, 0, 1])), 30.0)
 
-    def test_classifier_metadata_and_prediction_round_trip(self):
-        _check_classifier_metadata_and_prediction_round_trip()
+    def test_train_with_optuna_save_and_reload_round_trip(self):
+        df = prepare_classifier_dataframe(self.synthetic_rows())
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "failure_classifier.pkl"
+            _, info = train_failure_classifier(
+                df, model_path=path, seed=1, n_trials=2, n_jobs=1)
+            self.assertEqual(info["features"], CLASSIFIER_FEATURES)
+            self.assertEqual(info["label_counts"], {"1": 40, "0": 40})
+            self.assertEqual(info["forecast_horizon_steps"], 12)
+            self.assertEqual(info["optuna"]["n_trials"], 2)
+            self.assertIn("class_weight", info["model_params"])
+            self.assertEqual(info["split"]["strategy"], "episode_grouped")
+            predictor = FailureForecastPredictor.load(path)
+            result = predictor.predict_from_features(self.synthetic_rows().iloc[0].to_dict())
+            self.assertIn(result["failure_prediction"], (0, 1))
+            self.assertTrue(0.0 <= result["failure_probability"] <= 1.0)
+
+    def test_zero_trials_uses_fixed_parameters(self):
+        df = prepare_classifier_dataframe(self.synthetic_rows())
+        with TemporaryDirectory() as tmp:
+            _, info = train_failure_classifier(
+                df, model_path=Path(tmp) / "c.pkl", seed=1, n_trials=0)
+            self.assertIsNone(info["optuna"]["best_risk"])
+
+    def test_split_is_70_15_15_and_keeps_episodes_apart(self):
+        df = prepare_classifier_dataframe(self.synthetic_rows())
+        X_train, X_val, X_test, _, _, _, groups, info = _split_classifier_rows(df, seed=3)
+        sets = [set(df.loc[X.index, "episode"]) for X in (X_train, X_val, X_test)]
+        self.assertFalse(sets[0] & sets[1] or sets[0] & sets[2] or sets[1] & sets[2])
+        self.assertEqual(set(groups), sets[0])
+        self.assertEqual(info["strategy"], "episode_grouped")
+        self.assertEqual((info["train_episodes"], info["val_episodes"], info["test_episodes"]),
+                         (14, 3, 3))
+
+    def test_missing_columns_are_rejected(self):
+        with self.assertRaises(ValueError):
+            prepare_classifier_dataframe(
+                self.synthetic_rows().drop(columns=["fcast_max_line_rho"]))
+
+    def test_tuning_split_is_episode_disjoint(self):
+        episode_ids = np.repeat(np.arange(10), 5)
+        train_idx, val_idx = _fixed_tuning_indices(
+            len(episode_ids), episode_ids, max_subsample=100, seed=0)
+        self.assertFalse(set(episode_ids[train_idx]) & set(episode_ids[val_idx]))
 
 
 if __name__ == "__main__":

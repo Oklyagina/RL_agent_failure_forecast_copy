@@ -39,8 +39,15 @@ Run the local example:
 python run_example.py
 ```
 
-The original `run_pipeline.py` workflow is archived under
-`archive/legacy/old_version/` and is not part of the active training path.
+To run all active ENN and failure-forecast training stages from `.env`, use:
+
+```bash
+python run_pipeline.py
+```
+
+The original pipeline implementation is archived under
+`archive/legacy/old_version/`; the root `run_pipeline.py` is the active
+orchestrator.
 
 ## Rollout Collection
 
@@ -151,13 +158,44 @@ live Grid2Op environment.
 A live Grid2Op validation requires the target environment dataset, active agent
 assets, trained ENN artifacts, and the pinned Grid2Op/LightSim dependency stack.
 
+For a small end-to-end pipeline check that writes only to `artifacts_smoke/`,
+run:
+
+```bash
+python smoke_test.py
+```
+
+The smoke test uses short runs and adds clearly marked synthetic positive rows
+only when the tiny sample does not contain both classifier labels.
+
 ## Failure Forecasting
 
-The active module-only failure forecast predicts whether the configured RL agent
-will fail one hour ahead after a candidate line disconnection. It ports the
-legacy archive forecast path: historical t/1h/1d/1w features, t+12 mean and
-aleatoric forecasters, `_forecasted_inj` power-flow simulation, and HGB failure
-classification.
+The failure forecast estimates whether the configured RL agent will fail if a
+candidate line is lost one hour ahead. Forecast inputs contain the current,
+1-hour, 1-day, and 1-week grid values plus time features. Collection keeps
+every step as a forecast origin (legacy behaviour) and pairs each origin with
+its actual `t+12` injections (12 five-minute Grid2Op steps = one hour). The
+resulting `forecast_X.npy`, `forecast_y.npy`, and `forecast_episode_ids.npy`
+files support an episode-separated tuning split for the mean forecaster.
+
+Classifier rows follow the legacy forced-disconnection procedure. The agent
+plays episodes in three phases (`Standard`, `HeavyAttack_1` with opponent
+cooldown 288, `HeavyAttack_2` with cooldown 128) using seeds starting at
+`FAILURE_SEED_START`. At every step with `step > 12` and `step % 20 == 0`, the
+`t+12` injections are forecast and fed to one do-nothing power flow (the
+`fcast_*` features and `epistemic_after`); the agent then plays 12 steps in a
+copy of the environment, and each configured connected line is forcibly
+disconnected at `t+12` in a further copy. The label is 1 when that step ends
+the episode (`done`), and 1 for every line when the episode ended before
+`t+12`. The 21 classifier features and the Optuna search (`FAILURE_CLASSIFIER_TRIALS`
+trials, risk = 0.4 x false-alarm % + 0.6 x oversight %) follow the legacy
+classifier; the train/validation/test split and the cross-validation folds are
+grouped by episode so no episode leaks across sets.
+
+Runtime does not execute the agent or the forced-disconnection simulation: it
+forecasts the injections, runs one do-nothing power flow with them (hence the
+`env` argument of the predictor) and builds the same features for each
+requested, currently connected line represented in the classifier metadata.
 
 Run the full pipeline:
 
@@ -173,25 +211,38 @@ python training/run_failure_forecast_pipeline.py \
 Train the mean and aleatoric forecast models:
 
 ```bash
-python training/train_failure_forecasters.py \
+python training/train_mean_and_aleatoric.py \
   --agent-artifact-dir artifacts/<ENV_NAME>/<AGENT_NAME> \
   --episodes 50
 ```
 
+Mean-forecaster tuning is checkpointed in
+`mean_forecaster_best_params.json` before the full-data fit. A rerun resumes
+from those parameters when the model is missing. Output models are fitted
+sequentially by default with four native HGB threads; the default environment
+has 96 outputs, while other environments may differ. Configure
+`FORECAST_HGB_THREADS` when the server has different CPU limits. Existing mean
+and aleatoric models are reused when possible. Use `--force-retune` to ignore
+both reusable models and the tuning checkpoint and retrain both forecasters.
+
 Collect rows:
 
 ```bash
-python training/collect_failure_forecast.py \
-  --mean-model artifacts/<ENV_NAME>/<AGENT_NAME>/failure_forecast/mean_forecaster.pkl \
-  --aleatoric-model artifacts/<ENV_NAME>/<AGENT_NAME>/failure_forecast/aleatoric_forecaster.pkl \
-  --episodes 50 \
-  --lines line_a,line_b
+python training/collect_failure_forecast.py
 ```
+
+The collector reads its settings from `.env`. Configure `FAILURE_EPISODES`,
+`FAILURE_MAX_STEPS`, `FAILURE_SEED_START`, `FAILURE_CLASSIFIER_TRIALS`,
+`FAILURE_LINES`, and the other
+`FAILURE_*` values there. By default it loads the forecasters and writes the
+collected rows under
+`artifacts/<ENV_NAME>/<AGENT_NAME>/failure_forecast`; set
+`FAILURE_FORECAST_DIR` to override that directory.
 
 Train the classifier:
 
 ```bash
-python training/train_failure_forecast.py
+python training/train_faillure_classifyer.py
 ```
 
 Smoke-test one prediction:
@@ -203,8 +254,32 @@ python training/predict_failure_forecast.py \
   --line line_a
 ```
 
+`--line` accepts a comma-separated list. Omit it to predict all lines stored in
+the classifier metadata. Each returned item contains the line name, failure
+probability, and thresholded binary prediction.
+
+For the production failure-forecast bundle, configure `.env` and run the
+in-process trainer:
+
+```bash
+python forecaster_full_training_pipeline.py
+```
+
+This script collects and validates genuine `t -> t+12` pairs, trains both
+forecasters and the classifier, reopens the saved bundle, and checks per-line
+inference.
+
 Artifacts are written under:
 
 ```text
 artifacts/<ENV_NAME>/<AGENT_NAME>/failure_forecast/
+|-- forecast_X.npy
+|-- forecast_y.npy
+|-- forecast_episode_ids.npy
+|-- mean_forecaster_best_params.json
+|-- mean_forecaster.pkl
+|-- aleatoric_forecaster.pkl
+|-- failure_forecast_rows.csv
+|-- failure_classifier.pkl
+`-- failure_classifier_metadata.json
 ```

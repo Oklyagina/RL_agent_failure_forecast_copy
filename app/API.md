@@ -64,16 +64,14 @@ Output — a list of recommendation dictionaries. ENN uncertainty is exposed as
 ]
 ```
 
-## Two things to confirm before deployment
+## Deployment notes
 
-1. **`efficiency_of_the_reco` / description.** These come from the helper
-   `get_parade_info(action, obs)`, provided on the ExpertAgent side by
-   **ExpertOp4Grid** (installed in the ExpertAgent container). `app/main.py`
-   tries to import it (`app.parade`, `parade`, `expertop4grid`); wire the exact
-   import there, or drop the helper into the repo as `app/parade.py`. Until
-   then, `efficiency_of_the_reco` is `null` for the platform to fill and the
-   description is a plain serialisation — the uncertainty percentiles are added
-   on top either way.
+1. **`efficiency_of_the_reco` / description.** The vendored `app/parade.py`
+   formatter provides the InteractiveAI title, description, action payload, and
+   simulated maximum line loading in `efficiency_of_the_reco`. If that formatter
+   cannot produce a recommendation, `app/main.py` falls back to plain action
+   serialization and leaves `efficiency_of_the_reco` as `null`. ENN uncertainty
+   fields are merged into either result.
 
 2. **Environment / Grid2Op alignment.** The API uses `project_config.py`:
    environment variables override `.env`, and `.env` overrides the defaults.

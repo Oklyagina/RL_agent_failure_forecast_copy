@@ -37,13 +37,16 @@ DEFAULTS = {
     "ENN_VAL_FRAC": "0.1",
 
 #============= Failure forecast defaults =================#
-    "FORECAST_EPISODES": "50",
+    "FORECAST_EPISODES": "900",
     "FORECAST_MAX_STEPS": "0",
-    "FORECAST_MEAN_TRIALS": "20",
-    "FAILURE_EPISODES": "50",
+    "FORECAST_MEAN_TRIALS": "50",
+    "FORECAST_HGB_THREADS": "4",
+    "FAILURE_EPISODES": "100",
     "FAILURE_MAX_STEPS": "0",
-    "FAILURE_SAMPLING_STRIDE": "20",
-    "FAILURE_LINES": "",
+    "FAILURE_SEED_START": "700",
+    "FAILURE_CLASSIFIER_TRIALS": "500",
+    "FAILURE_LINES": "62_58_180,62_63_160,48_50_136,48_53_141,41_48_131,39_41_121,43_44_125,44_45_126,34_35_110,54_58_154",
+    "FAILURE_FORECAST_DIR": "",
     "FAILURE_THRESHOLD": "0.5",
 
     "EXAMPLE_N_STEPS": "5",
@@ -79,8 +82,27 @@ def get_float(name: str) -> float:
     return float(get_config(name))
 
 
+def get_bool(name: str) -> bool:
+    value = get_config(name).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value, got {value!r}")
+
+
 def get_path(name: str) -> Path:
     path = Path(get_config(name))
+    if path.is_absolute():
+        return path
+    return ROOT / path
+
+
+def get_optional_path(name: str) -> Path | None:
+    value = get_config(name).strip()
+    if not value:
+        return None
+    path = Path(value)
     if path.is_absolute():
         return path
     return ROOT / path
@@ -105,6 +127,18 @@ def configure_grid2op_warnings() -> None:
         message=r"We found either some slack coefficient to be < 0\. or they were all 0\.We set them all to 1\.0 to avoid such issues",
         category=UserWarning,
         module=r"lightsim2grid\.gridmodel\.from_pandapower\._aux_add_slack",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"divide by zero encountered in divide",
+        category=RuntimeWarning,
+        module=r"grid2op\.Backend\.backend",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"invalid value encountered in multiply",
+        category=RuntimeWarning,
+        module=r"grid2op\.Backend\.backend",
     )
 
 
@@ -139,10 +173,13 @@ ENN_VAL_FRAC = get_float("ENN_VAL_FRAC")
 FORECAST_EPISODES = get_int("FORECAST_EPISODES")
 FORECAST_MAX_STEPS = get_int("FORECAST_MAX_STEPS")
 FORECAST_MEAN_TRIALS = get_int("FORECAST_MEAN_TRIALS")
+FORECAST_HGB_THREADS = get_int("FORECAST_HGB_THREADS")
 FAILURE_EPISODES = get_int("FAILURE_EPISODES")
 FAILURE_MAX_STEPS = get_int("FAILURE_MAX_STEPS")
-FAILURE_SAMPLING_STRIDE = get_int("FAILURE_SAMPLING_STRIDE")
+FAILURE_SEED_START = get_int("FAILURE_SEED_START")
+FAILURE_CLASSIFIER_TRIALS = get_int("FAILURE_CLASSIFIER_TRIALS")
 FAILURE_LINES = get_config("FAILURE_LINES")
+FAILURE_FORECAST_DIR = get_optional_path("FAILURE_FORECAST_DIR")
 FAILURE_THRESHOLD = get_float("FAILURE_THRESHOLD")
 
 EXAMPLE_N_STEPS = get_int("EXAMPLE_N_STEPS")

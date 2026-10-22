@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -10,7 +11,21 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from project_config import AGENT_NAME, ARTIFACTS_DIR, ASSETS_DIR, ENV_DIR, ENV_NAME, SEED  # noqa: E402
+from project_config import (  # noqa: E402
+    AGENT_NAME,
+    ARTIFACTS_DIR,
+    ASSETS_DIR,
+    ENV_DIR,
+    ENV_NAME,
+    FAILURE_CLASSIFIER_TRIALS,
+    FAILURE_EPISODES,
+    FAILURE_LINES,
+    FAILURE_SEED_START,
+    FAILURE_THRESHOLD,
+    FORECAST_EPISODES,
+    FORECAST_MEAN_TRIALS,
+    SEED,
+)
 
 
 def default_agent_artifact_dir(agent_name: str) -> Path:
@@ -30,11 +45,19 @@ def split_lines(raw: str | None) -> list[str]:
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
-def stage(number: int, total: int, name: str, command: list[str]) -> None:
+def stage(
+    number: int,
+    total: int,
+    name: str,
+    command: list[str],
+    *,
+    environment: dict[str, str] | None = None,
+) -> None:
     """Print and run one pipeline stage using the current Python interpreter."""
     print(f"\n=== [{number}/{total}] {name} ===")
     print(" ".join(command))
-    subprocess.run(command, cwd=ROOT, check=True)
+    process_env = None if environment is None else {**os.environ, **environment}
+    subprocess.run(command, cwd=ROOT, check=True, env=process_env)
 
 
 def main() -> None:
@@ -43,15 +66,21 @@ def main() -> None:
     parser.add_argument("--env-dir", type=Path, default=ENV_DIR)
     parser.add_argument("--agent-artifact-dir", type=Path, default=None)
     parser.add_argument("--policy-agent-dir", type=Path, default=None)
-    parser.add_argument("--episodes", type=int, default=50)
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=None,
+        help="legacy shared override for both forecast and failure episodes",
+    )
     parser.add_argument("--forecast-episodes", type=int, default=None)
     parser.add_argument("--failure-episodes", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--sampling-stride", type=int, default=20)
-    parser.add_argument("--lines", default=None)
+    parser.add_argument("--seed-start", type=int, default=FAILURE_SEED_START)
+    parser.add_argument("--trials", type=int, default=FAILURE_CLASSIFIER_TRIALS)
+    parser.add_argument("--lines", default=FAILURE_LINES or None)
     parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--mean-trials", type=int, default=20)
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--mean-trials", type=int, default=FORECAST_MEAN_TRIALS)
+    parser.add_argument("--threshold", type=float, default=FAILURE_THRESHOLD)
     parser.add_argument("--reuse-forecast-data", action="store_true")
     parser.add_argument("--skip-forecasters", action="store_true")
     parser.add_argument("--skip-row-collection", action="store_true")
@@ -59,6 +88,17 @@ def main() -> None:
     parser.add_argument("--smoke-line", default=None)
     parser.add_argument("--skip-smoke", action="store_true")
     args = parser.parse_args()
+
+    forecast_episodes = (
+        args.forecast_episodes
+        if args.forecast_episodes is not None
+        else args.episodes if args.episodes is not None else FORECAST_EPISODES
+    )
+    failure_episodes = (
+        args.failure_episodes
+        if args.failure_episodes is not None
+        else args.episodes if args.episodes is not None else FAILURE_EPISODES
+    )
 
     agent_artifacts = args.agent_artifact_dir or default_agent_artifact_dir(args.agent_name)
     policy_dir = args.policy_agent_dir or default_policy_dir()
@@ -75,8 +115,8 @@ def main() -> None:
     print(f"  agent_artifacts  : {agent_artifacts}")
     print(f"  policy_agent_dir : {policy_dir}")
     print(f"  output           : {out_dir}")
-    print(f"  forecast episodes: {args.forecast_episodes or args.episodes}")
-    print(f"  failure episodes : {args.failure_episodes or args.episodes}")
+    print(f"  forecast episodes: {forecast_episodes}")
+    print(f"  failure episodes : {failure_episodes}")
     print(f"  lines            : {args.lines or 'all env lines'}")
     print(f"  smoke line       : {smoke_line or 'skipped'}")
 
@@ -92,12 +132,12 @@ def main() -> None:
     if not args.skip_forecasters:
         cmd = [
             sys.executable,
-            "training/train_failure_forecasters.py",
+            "training/train_mean_and_aleatoric.py",
             "--env-dir", str(args.env_dir),
             "--agent-name", args.agent_name,
             "--agent-artifact-dir", str(agent_artifacts),
             "--policy-agent-dir", str(policy_dir),
-            "--episodes", str(args.forecast_episodes or args.episodes),
+            "--episodes", str(forecast_episodes),
             "--seed", str(args.seed),
             "--mean-trials", str(args.mean_trials),
         ]
@@ -109,32 +149,33 @@ def main() -> None:
         current += 1
 
     if not args.skip_row_collection:
-        cmd = [
-            sys.executable,
-            "training/collect_failure_forecast.py",
-            "--agent-name", args.agent_name,
-            "--episodes", str(args.failure_episodes or args.episodes),
-            "--seed", str(args.seed),
-            "--sampling-stride", str(args.sampling_stride),
-            "--mean-model", str(mean_model),
-            "--aleatoric-model", str(aleatoric_model),
-            "--output-csv", str(rows_csv),
-        ]
-        if args.max_steps is not None:
-            cmd.extend(["--max-steps", str(args.max_steps)])
-        if args.lines:
-            cmd.extend(["--lines", args.lines])
-        stage(current, total, "Collect failure-forecast rows", cmd)
+        collector_env = {
+            "AGENT_NAME": args.agent_name,
+            "FAILURE_EPISODES": str(failure_episodes),
+            "FAILURE_FORECAST_DIR": str(out_dir),
+            "FAILURE_LINES": args.lines or "",
+            "FAILURE_MAX_STEPS": str(args.max_steps or 0),
+            "FAILURE_SEED_START": str(args.seed_start),
+            "SEED": str(args.seed),
+        }
+        stage(
+            current,
+            total,
+            "Collect failure-forecast rows",
+            [sys.executable, "training/collect_failure_forecast.py"],
+            environment=collector_env,
+        )
         current += 1
 
     if not args.skip_classifier:
         cmd = [
             sys.executable,
-            "training/train_failure_forecast.py",
+            "training/train_faillure_classifyer.py",
             "--agent-name", args.agent_name,
             "--input-csv", str(rows_csv),
             "--model-path", str(classifier),
             "--threshold", str(args.threshold),
+            "--trials", str(args.trials),
             "--seed", str(args.seed),
         ]
         stage(current, total, "Train failure classifier", cmd)

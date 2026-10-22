@@ -1,7 +1,6 @@
-"""Collect one-hour-ahead line-contingency failure-forecast rows."""
+"""Collect labeled forced-disconnection failure rows (legacy procedure, t+12)."""
 from __future__ import annotations
 
-import argparse
 import logging
 import sys
 from pathlib import Path
@@ -15,44 +14,47 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from project_config import (  # noqa: E402
-    AGENT_FACTORY,
-    AGENT_NAME,
-    ARTIFACTS_DIR,
-    ASSETS_DIR,
-    ENV_DIR,
-    ENV_NAME,
-    SEED,
-    configure_grid2op_warnings,
-)
+import project_config as config  # noqa: E402
+from run_example import load_enn_uncertainty  # noqa: E402
 from src.agent_runtime import build_agent  # noqa: E402
 from src.failure_forecast import (  # noqa: E402
+    LEGACY_PHASES,
     FailureForecastConfig,
-    collect_failure_forecast_rows,
+    collect_failure_forecast_phases,
     write_rows_csv,
 )
 
 
 def default_output_dir(agent_name: str) -> Path:
     """Return the standard artifact folder for collected failure rows."""
-    return ARTIFACTS_DIR / ENV_NAME / agent_name / "failure_forecast"
+    return config.ARTIFACTS_DIR / config.ENV_NAME / agent_name / "failure_forecast"
+
+
+def configured_output_dir() -> Path:
+    """Return the configured failure-forecast artifact directory."""
+    return config.FAILURE_FORECAST_DIR or default_output_dir(config.AGENT_NAME)
 
 
 def _default_agent_path() -> Path:
     """Find the runnable CurriculumAgent package used when no factory is set."""
-    for path in (ASSETS_DIR / ENV_NAME, ASSETS_DIR / "network36"):
+    for path in (
+        config.ASSETS_DIR / config.ENV_NAME,
+        config.ASSETS_DIR / "network36",
+    ):
         if (path / "model").is_dir() and (path / "actions").is_dir():
             return path
-    return ASSETS_DIR / ENV_NAME
+    return config.ASSETS_DIR / config.ENV_NAME
 
 
 def _parse_lines(raw: str | None, env) -> list:
-    """Parse CLI line ids/names, defaulting to every line known by Grid2Op."""
+    """Parse configured line ids/names, defaulting to all Grid2Op lines."""
     if raw:
         return [part.strip() for part in raw.split(",") if part.strip()]
     names = getattr(env, "name_line", None)
     if names is None:
-        raise ValueError("--lines is required when env.name_line is unavailable.")
+        raise ValueError(
+            "FAILURE_LINES must be set when env.name_line is unavailable."
+        )
     return list(names)
 
 
@@ -64,64 +66,73 @@ def configure_quiet_logging() -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--agent-name", default=AGENT_NAME)
-    parser.add_argument("--agent-factory", default=AGENT_FACTORY or None)
-    parser.add_argument("--episodes", type=int, default=50)
-    parser.add_argument("--seed", type=int, default=SEED)
-    parser.add_argument("--sampling-stride", type=int, default=20)
-    parser.add_argument("--max-steps", type=int, default=None)
-    parser.add_argument("--lines", default=None,
-                        help="comma-separated line names/ids; default: all env lines")
-    parser.add_argument("--mean-model", type=Path, required=True)
-    parser.add_argument("--aleatoric-model", type=Path, required=True)
-    parser.add_argument("--output-csv", type=Path, default=None)
-    args = parser.parse_args()
-
-    configure_grid2op_warnings()
+    config.configure_grid2op_warnings()
     configure_quiet_logging()
-    env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
-    progress = tqdm(total=args.episodes, desc="Collecting failure rows", unit="episode")
+    env = grid2op.make(str(config.ENV_DIR), backend=LightSimBackend())
+    progress = tqdm(
+        total=config.FAILURE_EPISODES * len(LEGACY_PHASES),
+        desc="Collecting failure rows",
+        unit="episode",
+    )
     try:
-        spec = args.agent_factory or None
+        spec = config.AGENT_FACTORY or None
         agent = build_agent(
             env,
             factory_spec=spec,
             agent_path=None if spec else _default_agent_path(),
         )
-        lines = _parse_lines(args.lines, env)
-        out_dir = default_output_dir(args.agent_name)
+        lines = _parse_lines(config.FAILURE_LINES or None, env)
+        out_dir = configured_output_dir()
         cfg = FailureForecastConfig.from_env(
             env,
-            env_name=ENV_NAME,
-            agent_name=args.agent_name,
+            env_name=config.ENV_NAME,
+            agent_name=config.AGENT_NAME,
             artifact_dir=out_dir,
             lines_to_test=lines,
         )
-        mean_model = joblib.load(args.mean_model)
-        aleatoric_model = joblib.load(args.aleatoric_model)
+        mean_model = joblib.load(out_dir / "mean_forecaster.pkl")
+        aleatoric_model = joblib.load(out_dir / "aleatoric_forecaster.pkl")
+        enn, uncertainty_fn = load_enn_uncertainty()
 
-        def update(_episode: int, steps: int, total_rows: int) -> None:
-            progress.update(1)
-            progress.set_postfix(last_steps=steps, total_rows=total_rows, refresh=False)
+        def update(_episode: int, steps: int, stats) -> None:
+            progress.n = stats["episodes"]
+            progress.set_postfix(
+                last_steps=steps,
+                samples=stats["rows"],
+                pos=stats["positive"],
+                neg=stats["negative"],
+                points=stats["sample_points"],
+                refresh=False,
+            )
+            progress.refresh()
 
-        rows = collect_failure_forecast_rows(
-            env,
+        def make_env(**kwargs):
+            return grid2op.make(str(config.ENV_DIR), backend=LightSimBackend(), **kwargs)
+
+        rows, stats = collect_failure_forecast_phases(
             agent,
+            make_env,
             mean_model,
             aleatoric_model,
             cfg,
-            episodes=args.episodes,
-            seed=args.seed,
-            sampling_stride=args.sampling_stride,
-            max_steps=args.max_steps,
+            episodes=config.FAILURE_EPISODES,
+            seed=config.FAILURE_SEED_START,
+            max_steps=config.FAILURE_MAX_STEPS or None,
+            model_enn=enn,
+            get_uncertainty_fn=uncertainty_fn,
             progress_callback=update,
         )
     finally:
         progress.close()
         env.close()
 
-    output_csv = args.output_csv or (default_output_dir(args.agent_name) / "failure_forecast_rows.csv")
+    print("[labels] " + ", ".join(f"{key}={value}" for key, value in sorted(stats.items())))
+    if stats["positive"] == 0 or stats["negative"] == 0:
+        raise SystemExit(
+            "Need both failures (1) and survivals (0) after the forced line "
+            "disconnection; collect more episodes or steps."
+        )
+    output_csv = configured_output_dir() / "failure_forecast_rows.csv"
     count = write_rows_csv(rows, output_csv)
     print(f"[ok] wrote {count} rows -> {output_csv}")
 

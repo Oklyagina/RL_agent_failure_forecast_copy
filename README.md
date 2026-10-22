@@ -53,16 +53,21 @@ artifacts/<ENV_NAME>/<AGENT_NAME>/
 environment/<ENV_NAME>
 ```
 
-Create `.env` as described in [Configuration](#configuration), then run the
-end-to-end example:
-
-```bash
-python run_example.py
-```
+### Main Scripts
+- `python smoke_test.py`: run every training stage with a tiny configuration
+  under `artifacts_smoke/`, leaving normal artifacts untouched. This verifies
+  integration, not model quality; if the tiny failure dataset contains only
+  one class, the test may add explicitly marked synthetic failure rows.
+- `python run_pipeline.py`: use `.env` settings to collect training data and
+  train all ENN and failure-forecast artifacts. Valid artifacts are reused, and
+  selected stages can be forced when needed.
+- `python run_example.py`: load pretrained artifacts and demonstrate live
+  recommendation uncertainty plus multi-line, one-hour-ahead failure
+  forecasting. This command requires existing artifacts and does not train
+  models.
 
 The workflow uses:
 
-- `run_pipeline.py` to run data collection and model training.
 - `training/collect_rollouts.py` and `training/train_enn.py` for ENN training.
 - `recommendation_uncertainty.py` to score an agent's selected action.
 - `app/main.py` to serve recommendations and KPIs through FastAPI.
