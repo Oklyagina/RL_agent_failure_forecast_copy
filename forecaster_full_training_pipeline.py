@@ -559,6 +559,7 @@ def run_full_forecasting(
         n_trials=int(mean_trials),
         seed=int(seed),
         episode_ids=episode_ids,
+        n_jobs=6
     )
 
     print("\n[3/6] Train aleatoric injection forecaster")
@@ -567,6 +568,7 @@ def run_full_forecasting(
         y,
         mean_model,
         model_path=paths["aleatoric_forecaster"],
+
     )
     write_provenance(
         provenance_path(paths["mean_forecaster"]),
