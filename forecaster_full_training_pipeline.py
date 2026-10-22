@@ -29,6 +29,7 @@ from project_config import (
     FAILURE_SEED_START,
     FAILURE_THRESHOLD,
     FORECAST_EPISODES,
+    FORECAST_HGB_THREADS,
     FORECAST_MAX_STEPS,
     FORECAST_MEAN_TRIALS,
     SEED,
@@ -40,24 +41,20 @@ from src.failure_forecast import (
     LABEL_DISCONNECTION_TEST,
     LABEL_EPISODE_ENDED,
     LEGACY_PHASES,
+    MEAN_BEST_PARAMS_FILENAME,
     STEP_MINUTES,
     FailureForecastConfig,
     FailureForecastPredictor,
     collect_failure_forecast_phases,
     collect_forecaster_training_data,
+    load_or_train_forecasters,
     normalize_line_name,
     prepare_classifier_dataframe,
     save_forecaster_training_data,
-    train_aleatoric_forecaster,
     train_failure_classifier,
-    train_mean_forecaster,
     write_rows_csv,
 )
-from src.pipeline_artifacts import (
-    mark_provenance_stale,
-    provenance_path,
-    write_provenance,
-)
+from src.pipeline_artifacts import mark_provenance_stale, provenance_path, write_provenance
 
 
 def _make_environment(env_dir: Path, **make_kwargs: Any) -> Any:
@@ -311,7 +308,13 @@ def _validate_artifacts(
     """Reopen the complete saved bundle and validate its metadata contract."""
     import joblib
 
-    missing = [str(path) for path in paths.values() if not path.is_file()]
+    required = [
+        paths["forecast_X"], paths["forecast_y"],
+        paths["forecast_episode_ids"], paths["mean_forecaster"],
+        paths["aleatoric_forecaster"], paths["failure_rows"],
+        paths["failure_classifier"], paths["classifier_metadata"],
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise FileNotFoundError("Missing forecast artifacts: " + ", ".join(missing))
 
@@ -405,6 +408,7 @@ def run_full_forecasting(
     forecast_max_steps: int = FORECAST_MAX_STEPS,
     failure_max_steps: int = FAILURE_MAX_STEPS,
     mean_trials: int = FORECAST_MEAN_TRIALS,
+    hgb_threads: int = FORECAST_HGB_THREADS,
     classifier_trials: int = FAILURE_CLASSIFIER_TRIALS,
     failure_seed_start: int = FAILURE_SEED_START,
     lines: Sequence[str] | None = None,
@@ -416,6 +420,8 @@ def run_full_forecasting(
     policy_agent_dir: Path | None = None,
     artifact_dir: Path | None = None,
     reuse_forecast_data: bool = True,
+    reuse_forecasters: bool = True,
+    force_mean_retune: bool = False,
 ) -> dict[str, Path]:
     """Train and validate the configured production failure-forecast bundle.
 
@@ -428,6 +434,8 @@ def run_full_forecasting(
         raise ValueError("mean_trials must be zero or positive.")
     if int(classifier_trials) < 0:
         raise ValueError("classifier_trials must be zero or positive.")
+    if int(hgb_threads) <= 0:
+        raise ValueError("hgb_threads must be positive.")
     if not 0.0 <= float(threshold) <= 1.0:
         raise ValueError("threshold must be between zero and one.")
 
@@ -446,6 +454,7 @@ def run_full_forecasting(
         "forecast_y": output_dir / "forecast_y.npy",
         "forecast_episode_ids": output_dir / "forecast_episode_ids.npy",
         "mean_forecaster": output_dir / "mean_forecaster.pkl",
+        "mean_best_params": output_dir / MEAN_BEST_PARAMS_FILENAME,
         "aleatoric_forecaster": output_dir / "aleatoric_forecaster.pkl",
         "failure_rows": output_dir / "failure_forecast_rows.csv",
         "failure_classifier": output_dir / "failure_classifier.pkl",
@@ -462,22 +471,15 @@ def run_full_forecasting(
     print(f"  forecast episodes : {forecast_episodes}")
     print("  forecast cadence  : every step (legacy), target t+12")
     print(f"  mean trials       : {mean_trials}")
+    print("  mean output jobs  : 1 (sequential)")
+    print(f"  HGB threads       : {hgb_threads}")
     print(f"  classifier trials : {classifier_trials}")
     print(f"  failure episodes  : {failure_episodes} x {len(LEGACY_PHASES)} phases")
     print(f"  forecast max steps: {forecast_limit or 'full episode'}")
     print(f"  failure max steps : {failure_limit or 'full episode'}")
     print(f"  reuse forecast data: {bool(reuse_forecast_data)}")
+    print(f"  reuse forecasters : {bool(reuse_forecasters)}")
     print(f"  output            : {output_dir}")
-
-    for stage, primary in (
-        ("forecasters", paths["mean_forecaster"]),
-        ("failure_rows", paths["failure_rows"]),
-        ("failure_classifier", paths["failure_classifier"]),
-    ):
-        mark_provenance_stale(
-            provenance_path(primary), stage, ENV_NAME, agent_name,
-            "full forecasting run scheduled to replace this stage",
-        )
 
     cached_data = None
     cache_reason = "reuse disabled"
@@ -551,24 +553,35 @@ def run_full_forecasting(
         )
         print(f"[data] X={X.shape} y={y.shape}")
 
-    print("\n[2/6] Train mean injection forecaster")
-    mean_model = train_mean_forecaster(
+    expected_bundle_dimensions = {
+        "rows": int(len(X)),
+        "input_dim": int(X.shape[1]),
+        "output_dim": int(y.shape[1]),
+    }
+
+    def mark_forecasters_stale() -> None:
+        mark_provenance_stale(
+            provenance_path(paths["mean_forecaster"]),
+            "forecasters",
+            ENV_NAME,
+            agent_name,
+            "forecaster stage is being resumed or replaced",
+        )
+
+    print("\n[2-3/6] Load or train injection forecasters")
+    mean_model, aleatoric_model, _ = load_or_train_forecasters(
         X,
         y,
-        model_path=paths["mean_forecaster"],
+        episode_ids,
+        mean_path=paths["mean_forecaster"],
+        aleatoric_path=paths["aleatoric_forecaster"],
+        best_params_path=paths["mean_best_params"],
         n_trials=int(mean_trials),
         seed=int(seed),
-        episode_ids=episode_ids,
-        n_jobs=1
-    )
-
-    print("\n[3/6] Train aleatoric injection forecaster")
-    aleatoric_model = train_aleatoric_forecaster(
-        X,
-        y,
-        mean_model,
-        model_path=paths["aleatoric_forecaster"],
-
+        native_threads=int(hgb_threads),
+        reuse=bool(reuse_forecasters),
+        force_retune=bool(force_mean_retune),
+        on_train_start=mark_forecasters_stale,
     )
     write_provenance(
         provenance_path(paths["mean_forecaster"]),
@@ -576,14 +589,17 @@ def run_full_forecasting(
         ENV_NAME,
         agent_name,
         forecast_outputs,
-        {
-            "rows": int(len(X)),
-            "input_dim": int(X.shape[1]),
-            "output_dim": int(y.shape[1]),
-        },
+        expected_bundle_dimensions,
     )
 
     print("\n[4/6] Collect forced-disconnection failure rows (legacy phases)")
+    mark_provenance_stale(
+        provenance_path(paths["failure_rows"]),
+        "failure_rows",
+        ENV_NAME,
+        agent_name,
+        "failure-row collection is starting",
+    )
     env = _make_environment(env_dir)
     progress = tqdm(
         total=int(failure_episodes) * len(LEGACY_PHASES),
@@ -646,6 +662,13 @@ def run_full_forecasting(
     )
 
     print("\n[5/6] Train failure classifier")
+    mark_provenance_stale(
+        provenance_path(paths["failure_classifier"]),
+        "failure_classifier",
+        ENV_NAME,
+        agent_name,
+        "failure-classifier training is starting",
+    )
     dataframe = prepare_classifier_dataframe(paths["failure_rows"])
     _, classifier_info = train_failure_classifier(
         dataframe,

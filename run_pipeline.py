@@ -47,6 +47,7 @@ from project_config import (  # noqa: E402
     FAILURE_SEED_START,
     FAILURE_THRESHOLD,
     FORECAST_EPISODES,
+    FORECAST_HGB_THREADS,
     FORECAST_MAX_STEPS,
     FORECAST_MEAN_TRIALS,
     ROLLOUT_EPISODES,
@@ -59,6 +60,9 @@ from src.pipeline_artifacts import (  # noqa: E402
     mark_provenance_stale,
     provenance_path,
     write_provenance,
+)
+from src.failure_forecast import (  # noqa: E402
+    MEAN_BEST_PARAMS_FILENAME,
 )
 
 
@@ -275,6 +279,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         failures / "mean_forecaster.pkl",
         failures / "aleatoric_forecaster.pkl",
     ]
+    mean_params = failures / MEAN_BEST_PARAMS_FILENAME
     rows_csv = failures / "failure_forecast_rows.csv"
     classifier = failures / "failure_classifier.pkl"
     classifier_meta = failures / "failure_classifier_metadata.json"
@@ -296,6 +301,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
         provenance_path(failures / "mean_forecaster.pkl"),
         ENV_NAME,
         args.agent_name,
+    )
+    tuning_check = StageCheck(
+        ArtifactStatus.REUSABLE if mean_params.is_file() else ArtifactStatus.MISSING,
+        "saved best parameters" if mean_params.is_file() else "checkpoint is missing",
     )
     rows_check = _check_with_validator(
         [rows_csv],
@@ -332,6 +341,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
             ("ENN rollouts", rollout_check, "collect" if collect_rollouts else "reuse"),
             ("ENN bundle", enn_check, "train" if train_enn else "reuse"),
             ("Forecasters", forecast_check, "train" if train_forecasters else "reuse"),
+            (
+                "Mean tuning",
+                tuning_check,
+                "resume full fit" if train_forecasters and tuning_check.reusable
+                else ("tune" if train_forecasters else "keep"),
+            ),
             ("Failure rows", rows_check, "collect" if collect_rows else "reuse"),
             ("Classifier", classifier_check, "train" if train_classifier else "reuse"),
         ],
@@ -427,6 +442,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             "--episodes", str(FORECAST_EPISODES),
             "--seed", str(SEED),
             "--mean-trials", str(FORECAST_MEAN_TRIALS),
+            "--hgb-threads", str(FORECAST_HGB_THREADS),
         ]
         if FORECAST_MAX_STEPS > 0:
             command.extend(["--max-steps", str(FORECAST_MAX_STEPS)])
@@ -434,6 +450,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
             command.extend(["--agent-factory", AGENT_FACTORY])
         if args.reuse_forecast_data:
             command.append("--reuse-data")
+        if force_all or "forecast" in forced:
+            command.append("--force-retune")
         execute(command, verbose=args.verbose)
         _write_stage(
             "forecasters",

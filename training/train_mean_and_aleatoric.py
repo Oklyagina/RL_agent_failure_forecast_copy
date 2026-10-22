@@ -23,16 +23,17 @@ from project_config import (  # noqa: E402
     ENV_NAME,
     FORECAST_EPISODES,
     FORECAST_MAX_STEPS,
+    FORECAST_HGB_THREADS,
     FORECAST_MEAN_TRIALS,
     SEED,
     configure_grid2op_warnings,
 )
 from src.agent_runtime import build_agent  # noqa: E402
 from src.failure_forecast import (  # noqa: E402
+    MEAN_BEST_PARAMS_FILENAME,
     collect_forecaster_training_data,
+    load_or_train_forecasters,
     save_forecaster_training_data,
-    train_aleatoric_forecaster,
-    train_mean_forecaster,
 )
 
 
@@ -105,7 +106,12 @@ def main() -> None:
     )
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--mean-trials", type=int, default=FORECAST_MEAN_TRIALS)
+    parser.add_argument("--hgb-threads", type=int, default=FORECAST_HGB_THREADS)
     parser.add_argument("--max-subsample", type=int, default=5000)
+    parser.add_argument(
+        "--force-retune", action="store_true",
+        help="ignore compatible models and saved Optuna parameters",
+    )
     parser.add_argument("--reuse-data", action="store_true",
                         help=(
                             "reuse forecast_X.npy, forecast_y.npy, and "
@@ -122,6 +128,7 @@ def main() -> None:
     x_path = out_dir / "forecast_X.npy"
     y_path = out_dir / "forecast_y.npy"
     episode_ids_path = out_dir / "forecast_episode_ids.npy"
+    best_params_path = out_dir / MEAN_BEST_PARAMS_FILENAME
 
     print("Failure forecaster training")
     print(f"  env_dir       : {args.env_dir}")
@@ -130,6 +137,8 @@ def main() -> None:
     print(f"  output        : {out_dir}")
     print(f"  episodes      : {args.episodes}")
     print(f"  mean_trials   : {args.mean_trials}")
+    print("  mean_jobs     : 1 (sequential)")
+    print(f"  hgb_threads   : {args.hgb_threads}")
     print("  sample cadence: every step (legacy), target t+12")
 
     if (
@@ -185,19 +194,21 @@ def main() -> None:
         save_forecaster_training_data(out_dir, X, y, episode_ids)
         print(f"[data] wrote X={X.shape} y={y.shape} -> {out_dir}")
 
-    print_stage(2, 3, "Training mean forecaster")
-
-    mean_model = train_mean_forecaster(
+    print_stage(2, 3, "Load or train mean forecaster")
+    _, _, changed = load_or_train_forecasters(
         X,
         y,
-        model_path=mean_path,
+        episode_ids,
+        mean_path=mean_path,
+        aleatoric_path=aleatoric_path,
+        best_params_path=best_params_path,
         n_trials=args.mean_trials,
         max_subsample=args.max_subsample,
         seed=args.seed,
-        episode_ids=episode_ids,
+        native_threads=args.hgb_threads,
+        force_retune=args.force_retune,
     )
-    print_stage(3, 3, "Training aleatoric forecaster")
-    train_aleatoric_forecaster(X, y, mean_model, model_path=aleatoric_path)
+    print_stage(3, 3, "Forecasters ready" if changed else "Reused forecasters")
     print(f"[ok] wrote mean forecaster -> {mean_path}")
     print(f"[ok] wrote aleatoric forecaster -> {aleatoric_path}")
 

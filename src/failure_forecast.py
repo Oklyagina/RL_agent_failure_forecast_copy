@@ -22,6 +22,8 @@ from __future__ import annotations
 import csv
 import datetime
 import json
+import os
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +44,7 @@ DEFAULT_SEED_START = 700
 MIN_GROUPED_EPISODES = 6
 LABEL_DISCONNECTION_TEST = "forced_disconnection_at_t12"
 LABEL_EPISODE_ENDED = "episode_ended_before_t12"
+MEAN_BEST_PARAMS_FILENAME = "mean_forecaster_best_params.json"
 
 # Legacy simulation phases: (name, opponent attack cooldown or None = env default).
 LEGACY_PHASES: Tuple[Tuple[str, Optional[int]], ...] = (
@@ -796,6 +799,103 @@ def _fixed_tuning_indices(
     return np.asarray(train_idx, dtype=int), np.asarray(validation_idx, dtype=int)
 
 
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _atomic_joblib_dump(value: Any, path: Path) -> None:
+    import joblib
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        joblib.dump(value, temporary)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _load_best_params(path: Path, seed: int) -> Optional[Dict[str, Any]]:
+    """Load a completed tuning result; invalid files simply trigger retuning."""
+    if not path.is_file():
+        return None
+    try:
+        params = json.loads(path.read_text(encoding="utf-8"))["best_params"]
+        params.update({"early_stopping": True, "random_state": int(seed)})
+        return params
+    except (OSError, KeyError, AttributeError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _load_model(path: str | Path) -> Optional[Any]:
+    import joblib
+
+    if not Path(path).is_file():
+        return None
+    try:
+        return joblib.load(path)
+    except Exception:
+        return None
+
+
+def _fit_multioutput_with_progress(
+    base_estimator: Any,
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    native_threads: int,
+    description: str,
+    show_progress: bool = True,
+) -> Any:
+    """Fit independent outputs with completion progress and bounded threads."""
+    from sklearn.base import clone
+    from sklearn.multioutput import MultiOutputRegressor
+    from threadpoolctl import threadpool_limits
+    from tqdm import tqdm
+
+    if int(native_threads) <= 0:
+        raise ValueError("native_threads must be positive")
+    output_count = int(y.shape[1])
+    if show_progress:
+        print(
+            f"[{description}] rows={len(X)} outputs={output_count} "
+            f"output_jobs=1 hgb_threads={native_threads}",
+            flush=True,
+        )
+
+    fitted = []
+    started = time.perf_counter()
+    with tqdm(
+        total=output_count, desc=f"[{description}] outputs",
+        unit="output", disable=not show_progress,
+    ) as bar:
+        for index in range(output_count):
+            estimator = clone(base_estimator)
+            with threadpool_limits(limits=int(native_threads), user_api="openmp"):
+                with threadpool_limits(limits=1, user_api="blas"):
+                    estimator.fit(X, y[:, index])
+            fitted.append(estimator)
+            bar.update(1)
+            bar.set_postfix(
+                avg=f"{(time.perf_counter() - started) / (index + 1):.1f}s/output",
+                refresh=False,
+            )
+    model = MultiOutputRegressor(base_estimator, n_jobs=1)
+    model.estimators_ = fitted
+    return model
+
+
 def train_mean_forecaster(
     X: np.ndarray,
     y: np.ndarray,
@@ -808,26 +908,37 @@ def train_mean_forecaster(
     progress_callback: Optional[Callable[[int, int, float], None]] = None,
     patience: int = 10,
     min_improvement: float = 0.005,
-    n_jobs: Optional[int] = -1,
+    native_threads: int = 4,
+    best_params_path: Optional[str | Path] = None,
+    force_retune: bool = False,
 ) -> Any:
     """Train the mean forecaster for injections twelve steps ahead.
 
     Optuna tuning stops early once the best validation RMSE has not improved
     by more than ``min_improvement`` (relative) for ``patience`` trials; set
-    ``patience`` to 0 to always run ``n_trials``. ``n_jobs`` parallelises the
-    per-output regressors (-1 = all cores) and does not change the fitted models.
+    ``patience`` to 0 to always run ``n_trials``. Output regressors are fitted
+    sequentially to keep peak memory bounded.
     """
-    import time
-    import joblib
     from tqdm import tqdm
     from sklearn.ensemble import HistGradientBoostingRegressor
     from sklearn.metrics import mean_squared_error
-    from sklearn.multioutput import MultiOutputRegressor
 
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
+    checkpoint_path = Path(best_params_path) if best_params_path else (
+        Path(model_path).with_name(MEAN_BEST_PARAMS_FILENAME)
+    )
+    params = None if force_retune else _load_best_params(checkpoint_path, seed)
+    reused_params = params is not None
+    print(
+        "[mean] tuning checkpoint: "
+        + ("reusing saved best_params" if params else "not reusable; tuning required"),
+        flush=True,
+    )
 
-    if n_trials > 0:
+    best_value = None
+    completed_trials = 0
+    if params is None and n_trials > 0:
         import optuna
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -847,11 +958,18 @@ def train_mean_forecaster(
                 "early_stopping": True,
                 "random_state": seed,
             }
-            model = MultiOutputRegressor(
-                HistGradientBoostingRegressor(**params), n_jobs=n_jobs
+            model = _fit_multioutput_with_progress(
+                HistGradientBoostingRegressor(**params),
+                X[tune_train_idx],
+                y[tune_train_idx],
+                native_threads=int(native_threads),
+                description="mean tune",
+                show_progress=False,
             )
-            model.fit(X[tune_train_idx], y[tune_train_idx])
-            pred = model.predict(X[tune_validation_idx])
+            pred = np.column_stack([
+                estimator.predict(X[tune_validation_idx])
+                for estimator in model.estimators_
+            ])
             return float(np.sqrt(mean_squared_error(y[tune_validation_idx], pred)))
 
         study = optuna.create_study(direction="minimize")
@@ -891,7 +1009,9 @@ def train_mean_forecaster(
         params = dict(study.best_params)
         params["early_stopping"] = True
         params["random_state"] = seed
-    else:
+        best_value = float(study.best_value)
+        completed_trials = len(study.trials)
+    elif params is None:
         params = {
             "loss": "squared_error",
             "learning_rate": 0.05,
@@ -902,14 +1022,26 @@ def train_mean_forecaster(
             "random_state": seed,
         }
 
+    params.update({"early_stopping": True, "random_state": int(seed)})
+    payload = {
+        "completed_trials": int(completed_trials),
+        "best_value": best_value,
+        "best_params": params,
+    }
+    if not reused_params:
+        _atomic_write_json(checkpoint_path, payload)
+        print(f"[mean] saved tuning checkpoint -> {checkpoint_path}", flush=True)
+
     print(f"[mean] final fit on {len(X)} rows, {y.shape[1]} outputs...", flush=True)
     started = time.perf_counter()
-    model = MultiOutputRegressor(HistGradientBoostingRegressor(**params), n_jobs=n_jobs)
-    model.fit(X, y)
+    model = _fit_multioutput_with_progress(
+        HistGradientBoostingRegressor(**params), X, y,
+        native_threads=int(native_threads),
+        description="mean final",
+    )
     print(f"[mean] final fit done in {(time.perf_counter() - started) / 60:.1f} min", flush=True)
     path = Path(model_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model, path)
+    _atomic_joblib_dump(model, path)
     return model
 
 
@@ -919,15 +1051,18 @@ def train_aleatoric_forecaster(
     mean_model: Any,
     *,
     model_path: str | Path,
+    native_threads: int = 4,
 ) -> Any:
     """Train the legacy residual-variance forecaster."""
-    import joblib
     from sklearn.ensemble import HistGradientBoostingRegressor
-    from sklearn.multioutput import MultiOutputRegressor
 
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.float32)
-    y_pred = np.asarray(mean_model.predict(X), dtype=np.float32)
+    from threadpoolctl import threadpool_limits
+
+    with threadpool_limits(limits=int(native_threads), user_api="openmp"):
+        with threadpool_limits(limits=1, user_api="blas"):
+            y_pred = np.asarray(mean_model.predict(X), dtype=np.float32)
     squared_residuals = (y - y_pred) ** 2
     upper = np.percentile(squared_residuals, 99.9, axis=0)
     squared_residuals = np.clip(squared_residuals, 0.0, upper)
@@ -940,12 +1075,56 @@ def train_aleatoric_forecaster(
         l2_regularization=2.0,
         early_stopping=True,
     )
-    model = MultiOutputRegressor(base)
-    model.fit(X, z)
+    model = _fit_multioutput_with_progress(
+        base, X, z, native_threads=int(native_threads),
+        description="aleatoric final",
+    )
     path = Path(model_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    joblib.dump(model, path)
+    _atomic_joblib_dump(model, path)
     return model
+
+
+def load_or_train_forecasters(
+    X: np.ndarray,
+    y: np.ndarray,
+    episode_ids: np.ndarray,
+    *,
+    mean_path: str | Path,
+    aleatoric_path: str | Path,
+    best_params_path: str | Path,
+    n_trials: int,
+    max_subsample: int = 5000,
+    seed: int = 42,
+    native_threads: int = 4,
+    reuse: bool = True,
+    force_retune: bool = False,
+    on_train_start: Optional[Callable[[], None]] = None,
+) -> Tuple[Any, Any, bool]:
+    """Reuse saved models and train only the missing forecaster stages."""
+    mean = _load_model(mean_path) if reuse and not force_retune else None
+    aleatoric = _load_model(aleatoric_path) if reuse and not force_retune else None
+    print(f"[preflight] best params: {'found' if Path(best_params_path).is_file() else 'missing'}")
+    print(f"[preflight] mean model: {'found' if mean else 'missing'}")
+    print(f"[preflight] aleatoric model: {'found' if aleatoric else 'missing'}")
+    if mean is not None and aleatoric is not None:
+        return mean, aleatoric, False
+
+    if on_train_start is not None:
+        on_train_start()
+    mean_was_trained = mean is None
+    if mean_was_trained:
+        mean = train_mean_forecaster(
+            X, y, model_path=mean_path, n_trials=n_trials,
+            max_subsample=max_subsample, seed=seed, episode_ids=episode_ids,
+            native_threads=native_threads,
+            best_params_path=best_params_path, force_retune=force_retune,
+        )
+    if aleatoric is None or mean_was_trained:
+        aleatoric = train_aleatoric_forecaster(
+            X, y, mean, model_path=aleatoric_path,
+            native_threads=native_threads,
+        )
+    return mean, aleatoric, True
 
 
 def write_rows_csv(rows: Iterable[Dict[str, Any]], output_path: str | Path) -> int:

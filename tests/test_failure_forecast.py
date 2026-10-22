@@ -27,6 +27,7 @@ from src.failure_forecast import (  # noqa: E402
     LEGACY_PHASES,
     FailureForecastConfig,
     FailureForecastPredictor,
+    _fit_multioutput_with_progress,
     _classifier_risk,
     _fixed_tuning_indices,
     _split_classifier_rows,
@@ -39,6 +40,7 @@ from src.failure_forecast import (  # noqa: E402
     prepare_classifier_dataframe,
     run_historical_episode,
     train_failure_classifier,
+    train_mean_forecaster,
 )
 
 LINE_NAMES = ["line_ok", "line_bad", "line_trip"]
@@ -436,6 +438,85 @@ class PredictorTests(unittest.TestCase):
             predictor.features_from_row({"line_disconnected": "line_bad"})
         with self.assertRaises(ValueError):
             FailureForecastPredictor(RecordingClassifier(), {"features": ["old"]})
+
+
+class ForecasterTrainingTests(unittest.TestCase):
+    @staticmethod
+    def arrays():
+        rng = np.random.default_rng(7)
+        X = rng.normal(size=(60, 4)).astype(np.float32)
+        y = rng.normal(size=(60, 2)).astype(np.float32)
+        episode_ids = np.repeat(np.arange(6), 10)
+        return X, y, episode_ids
+
+    def test_checkpoint_survives_failed_final_fit_and_skips_retuning(self):
+        X, y, episode_ids = self.arrays()
+        with TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            params_path = directory / "mean_forecaster_best_params.json"
+            model_path = directory / "mean_forecaster.pkl"
+
+            def fail_only_full_fit(*args, **kwargs):
+                if len(args[1]) == len(X):
+                    raise RuntimeError("simulated full-fit failure")
+                return _fit_multioutput_with_progress(*args, **kwargs)
+
+            with mock.patch(
+                "src.failure_forecast._fit_multioutput_with_progress",
+                side_effect=fail_only_full_fit,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated"):
+                    train_mean_forecaster(
+                        X,
+                        y,
+                        model_path=model_path,
+                        n_trials=1,
+                        max_subsample=20,
+                        seed=3,
+                        episode_ids=episode_ids,
+                        native_threads=1,
+                        best_params_path=params_path,
+                    )
+            self.assertTrue(params_path.is_file())
+            self.assertFalse(model_path.exists())
+
+            with mock.patch(
+                "optuna.create_study",
+                side_effect=AssertionError("Optuna must not run on resume"),
+            ):
+                model = train_mean_forecaster(
+                    X,
+                    y,
+                    model_path=model_path,
+                    n_trials=1,
+                    max_subsample=20,
+                    seed=3,
+                    episode_ids=episode_ids,
+                    native_threads=1,
+                    best_params_path=params_path,
+                )
+            self.assertEqual(len(model.estimators_), y.shape[1])
+            self.assertTrue(model_path.is_file())
+
+    def test_progress_fit_limits_openmp_and_blas_threads(self):
+        from sklearn.ensemble import HistGradientBoostingRegressor
+
+        X, y, _ = self.arrays()
+        limiter = mock.MagicMock()
+        limiter.return_value.__enter__.return_value = None
+        with mock.patch("threadpoolctl.threadpool_limits", limiter):
+            model = _fit_multioutput_with_progress(
+                HistGradientBoostingRegressor(max_iter=2),
+                X,
+                y,
+                native_threads=4,
+                description="test",
+            )
+        self.assertEqual(len(model.estimators_), 2)
+        self.assertIn(
+            mock.call(limits=4, user_api="openmp"), limiter.call_args_list
+        )
+        self.assertIn(mock.call(limits=1, user_api="blas"), limiter.call_args_list)
 
 
 class ClassifierTests(unittest.TestCase):
