@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from tqdm import tqdm
 
 from src.explainability import dual_llm
 from src.explainability.shap_cache import (
@@ -71,10 +72,14 @@ def compute_rankings(
         rows_path, classifier_path, metadata_path
     )
     rankings: dict[str, list[str]] = {}
-    for line_name in line_map:
+    progress = tqdm(
+        line_map, desc="SHAP contingencies", unit="line", dynamic_ncols=True
+    )
+    for line_name in progress:
         line_rows = dataframe[dataframe["line_disconnected"] == line_name]
+        progress.set_postfix(line=line_name, rows=len(line_rows))
         if len(line_rows) < 5:
-            print(f"  [skip] {line_name}: too few rows ({len(line_rows)})")
+            tqdm.write(f"  [skip] {line_name}: too few rows ({len(line_rows)})")
             continue
         features = line_rows[dual_llm.FEATURES].copy()
         if len(features) > max_rows_per_line:
@@ -94,7 +99,7 @@ def compute_rankings(
             if dual_llm.FEATURES[index] in dual_llm.FEATURES_FOR_LLM
         ][:top_k]
         rankings[line_name] = ranked
-        print(f"  {line_name} [{method}]: {ranked}")
+        tqdm.write(f"  {line_name} [{method}]: {ranked}")
     return rankings
 
 
