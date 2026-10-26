@@ -257,6 +257,13 @@ environment.
 
 ## Legacy Workflow
 
-The original tutor-data ENN pipeline, LLM rule generation, and its documentation
-are preserved under `archive/legacy/old_version/`. They are not used by the
-active API or training pipeline.
+The original tutor-data ENN pipeline and its documentation are preserved under
+`archive/legacy/old_version/`. The optional LLM rule-distillation integration
+has moved to `src/explainability/`; it can annotate smoke predictions without
+changing the active classifier result. See `src/explainability/README.md`.
+
+Run the disposable end-to-end smoke workflow with explanations using:
+
+```powershell
+python smoke_test.py --llm-config path\to\llm_config.json
+```
