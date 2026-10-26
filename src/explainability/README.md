@@ -7,8 +7,9 @@ binary predictions.
 The offline workflow follows the legacy implementation:
 
 1. Rank the HGB features for each contingency.
-2. Ask one OpenAI-compatible model, with generator, critic, and repair prompts,
-   to distil the HGB decisions into a small `if/else` rule per line.
+2. For each line, use one OpenAI-compatible model in three stages: generate a
+   compact `if/else` rule from the HGB decisions, critique the rule's fidelity,
+   and repair it when the output is invalid or incomplete.
 3. Load those rules at runtime and translate them into text.
 
 ## Module map
