@@ -1,26 +1,34 @@
-"""Distil the current HGB failure classifier into readable per-line rules.
+"""Distil the active HGB failure classifier into readable per-line rules.
 
-This is the small, offline LLM step used by the runtime explainability layer.
-The generator, critic, and repair roles use one configured chat model, matching
-the useful part of the legacy implementation without its paper-evaluation
-orchestration.
+The HGB remains authoritative. This optional offline stage builds compact
+surrogate rules using a deterministic seed followed by generator/critic LLM
+calls. Rule evaluation is vectorized because it is also the main inner loop of
+the seed search.
 """
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import logging
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import joblib
 import numpy as np
 import pandas as pd
+from numpy import ndarray, dtype, bool_
 from sklearn.metrics import accuracy_score, confusion_matrix, fbeta_score
 
 from project_config import AGENT_NAME, ARTIFACTS_DIR, ENV_NAME
-from src.explainability.llm_client import LLMClient, LLMConfig
+from src.explainability.llm_client import (
+    LLMClient,
+    LLMConfig,
+    LLMUnavailableError,
+)
 from src.explainability.rule_predictor import compile_rule, validate_rule
 from src.explainability.shap_cache import ShapSettings, validate_rankings_cache
 from src.failure_forecast import (
@@ -30,6 +38,7 @@ from src.failure_forecast import (
 )
 
 
+LOGGER = logging.getLogger(__name__)
 HERE = Path(__file__).resolve().parent
 FAILURE_FORECAST_DIR = ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "failure_forecast"
 DATA_PATH = FAILURE_FORECAST_DIR / "failure_forecast_rows.csv"
@@ -41,7 +50,6 @@ PROMPTS_DIR = HERE / "prompts"
 
 FEATURES = list(CLASSIFIER_FEATURES)
 FEATURES_FOR_LLM = [feature for feature in FEATURES if feature != "line_id_encoded"]
-
 FEATURE_DESCRIPTIONS = {
     "sum_load_p": "total active load now",
     "sum_load_q": "total reactive load now",
@@ -68,12 +76,25 @@ FEATURE_DESCRIPTIONS = {
 
 @dataclass(frozen=True)
 class DistillationConfig:
-    """Small set of controls for one rule-distillation run."""
+    """Controls that affect one rule-distillation run."""
 
     iterations: int = 20
     temperature: float = 0.7
     top_features: int = 8
     max_error_examples: int = 8
+
+    def __post_init__(self) -> None:
+        if self.iterations < 0 or self.top_features < 1 or self.max_error_examples < 1:
+            raise ValueError("iterations cannot be negative; feature/error limits must be positive")
+
+
+@dataclass(frozen=True)
+class _SeedResult:
+    """Seed rule plus its already-computed predictions and metrics."""
+
+    code: str
+    predictions: np.ndarray
+    metrics: dict[str, float]
 
 
 def load_teacher_data(
@@ -96,7 +117,7 @@ def load_teacher_data(
 
 
 def compute_metrics(y_true: Sequence[int], y_pred: Sequence[int]) -> dict[str, float]:
-    """Return compact fidelity metrics, emphasizing failure recall through F2."""
+    """Return fidelity metrics, emphasizing failure recall through F2."""
     actual = np.asarray(y_true, dtype=int)
     predicted = np.asarray(y_pred, dtype=int)
     tn, fp, fn, tp = confusion_matrix(actual, predicted, labels=[0, 1]).ravel()
@@ -108,23 +129,94 @@ def compute_metrics(y_true: Sequence[int], y_pred: Sequence[int]) -> dict[str, f
     }
 
 
+def _comparison(node: ast.Compare, rows: pd.DataFrame) -> bool | Any:
+    feature = node.left.slice.value
+    threshold_node = node.comparators[0]
+    threshold = (
+        -float(threshold_node.operand.value)
+        if isinstance(threshold_node, ast.UnaryOp)
+        else float(threshold_node.value)
+    )
+    values = rows[feature].to_numpy(copy=False)
+    operator = node.ops[0]
+    if isinstance(operator, ast.Gt):
+        return values > threshold
+    if isinstance(operator, ast.GtE):
+        return values >= threshold
+    if isinstance(operator, ast.Lt):
+        return values < threshold
+    if isinstance(operator, ast.LtE):
+        return values <= threshold
+    if isinstance(operator, ast.Eq):
+        return values == threshold
+    if isinstance(operator, ast.NotEq):
+        return values != threshold
+    raise ValueError(f"Unsupported comparison operator: {type(operator).__name__}")
+
+
+def _condition(node: ast.expr, rows: pd.DataFrame) -> np.ndarray:
+    if isinstance(node, ast.Compare):
+        return np.asarray(_comparison(node, rows), dtype=bool)
+    if isinstance(node, ast.BoolOp):
+        values = [_condition(value, rows) for value in node.values]
+        if isinstance(node.op, ast.And):
+            return np.logical_and.reduce(values)
+        return np.logical_or.reduce(values)
+    raise ValueError(f"Unsupported condition: {type(node).__name__}")
+
+
 def evaluate_rule(rule_code: str, rows: pd.DataFrame) -> np.ndarray:
-    """Apply one validated rule to classifier feature rows."""
+    """Evaluate a validated rule with NumPy masks, without Python row loops."""
+    function = validate_rule(rule_code)
+    result = np.empty(len(rows), dtype=int)
+
+    def run(statements: Sequence[ast.stmt], active: np.ndarray) -> np.ndarray:
+        remaining = active
+        for statement in statements:
+            if not remaining.any():
+                break
+            if isinstance(statement, ast.Return):
+                value_node = statement.value
+                value = (
+                    -int(value_node.operand.value)
+                    if isinstance(value_node, ast.UnaryOp)
+                    else int(value_node.value)
+                )
+                result[remaining] = value
+                return np.zeros(len(rows), dtype=bool)
+            if isinstance(statement, ast.If):
+                condition = _condition(statement.test, rows)
+                after_true = run(statement.body, remaining & condition)
+                after_false = run(statement.orelse, remaining & ~condition)
+                remaining = after_true | after_false
+        return remaining
+
+    unfinished = run(function.body, np.ones(len(rows), dtype=bool))
+    if unfinished.any():
+        raise ValueError("Rule does not return 0 or 1 for every input")
+    return result
+
+
+def _evaluate_rule_scalar(rule_code: str, rows: pd.DataFrame) -> np.ndarray:
+    """Reference evaluator retained for equivalence tests and benchmarks."""
     rule = compile_rule(rule_code)
     return np.asarray([int(rule(row)) for _, row in rows.iterrows()], dtype=int)
 
 
+@lru_cache(maxsize=3)
+def _load_template(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
 def _fill_template(path: Path, values: Mapping[str, Any]) -> str:
-    text = path.read_text(encoding="utf-8")
+    text = _load_template(path)
     for key, value in values.items():
         text = text.replace("{{" + key + "}}", str(value))
     return text.strip()
 
 
 def _extract_rule(text: str) -> str:
-    tagged = re.search(
-        r"\[Start of Rule\](.*?)\[End of Rule\]", text, re.I | re.S
-    )
+    tagged = re.search(r"\[Start of Rule\](.*?)\[End of Rule\]", text, re.I | re.S)
     if tagged:
         text = tagged.group(1)
     for block in re.findall(r"```(?:python)?\s*(.*?)```", text, re.I | re.S):
@@ -135,17 +227,18 @@ def _extract_rule(text: str) -> str:
 
 
 def _feature_order(rows: pd.DataFrame, ranking: Sequence[str] | None) -> list[str]:
+    available = [feature for feature in FEATURES_FOR_LLM if feature in rows.columns]
     if ranking:
-        selected = [feature for feature in ranking if feature in FEATURES_FOR_LLM]
+        selected = [feature for feature in ranking if feature in available]
         if selected:
             return selected
     failed = rows[rows["target"] == 1]
     normal = rows[rows["target"] == 0]
     if failed.empty or normal.empty:
-        return list(FEATURES_FOR_LLM)
+        return available
     separation = {
         feature: abs(float(failed[feature].median() - normal[feature].median()))
-        for feature in FEATURES_FOR_LLM
+        for feature in available
     }
     return sorted(separation, key=separation.get, reverse=True)
 
@@ -166,17 +259,28 @@ def _feature_summary(rows: pd.DataFrame, features: Sequence[str]) -> str:
     return "\n".join(lines)
 
 
-def _seed_rule(rows: pd.DataFrame, features: Sequence[str]) -> str:
-    """Create a deterministic one-split baseline for the LLM to improve."""
+def _constant_rule(value: int, rows: pd.DataFrame) -> _SeedResult:
+    code = f"def rule(x):\n    return {value}\n"
+    predictions = np.full(len(rows), value, dtype=int)
+    return _SeedResult(code, predictions, compute_metrics(rows["target"], predictions))
+
+
+def _seed_rule(rows: pd.DataFrame, features: Sequence[str]) -> _SeedResult:
+    """Select the best one-split seed using vectorized candidate evaluation.
+
+    The returned predictions and metrics are reused by :func:`distill_line`, so
+    the selected candidate is not evaluated a second time.
+    """
     failed = rows[rows["target"] == 1]
     normal = rows[rows["target"] == 0]
     if failed.empty:
-        return "def rule(x):\n    return 0\n"
+        return _constant_rule(0, rows)
     if normal.empty:
-        return "def rule(x):\n    return 1\n"
+        return _constant_rule(1, rows)
 
-    best_code = "def rule(x):\n    return 0\n"
+    best = _constant_rule(0, rows)
     best_f2 = -1.0
+    targets = rows["target"].to_numpy(dtype=int, copy=False)
     for feature in features:
         positive = float(failed[feature].median())
         negative = float(normal[feature].median())
@@ -191,10 +295,16 @@ def _seed_rule(rows: pd.DataFrame, features: Sequence[str]) -> str:
             "    else:\n"
             "        return 0\n"
         )
-        score = compute_metrics(rows["target"], evaluate_rule(code, rows))["f2"]
-        if score > best_f2:
-            best_code, best_f2 = code, score
-    return best_code
+        values = rows[feature].to_numpy(copy=False)
+        predictions = np.asarray(
+            values >= threshold if positive > negative else values <= threshold,
+            dtype=int,
+        )
+        metrics = compute_metrics(targets, predictions)
+        if metrics["f2"] > best_f2:
+            best = _SeedResult(code, predictions, metrics)
+            best_f2 = metrics["f2"]
+    return best
 
 
 def _wrong_examples(
@@ -207,14 +317,18 @@ def _wrong_examples(
     return "None" if wrong.empty else wrong.to_json(orient="records")
 
 
+def _progress(step: int, total: int, message: str) -> None:
+    width = 12
+    filled = min(width, round(width * step / max(total, 1)))
+    print(f"[explainability] [{'#' * filled}{'-' * (width - filled)}] {message}")
+
+
 def _repair_rule(client: LLMClient, raw: str, error: Exception, temperature: float) -> str:
     prompt = _fill_template(
         PROMPTS_DIR / "repair_prompt.md",
         {"bad_output": raw, "error_msg": str(error)},
     )
-    repaired = _extract_rule(client.complete(prompt, temperature=temperature))
-    validate_rule(repaired)
-    return repaired
+    return _extract_rule(client.complete(prompt, temperature=temperature))
 
 
 def distill_line(
@@ -228,18 +342,21 @@ def distill_line(
 ) -> dict[str, Any]:
     """Generate, evaluate, and save one explanatory contingency rule."""
     features = _feature_order(rows, ranking)[: config.top_features]
-    best_rule = _seed_rule(rows, features)
-    best_predictions = evaluate_rule(best_rule, rows)
-    best_metrics = compute_metrics(rows["target"], best_predictions)
+    _progress(1, 3, f"{line_name}: evaluating deterministic seed candidates")
+    seed = _seed_rule(rows, features)
+    best_rule = seed.code
+    best_predictions = seed.predictions
+    best_metrics = seed.metrics
     feedback = "Improve the baseline while keeping the rule compact."
+    feature_summary = _feature_summary(rows, features)
 
-    for _ in range(config.iterations):
+    for iteration in range(1, config.iterations + 1):
         prompt = _fill_template(
             PROMPTS_DIR / "generator_prompt.md",
             {
                 "line_name": line_name,
                 "current_metrics": json.dumps(best_metrics, sort_keys=True),
-                "feature_summary": _feature_summary(rows, features),
+                "feature_summary": feature_summary,
                 "worst_cases": _wrong_examples(
                     rows, best_predictions, features, config.max_error_examples
                 ),
@@ -247,14 +364,24 @@ def distill_line(
                 "best_rule": best_rule,
             },
         )
-        raw = client.complete(prompt, temperature=config.temperature)
+        _progress(2, 3, f"{line_name} iteration {iteration}/{config.iterations}: requesting a candidate rule; waiting")
+        try:
+            raw = client.complete(prompt, temperature=config.temperature)
+        except LLMUnavailableError as exc:
+            LOGGER.warning("LLM generator unavailable for %s: %s", line_name, exc)
+            break
         candidate = _extract_rule(raw)
         try:
-            validate_rule(candidate)
-        except Exception as exc:
-            candidate = _repair_rule(client, raw, exc, config.temperature)
+            try:
+                predictions = evaluate_rule(candidate, rows)
+            except (ValueError, TypeError, KeyError) as exc:
+                candidate = _repair_rule(client, raw, exc, config.temperature)
+                predictions = evaluate_rule(candidate, rows)
+        except (LLMUnavailableError, ValueError, TypeError, KeyError) as exc:
+            LOGGER.warning("Skipping invalid LLM rule for %s: %s", line_name, exc)
+            feedback = f"Previous candidate failed validation or evaluation: {exc}"
+            continue
 
-        predictions = evaluate_rule(candidate, rows)
         metrics = compute_metrics(rows["target"], predictions)
         if metrics["f2"] > best_metrics["f2"]:
             best_rule, best_predictions, best_metrics = candidate, predictions, metrics
@@ -264,14 +391,21 @@ def distill_line(
             {
                 "current_rule": candidate,
                 "current_metrics": json.dumps(metrics, sort_keys=True),
-                "feature_summary": _feature_summary(rows, features),
+                "feature_summary": feature_summary,
                 "worst_cases": _wrong_examples(
                     rows, predictions, features, config.max_error_examples
                 ),
                 "best_rule": best_rule,
             },
         )
-        feedback = client.complete(critic_prompt, temperature=config.temperature)[:3000]
+        _progress(2, 3, f"{line_name} iteration {iteration}/{config.iterations}: Requesting rule feedback; waiting")
+        try:
+            feedback = client.complete(
+                critic_prompt, temperature=config.temperature
+            )[:3000]
+        except LLMUnavailableError as exc:
+            LOGGER.warning("LLM critic unavailable for %s: %s", line_name, exc)
+            feedback = "Critic unavailable; keep the best valid rule compact."
 
     line_dir = Path(output_dir) / f"line_{line_name}"
     line_dir.mkdir(parents=True, exist_ok=True)
@@ -280,6 +414,7 @@ def distill_line(
     (line_dir / "metrics.json").write_text(
         json.dumps(result, indent=2), encoding="utf-8"
     )
+    _progress(3, 3, f"{line_name}: explanatory rule saved")
     return result
 
 
@@ -294,15 +429,11 @@ def distill_classifier(
     config: DistillationConfig = DistillationConfig(),
     shap_settings: ShapSettings = ShapSettings(),
 ) -> list[dict[str, Any]]:
-    """Distil one rule for every line represented by both teacher classes."""
-    rankings = {}
+    """Distil one best-effort rule for each configured contingency."""
+    rankings: dict[str, list[str]] = {}
     if rankings_path is not None:
         validation = validate_rankings_cache(
-            rankings_path,
-            rows_path,
-            classifier_path,
-            metadata_path,
-            shap_settings,
+            rankings_path, rows_path, classifier_path, metadata_path, shap_settings
         )
         if not validation.compatible:
             raise ValueError(
@@ -315,23 +446,27 @@ def distill_classifier(
     )
     client = LLMClient(LLMConfig.from_json(llm_config_path))
 
-    results = []
+    results: list[dict[str, Any]] = []
     for line_name in line_map:
         line_rows = dataframe[dataframe["line_disconnected"] == line_name].copy()
         if line_rows.empty:
-            print(f"[skip] {line_name}: no classifier rows")
+            LOGGER.warning("No classifier rows for explainability line %s", line_name)
             continue
-        print(f"[distil] {line_name}: {len(line_rows)} rows")
-        results.append(
-            distill_line(
-                line_rows,
-                line_name,
-                client,
-                output_dir,
-                ranking=rankings.get(line_name),
-                config=config,
+        print(f"[explainability] {line_name}: {len(line_rows)} rows")
+        try:
+            results.append(
+                distill_line(
+                    line_rows,
+                    line_name,
+                    client,
+                    output_dir,
+                    ranking=rankings.get(line_name),
+                    config=config,
+                )
             )
-        )
+        except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
+            LOGGER.warning("Could not distil rule for %s: %s", line_name, exc)
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     (Path(output_dir) / "summary.json").write_text(
         json.dumps(results, indent=2), encoding="utf-8"
@@ -349,19 +484,7 @@ def main() -> None:
     parser.add_argument("--llm-config", type=Path, required=True)
     parser.add_argument("--shap-rankings", type=Path, default=SHAP_RANKINGS_FILE)
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
-    parser.add_argument(
-        "--iterations", type=int, default=DistillationConfig().iterations
-    )
-    parser.add_argument("--shap-top-k", type=int, default=ShapSettings().top_k)
-    parser.add_argument(
-        "--shap-max-rows-per-line",
-        type=int,
-        default=ShapSettings().max_rows_per_line,
-    )
-    parser.add_argument("--shap-repeats", type=int, default=ShapSettings().repeats)
-    parser.add_argument(
-        "--shap-random-seed", type=int, default=ShapSettings().random_seed
-    )
+    parser.add_argument("--iterations", type=int, default=DistillationConfig().iterations)
     args = parser.parse_args()
     distill_classifier(
         args.rows,
@@ -371,12 +494,6 @@ def main() -> None:
         args.output_dir,
         rankings_path=args.shap_rankings,
         config=DistillationConfig(iterations=args.iterations),
-        shap_settings=ShapSettings(
-            top_k=args.shap_top_k,
-            max_rows_per_line=args.shap_max_rows_per_line,
-            repeats=args.shap_repeats,
-            random_seed=args.shap_random_seed,
-        ),
     )
 
 

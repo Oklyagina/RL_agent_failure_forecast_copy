@@ -45,7 +45,6 @@ from project_config import (  # noqa: E402
     FAILURE_LINES,
     FAILURE_MAX_STEPS,
     FAILURE_SEED_START,
-    FAILURE_THRESHOLD,
     FORECAST_EPISODES,
     FORECAST_HGB_THREADS,
     FORECAST_MAX_STEPS,
@@ -91,7 +90,7 @@ def run_explainability_stage(
     *,
     iterations: int,
     force_shap_recalculation: bool = False,
-) -> None:
+) -> list[dict[str, object]]:
     """Rank classifier features and distil runtime explanation rules."""
     from src.explainability.compute_shap_rankings import (
         DEFAULT_SHAP_SETTINGS,
@@ -163,8 +162,23 @@ def run_explainability_stage(
         shap_settings=DEFAULT_SHAP_SETTINGS,
     )
     if not results:
-        raise RuntimeError("LLM distillation produced no explanatory rules.")
+        print(
+            "[warn] explainability unavailable: distillation produced no rules; "
+            "the HGB pipeline remains available"
+        )
+        return []
+    metadata = json.loads(classifier_meta.read_text(encoding="utf-8"))
+    expected_lines = set(metadata.get("line_map", {}))
+    generated_lines = {str(result.get("line")) for result in results}
+    missing_lines = sorted(expected_lines - generated_lines)
+    if missing_lines:
+        print(
+            "[warn] no explanatory rule was produced for: "
+            + ", ".join(missing_lines)
+            + "; predictions for those lines remain available without explanations"
+        )
     print(f"[ok] wrote {len(results)} explanatory rules -> {rules_dir}")
+    return results
 
 
 def default_policy_dir() -> Path:
@@ -249,7 +263,8 @@ def validate_failure_rows(path: Path) -> dict[str, int]:
     from src.failure_forecast import REQUIRED_DATA_COLUMNS
 
     df = pd.read_csv(path)
-    missing = sorted(REQUIRED_DATA_COLUMNS | {"event_step", "label_reason"} - set(df.columns))
+    # missing = sorted(REQUIRED_DATA_COLUMNS | {"event_step", "label_reason"} - set(df.columns))
+    missing = sorted((REQUIRED_DATA_COLUMNS | {"event_step", "label_reason"}) - set(df.columns))
     if missing:
         raise ValueError("failure rows use an old format; missing " + ", ".join(missing))
     return {"rows": int(len(df)), "positives": int((df["failed"] == 1).sum())}
@@ -582,7 +597,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
             "--agent-name", args.agent_name,
             "--input-csv", str(rows_csv),
             "--model-path", str(classifier),
-            "--threshold", str(FAILURE_THRESHOLD),
             "--trials", str(FAILURE_CLASSIFIER_TRIALS),
             "--seed", str(SEED),
         ]
@@ -596,15 +610,28 @@ def run_pipeline(args: argparse.Namespace) -> None:
         )
 
     if args.with_explainability:
-        run_explainability_stage(
-            rows_csv,
-            classifier,
-            classifier_meta,
-            args.llm_config,
-            generated_rules_dir,
-            iterations=args.llm_iterations,
-            force_shap_recalculation=args.force_shap_recalculation,
-        )
+        try:
+            run_explainability_stage(
+                rows_csv,
+                classifier,
+                classifier_meta,
+                args.llm_config,
+                generated_rules_dir,
+                iterations=args.llm_iterations,
+                force_shap_recalculation=args.force_shap_recalculation,
+            )
+        except (
+            FileNotFoundError,
+            PermissionError,
+            UnicodeError,
+            json.JSONDecodeError,
+            ImportError,
+            ValueError,
+        ) as exc:
+            print(
+                "[warn] optional explainability stage unavailable "
+                f"({type(exc).__name__}: {exc}); continuing with HGB predictions"
+            )
 
     if not args.skip_smoke and (args.smoke_line or FAILURE_LINES):
         smoke_line = args.smoke_line or FAILURE_LINES.split(",")[0].strip()

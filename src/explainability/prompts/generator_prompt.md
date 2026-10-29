@@ -18,7 +18,10 @@ Best rule so far:
 
 Use only the listed features and numeric thresholds. The output must contain a
 single `def rule(x):` function made only of nested if/else statements and
-`return 0` or `return 1`. Do not import anything or use loops.
+`return 0` or `return 1`. Write every comparison as
+`x["feature_name"]` against a numeric threshold, for example
+`x["max_line_rho"] >= 0.9`; never compare `x` itself with a value. Do not import
+anything or use loops.
 
 [Start of Rule]
 def rule(x):
