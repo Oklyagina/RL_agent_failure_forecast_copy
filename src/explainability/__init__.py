@@ -1,6 +1,6 @@
 """Optional LLM-based explainability for failure-forecast predictions."""
 
-from src.explainability.llm_client import LLMClient, LLMConfig
+from src.explainability.llm_client import LLMClient, LLMConfig, LLMUnavailableError
 from src.explainability.orchestrator import ExplainabilityOrchestrator
 from src.explainability.rule_predictor import (
     RuleExplainer,
@@ -14,6 +14,7 @@ __all__ = [
     "ExplainabilityOrchestrator",
     "LLMClient",
     "LLMConfig",
+    "LLMUnavailableError",
     "RuleExplainer",
     "RuleExplanation",
     "compile_rule",
