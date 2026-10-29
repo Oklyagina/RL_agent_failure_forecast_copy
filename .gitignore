@@ -11,3 +11,5 @@ models_expert/
 /calib.npz
 /enn_meta.json
 /scaler_params.json
+/src/llm_config.json
+/src/explainability/llm_config.json

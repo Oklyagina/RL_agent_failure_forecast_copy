@@ -21,7 +21,6 @@ from project_config import (  # noqa: E402
     FAILURE_EPISODES,
     FAILURE_LINES,
     FAILURE_SEED_START,
-    FAILURE_THRESHOLD,
     FORECAST_EPISODES,
     FORECAST_MEAN_TRIALS,
     SEED,
@@ -80,7 +79,6 @@ def main() -> None:
     parser.add_argument("--lines", default=FAILURE_LINES or None)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--mean-trials", type=int, default=FORECAST_MEAN_TRIALS)
-    parser.add_argument("--threshold", type=float, default=FAILURE_THRESHOLD)
     parser.add_argument("--reuse-forecast-data", action="store_true")
     parser.add_argument("--skip-forecasters", action="store_true")
     parser.add_argument("--skip-row-collection", action="store_true")
@@ -174,7 +172,6 @@ def main() -> None:
             "--agent-name", args.agent_name,
             "--input-csv", str(rows_csv),
             "--model-path", str(classifier),
-            "--threshold", str(args.threshold),
             "--trials", str(args.trials),
             "--seed", str(args.seed),
         ]

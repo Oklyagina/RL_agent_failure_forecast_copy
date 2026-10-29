@@ -45,7 +45,6 @@ from project_config import (  # noqa: E402
     FAILURE_LINES,
     FAILURE_MAX_STEPS,
     FAILURE_SEED_START,
-    FAILURE_THRESHOLD,
     FORECAST_EPISODES,
     FORECAST_HGB_THREADS,
     FORECAST_MAX_STEPS,
@@ -80,6 +79,106 @@ def model_dir(agent_name: str) -> Path:
 
 def failure_dir(agent_name: str) -> Path:
     return agent_artifact_dir(agent_name) / "failure_forecast"
+
+
+def run_explainability_stage(
+    rows_csv: Path,
+    classifier: Path,
+    classifier_meta: Path,
+    llm_config: Path,
+    rules_dir: Path,
+    *,
+    iterations: int,
+    force_shap_recalculation: bool = False,
+) -> list[dict[str, object]]:
+    """Rank classifier features and distil runtime explanation rules."""
+    from src.explainability.compute_shap_rankings import (
+        DEFAULT_SHAP_SETTINGS,
+        compute_rankings,
+    )
+    from src.explainability.dual_llm import DistillationConfig, distill_classifier
+    from src.explainability.shap_cache import (
+        build_provenance,
+        validate_rankings_cache,
+        write_rankings_cache,
+    )
+
+    explainability_dir = rules_dir.parent
+    rankings_path = explainability_dir / "shap_rankings.json"
+    explainability_dir.mkdir(parents=True, exist_ok=True)
+
+    print("\n=== Explainability: feature rankings ===")
+    validation = validate_rankings_cache(
+        rankings_path,
+        rows_csv,
+        classifier,
+        classifier_meta,
+        DEFAULT_SHAP_SETTINGS,
+    )
+    if validation.compatible and not force_shap_recalculation:
+        print(
+            "[reuse] SHAP rankings: compatible cache; "
+            f"{validation.reason} -> {rankings_path}"
+        )
+    else:
+        reason = (
+            "forced by --force-shap-recalculation"
+            if force_shap_recalculation
+            else validation.reason
+        )
+        print(f"[recalculate] SHAP rankings: {reason}")
+        initial_provenance = build_provenance(
+            rows_csv, classifier, classifier_meta, DEFAULT_SHAP_SETTINGS
+        )
+        rankings = compute_rankings(
+            rows_csv,
+            classifier,
+            classifier_meta,
+            top_k=DEFAULT_SHAP_SETTINGS.top_k,
+            max_rows_per_line=DEFAULT_SHAP_SETTINGS.max_rows_per_line,
+            repeats=DEFAULT_SHAP_SETTINGS.repeats,
+            random_seed=DEFAULT_SHAP_SETTINGS.random_seed,
+        )
+        write_rankings_cache(
+            rankings_path,
+            rankings,
+            rows_csv,
+            classifier,
+            classifier_meta,
+            DEFAULT_SHAP_SETTINGS,
+            expected_provenance=initial_provenance,
+        )
+        print(f"[ok] atomically wrote SHAP rankings cache -> {rankings_path}")
+
+    print("\n=== Explainability: LLM rule distillation ===")
+    results = distill_classifier(
+        rows_csv,
+        classifier,
+        classifier_meta,
+        llm_config,
+        rules_dir,
+        rankings_path=rankings_path,
+        config=DistillationConfig(iterations=iterations),
+        shap_settings=DEFAULT_SHAP_SETTINGS,
+    )
+    if not results:
+        print(
+            "[warn] explainability unavailable: distillation produced no rules; "
+            "the HGB pipeline remains available"
+        )
+        return []
+    metadata = json.loads(classifier_meta.read_text(encoding="utf-8"))
+    expected_lines = set(metadata.get("line_map", {}))
+    generated_lines = {str(result.get("line")) for result in results}
+    missing_lines = sorted(expected_lines - generated_lines)
+    if missing_lines:
+        print(
+            "[warn] no explanatory rule was produced for: "
+            + ", ".join(missing_lines)
+            + "; predictions for those lines remain available without explanations"
+        )
+    print(f"[ok] wrote {len(results)} explanatory rules -> {rules_dir}")
+    return results
 
 
 def default_policy_dir() -> Path:
@@ -164,7 +263,8 @@ def validate_failure_rows(path: Path) -> dict[str, int]:
     from src.failure_forecast import REQUIRED_DATA_COLUMNS
 
     df = pd.read_csv(path)
-    missing = sorted(REQUIRED_DATA_COLUMNS | {"event_step", "label_reason"} - set(df.columns))
+    # missing = sorted(REQUIRED_DATA_COLUMNS | {"event_step", "label_reason"} - set(df.columns))
+    missing = sorted((REQUIRED_DATA_COLUMNS | {"event_step", "label_reason"}) - set(df.columns))
     if missing:
         raise ValueError("failure rows use an old format; missing " + ", ".join(missing))
     return {"rows": int(len(df)), "positives": int((df["failed"] == 1).sum())}
@@ -283,6 +383,17 @@ def run_pipeline(args: argparse.Namespace) -> None:
     rows_csv = failures / "failure_forecast_rows.csv"
     classifier = failures / "failure_classifier.pkl"
     classifier_meta = failures / "failure_classifier_metadata.json"
+    generated_rules_dir = (
+        args.explain_rules_dir
+        or failures / "explainability" / "rules"
+    )
+    if args.with_explainability:
+        if args.llm_config is None:
+            raise ValueError("--with-explainability requires --llm-config PATH")
+        if not args.llm_config.is_file():
+            raise FileNotFoundError(f"LLM configuration not found: {args.llm_config}")
+        if args.llm_iterations < 1:
+            raise ValueError("--llm-iterations must be at least 1")
 
     rollout_check = _check_with_validator(
         rollout_outputs,
@@ -486,7 +597,6 @@ def run_pipeline(args: argparse.Namespace) -> None:
             "--agent-name", args.agent_name,
             "--input-csv", str(rows_csv),
             "--model-path", str(classifier),
-            "--threshold", str(FAILURE_THRESHOLD),
             "--trials", str(FAILURE_CLASSIFIER_TRIALS),
             "--seed", str(SEED),
         ]
@@ -498,6 +608,30 @@ def run_pipeline(args: argparse.Namespace) -> None:
             {},
             args.agent_name,
         )
+
+    if args.with_explainability:
+        try:
+            run_explainability_stage(
+                rows_csv,
+                classifier,
+                classifier_meta,
+                args.llm_config,
+                generated_rules_dir,
+                iterations=args.llm_iterations,
+                force_shap_recalculation=args.force_shap_recalculation,
+            )
+        except (
+            FileNotFoundError,
+            PermissionError,
+            UnicodeError,
+            json.JSONDecodeError,
+            ImportError,
+            ValueError,
+        ) as exc:
+            print(
+                "[warn] optional explainability stage unavailable "
+                f"({type(exc).__name__}: {exc}); continuing with HGB predictions"
+            )
 
     if not args.skip_smoke and (args.smoke_line or FAILURE_LINES):
         smoke_line = args.smoke_line or FAILURE_LINES.split(",")[0].strip()
@@ -511,6 +645,11 @@ def run_pipeline(args: argparse.Namespace) -> None:
             "--aleatoric-model", str(failures / "aleatoric_forecaster.pkl"),
             "--classifier", str(classifier),
         ]
+        runtime_rules_dir = (
+            generated_rules_dir if args.with_explainability else args.explain_rules_dir
+        )
+        if runtime_rules_dir:
+            command.extend(["--explain-rules-dir", str(runtime_rules_dir)])
         execute(command, verbose=args.verbose)
 
     print("\n[ok] pipeline finished")
@@ -538,6 +677,34 @@ def build_parser() -> argparse.ArgumentParser:
         help="reuse cached forecaster training rows when that stage runs",
     )
     parser.add_argument("--smoke-line", help="line name for a final smoke prediction")
+    parser.add_argument(
+        "--explain-rules-dir",
+        type=Path,
+        default=None,
+        help="optional distilled-rule directory used only by the final smoke prediction",
+    )
+    parser.add_argument(
+        "--with-explainability",
+        action="store_true",
+        help="rank features, distil LLM rules, and explain the final smoke prediction",
+    )
+    parser.add_argument(
+        "--llm-config",
+        type=Path,
+        default=None,
+        help="JSON configuration for the OpenAI-compatible LLM endpoint",
+    )
+    parser.add_argument(
+        "--llm-iterations",
+        type=int,
+        default=20,
+        help="generator/critic iterations per contingency",
+    )
+    parser.add_argument(
+        "--force-shap-recalculation",
+        action="store_true",
+        help="recompute SHAP rankings even when the saved cache is compatible",
+    )
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser

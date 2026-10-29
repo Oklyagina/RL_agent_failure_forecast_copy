@@ -4,11 +4,17 @@ Runs every stage (ENN rollouts/training, forecasters, failure rows, classifier,
 multi-line t+12 prediction) on 2 lines and a few steps, writing to
 artifacts_smoke/ so real artifacts are untouched.  Results are not meaningful.
 
-Run:  python smoke_test.py
+Run without LLM explanations:
+    python smoke_test.py
+
+Run every stage including LLM rule generation and explained inference:
+    python smoke_test.py --llm-config path/to/llm_config.json
 """
+import argparse
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pandas as pd
 
@@ -35,8 +41,33 @@ lines = ",".join(FAILURE_LINES.split(",")[:2])
 os.environ["FAILURE_LINES"] = lines
 run_pipeline.FAILURE_LINES = lines
 
+def pipeline_arguments(llm_config: Path | None, force_stage: str) -> list[str]:
+    """Build root-pipeline arguments for the compact smoke run."""
+    arguments = [
+        sys.argv[0],
+        "--force-stage", force_stage,
+        "--smoke-line", lines,
+    ]
+    if llm_config is not None:
+        arguments.extend([
+            "--with-explainability",
+            "--llm-config", str(llm_config),
+            "--llm-iterations", "1",
+        ])
+    return arguments
+
+
 if __name__ == "__main__":
-    sys.argv = [sys.argv[0], "--force-stage", "all", "--smoke-line", lines]
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--llm-config",
+        type=Path,
+        default=None,
+        help="include SHAP ranking, LLM rule generation, and explained inference",
+    )
+    smoke_args = parser.parse_args()
+
+    sys.argv = pipeline_arguments(smoke_args.llm_config, "all")
     try:
         run_pipeline.main()
     except subprocess.CalledProcessError:
@@ -54,5 +85,5 @@ if __name__ == "__main__":
             for episode in rows["episode"].unique()
         ]).assign(failed=1, label_reason="smoke_synthetic")
         pd.concat([rows, synthetic]).to_csv(rows_csv, index=False)
-        sys.argv = [sys.argv[0], "--force-stage", "classifier", "--smoke-line", lines]
+        sys.argv = pipeline_arguments(smoke_args.llm_config, "classifier")
         run_pipeline.main()

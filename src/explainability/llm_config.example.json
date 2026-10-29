@@ -1,0 +1,22 @@
+{
+  "api_url": "https://example.invalid/v1/chat/completions",
+  "api_key_env": "OPENAI_API_KEY",
+  "model": "model-name",
+  "enable_thinking": false,
+  "max_tokens": 4000,
+  "timeout": 180,
+  "verify_ssl": true,
+  "retries": 3,
+  "retry_delay": 3,
+  "pipeline": {
+    "agent_name": "curriculum",
+    "llm_iterations": 5,
+    "force_stages": [],
+    "reuse_forecast_data": false,
+    "force_shap_recalculation": false,
+    "smoke_line": null,
+    "rules_dir": null,
+    "skip_smoke": false,
+    "verbose": true
+  }
+}

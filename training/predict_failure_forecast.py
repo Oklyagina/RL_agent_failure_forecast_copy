@@ -61,6 +61,12 @@ def main() -> None:
     parser.add_argument("--mean-model", type=Path, required=True)
     parser.add_argument("--aleatoric-model", type=Path, required=True)
     parser.add_argument("--classifier", type=Path, default=None)
+    parser.add_argument(
+        "--explain-rules-dir",
+        type=Path,
+        default=None,
+        help="optional line_*/best_rule.py directory produced by LLM distillation",
+    )
     args = parser.parse_args()
 
     configure_grid2op_warnings()
@@ -101,11 +107,30 @@ def main() -> None:
             lines_to_test=lines,
         )
         enn, uncertainty_fn = load_enn_uncertainty()
-        print(predictor.predict_many(
-            obs, observations, lines,
-            mean_model, aleatoric_model, cfg,
-            env=env, model_enn=enn, get_uncertainty_fn=uncertainty_fn,
-        ))
+        prediction_args = (
+            obs,
+            observations,
+            lines,
+            mean_model,
+            aleatoric_model,
+            cfg,
+        )
+        prediction_kwargs = {
+            "env": env,
+            "model_enn": enn,
+            "get_uncertainty_fn": uncertainty_fn,
+        }
+        if args.explain_rules_dir:
+            from src.explainability import ExplainabilityOrchestrator
+
+            explainer = ExplainabilityOrchestrator(
+                predictor, rules_dir=args.explain_rules_dir
+            )
+            print(explainer.predict_and_explain_many(
+                *prediction_args, **prediction_kwargs
+            ))
+        else:
+            print(predictor.predict_many(*prediction_args, **prediction_kwargs))
     finally:
         env.close()
 
