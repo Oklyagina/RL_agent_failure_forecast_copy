@@ -13,7 +13,7 @@ agent.act(obs, reward, done)
 
 The active workflow is implemented by `run_pipeline.py`, `run_example.py`,
 `recommendation_uncertainty.py`, `training/`, and `app/`. The original workflow
-is preserved under `archive/legacy/old_version/`.
+is available only in Git history; see [Legacy Workflow](#legacy-workflow).
 
 ## Quick Links
 
@@ -257,10 +257,18 @@ environment.
 
 ## Legacy Workflow
 
-The original tutor-data ENN pipeline and its documentation are preserved under
-`archive/legacy/old_version/`. The optional LLM rule-distillation integration
-has moved to `src/explainability/`; it can annotate smoke predictions without
-changing the active classifier result. See `src/explainability/README.md`.
+The original tutor-data ENN pipeline is no longer present in the working tree.
+Its latest retained snapshot is commit `08781bf` from 14 August 2026. Inspect
+the snapshot without changing the current checkout with:
+
+```bash
+git show --stat --oneline 08781bf
+git show 08781bf:run_pipeline.py
+```
+
+The optional LLM rule-distillation integration lives in `src/explainability/`;
+it can annotate smoke predictions without changing the active classifier
+result. See `src/explainability/README.md`.
 
 Run the disposable end-to-end smoke workflow with explanations using:
 
