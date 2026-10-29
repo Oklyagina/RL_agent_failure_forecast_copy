@@ -27,8 +27,10 @@ from src.failure_forecast import (  # noqa: E402
     LEGACY_PHASES,
     FailureForecastConfig,
     FailureForecastPredictor,
+    _classifier_f2,
+    _f2_optimal_threshold,
     _fit_multioutput_with_progress,
-    _classifier_risk,
+    _metrics,
     _fixed_tuning_indices,
     _split_classifier_rows,
     build_forecast_pairs,
@@ -536,13 +538,33 @@ class ClassifierTests(unittest.TestCase):
                 rows.append(row)
         return pd.DataFrame(rows)
 
-    def test_legacy_risk_weights_oversights_more(self):
-        self.assertAlmostEqual(_classifier_risk(np.array([0, 0, 1, 1]),
-                                                np.array([1, 0, 0, 1])), 50.0)
-        self.assertAlmostEqual(_classifier_risk(np.array([0, 0, 1, 1]),
-                                                np.array([1, 0, 1, 1])), 20.0)
-        self.assertAlmostEqual(_classifier_risk(np.array([0, 0, 1, 1]),
-                                                np.array([0, 0, 0, 1])), 30.0)
+    def test_f2_uses_sampled_probability_threshold(self):
+        labels = np.array([0, 0, 1, 1])
+        probabilities = np.array([0.2, 0.6, 0.4, 0.8])
+        low_threshold = _classifier_f2(labels, probabilities, 0.3)
+        high_threshold = _classifier_f2(labels, probabilities, 0.7)
+        self.assertNotEqual(low_threshold, high_threshold)
+        self.assertAlmostEqual(low_threshold, 10.0 / 11.0)
+        self.assertAlmostEqual(high_threshold, 5.0 / 9.0)
+
+    def test_exact_threshold_selection_prefers_lower_threshold_on_f2_tie(self):
+        labels = np.array([1, 0])
+        probabilities = np.array([0.1, 0.2])
+        threshold, f2 = _f2_optimal_threshold(labels, probabilities)
+        self.assertEqual(threshold, 0.0)
+        self.assertAlmostEqual(f2, 5.0 / 6.0)
+
+    def test_metrics_report_rare_event_counts_and_scores(self):
+        labels = np.array([0, 0, 0, 1, 1, 1])
+        predictions = np.array([0, 1, 0, 1, 0, 1])
+        probabilities = np.array([0.1, 0.8, 0.2, 0.9, 0.3, 0.7])
+        metrics = _metrics(labels, predictions, probabilities)
+        self.assertEqual(metrics["false_alarms"], 1)
+        self.assertEqual(metrics["missed_failures"], 1)
+        self.assertAlmostEqual(metrics["precision"], 2.0 / 3.0)
+        self.assertAlmostEqual(metrics["recall"], 2.0 / 3.0)
+        self.assertAlmostEqual(metrics["f2"], 2.0 / 3.0)
+        self.assertAlmostEqual(metrics["pr_auc"], 29.0 / 36.0)
 
     def test_train_with_optuna_save_and_reload_round_trip(self):
         df = prepare_classifier_dataframe(self.synthetic_rows())
@@ -554,9 +576,15 @@ class ClassifierTests(unittest.TestCase):
             self.assertEqual(info["label_counts"], {"1": 40, "0": 40})
             self.assertEqual(info["forecast_horizon_steps"], 12)
             self.assertEqual(info["optuna"]["n_trials"], 2)
+            self.assertEqual(info["optuna"]["direction"], "maximize")
+            self.assertEqual(
+                info["decision_threshold"], info["optuna"]["best_threshold"]
+            )
+            self.assertGreaterEqual(info["optuna"]["best_f2"], 0.0)
             self.assertIn("class_weight", info["model_params"])
             self.assertEqual(info["split"]["strategy"], "episode_grouped")
             predictor = FailureForecastPredictor.load(path)
+            self.assertEqual(predictor.threshold, info["decision_threshold"])
             result = predictor.predict_from_features(self.synthetic_rows().iloc[0].to_dict())
             self.assertIn(result["failure_prediction"], (0, 1))
             self.assertTrue(0.0 <= result["failure_probability"] <= 1.0)
@@ -566,7 +594,12 @@ class ClassifierTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             _, info = train_failure_classifier(
                 df, model_path=Path(tmp) / "c.pkl", seed=1, n_trials=0)
-            self.assertIsNone(info["optuna"]["best_risk"])
+            self.assertEqual(info["optuna"]["direction"], "maximize")
+            self.assertEqual(
+                info["decision_threshold"], info["optuna"]["best_threshold"]
+            )
+            self.assertTrue(0.0 <= info["decision_threshold"] <= 1.0)
+            self.assertIn("baseline_threshold_0_5_metrics", info)
 
     def test_split_is_70_15_15_and_keeps_episodes_apart(self):
         df = prepare_classifier_dataframe(self.synthetic_rows())

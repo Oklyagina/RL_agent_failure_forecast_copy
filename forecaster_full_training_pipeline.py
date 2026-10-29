@@ -1,7 +1,7 @@
 """Train the production failure-forecast bundle from configured full-case data.
 
-Edit ``.env`` to choose the environment, agent, training duration, lines, and
-decision threshold, then run this file directly.  The public
+Edit ``.env`` to choose the environment, agent, training duration, and lines,
+then run this file directly.  The public
 ``run_full_forecasting`` function accepts the same values as keyword overrides
 for programmatic use; no command-line parser or subprocess is involved.
 """
@@ -27,7 +27,6 @@ from project_config import (
     FAILURE_LINES,
     FAILURE_MAX_STEPS,
     FAILURE_SEED_START,
-    FAILURE_THRESHOLD,
     FORECAST_EPISODES,
     FORECAST_HGB_THREADS,
     FORECAST_MAX_STEPS,
@@ -302,7 +301,6 @@ def _validate_rows(
 def _validate_artifacts(
     paths: dict[str, Path],
     agent_name: str,
-    threshold: float,
     expected_lines: Sequence[str],
 ) -> tuple[Any, Any]:
     """Reopen the complete saved bundle and validate its metadata contract."""
@@ -345,8 +343,9 @@ def _validate_artifacts(
         raise RuntimeError("Classifier metadata is missing features or the line map.")
     if not set(metadata["line_map"]) <= {normalize_line_name(line) for line in expected_lines}:
         raise RuntimeError("Classifier metadata contains lines that were not configured.")
-    if not np.isclose(float(metadata.get("decision_threshold", np.nan)), threshold):
-        raise RuntimeError("Classifier metadata contains the wrong decision threshold.")
+    decision_threshold = float(metadata.get("decision_threshold", np.nan))
+    if not np.isfinite(decision_threshold) or not 0.0 <= decision_threshold <= 1.0:
+        raise RuntimeError("Classifier metadata contains an invalid decision threshold.")
     print(f"[artifacts] reopened X={X.shape} y={y.shape} and all model files")
     return mean_model, aleatoric_model
 
@@ -412,7 +411,6 @@ def run_full_forecasting(
     classifier_trials: int = FAILURE_CLASSIFIER_TRIALS,
     failure_seed_start: int = FAILURE_SEED_START,
     lines: Sequence[str] | None = None,
-    threshold: float = FAILURE_THRESHOLD,
     seed: int = SEED,
     env_dir: Path = ENV_DIR,
     agent_name: str = AGENT_NAME,
@@ -436,9 +434,6 @@ def run_full_forecasting(
         raise ValueError("classifier_trials must be zero or positive.")
     if int(hgb_threads) <= 0:
         raise ValueError("hgb_threads must be positive.")
-    if not 0.0 <= float(threshold) <= 1.0:
-        raise ValueError("threshold must be between zero and one.")
-
     forecast_limit = _step_limit(forecast_max_steps, "forecast_max_steps")
     failure_limit = _step_limit(failure_max_steps, "failure_max_steps")
     env_dir = Path(env_dir)
@@ -673,7 +668,6 @@ def run_full_forecasting(
     _, classifier_info = train_failure_classifier(
         dataframe,
         model_path=paths["failure_classifier"],
-        threshold=float(threshold),
         seed=int(seed),
         env_name=ENV_NAME,
         agent_name=agent_name,
@@ -693,9 +687,18 @@ def run_full_forecasting(
     )
     metrics = classifier_info["metrics"]
     print(
-        f"[test] FA={metrics['false_alarm_pct']:.2f}% "
-        f"oversight={metrics['oversight_pct']:.2f}% "
-        f"AUC={metrics['roc_auc']:.3f}"
+        f"[test] threshold={classifier_info['decision_threshold']:.6f} "
+        f"F2={metrics['f2']:.3f} precision={metrics['precision']:.3f} "
+        f"recall={metrics['recall']:.3f} PR-AUC={metrics['pr_auc']:.3f} "
+        f"FA={metrics['false_alarms']} ({metrics['false_alarm_pct']:.2f}%) "
+        f"missed={metrics['missed_failures']} "
+        f"({metrics['missed_failure_pct']:.2f}%)"
+    )
+    baseline = classifier_info["baseline_threshold_0_5_metrics"]
+    print(
+        f"[baseline@0.5] F2={baseline['f2']:.3f} "
+        f"precision={baseline['precision']:.3f} recall={baseline['recall']:.3f} "
+        f"FA={baseline['false_alarms']} missed={baseline['missed_failures']}"
     )
     split = classifier_info["split"]
     print(
@@ -715,7 +718,7 @@ def run_full_forecasting(
 
     print("\n[6/6] Validate per-line inference")
     mean_model, aleatoric_model = _validate_artifacts(
-        paths, agent_name, float(threshold), selected_lines
+        paths, agent_name, selected_lines
     )
     predictions = _validate_inference(
         env_dir,

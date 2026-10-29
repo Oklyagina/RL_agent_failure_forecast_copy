@@ -1204,19 +1204,41 @@ def _failure_probability(model: Any, X: pd.DataFrame) -> np.ndarray:
 
 def _metrics(y_true: np.ndarray, y_pred: np.ndarray,
              probs: np.ndarray) -> Dict[str, Any]:
-    """Compute the legacy false-alarm, oversight, AUC, and confusion metrics."""
-    from sklearn.metrics import confusion_matrix, roc_auc_score
+    """Compute thresholded and ranking metrics for rare failure events."""
+    from sklearn.metrics import (
+        average_precision_score,
+        confusion_matrix,
+        fbeta_score,
+        precision_score,
+        recall_score,
+        roc_auc_score,
+    )
 
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
     fa = (fp / (tn + fp) * 100.0) if (tn + fp) else 0.0
     oversight = (fn / (tp + fn) * 100.0) if (tp + fn) else 0.0
+    precision = precision_score(y_true, y_pred, zero_division=0)
+    recall = recall_score(y_true, y_pred, zero_division=0)
+    f2 = fbeta_score(y_true, y_pred, beta=2, zero_division=0)
+    try:
+        pr_auc = float(average_precision_score(y_true, probs))
+    except ValueError:
+        pr_auc = float("nan")
     try:
         auc = float(roc_auc_score(y_true, probs))
     except ValueError:
         auc = float("nan")
     return {
+        "f2": float(f2),
+        "precision": float(precision),
+        "recall": float(recall),
+        "pr_auc": pr_auc,
+        "false_alarms": int(fp),
         "false_alarm_pct": float(fa),
+        "missed_failures": int(fn),
+        "missed_failure_pct": float(oversight),
+        # Keep the legacy name for readers of existing metadata.
         "oversight_pct": float(oversight),
         "roc_auc": auc,
         "confusion_matrix": cm.tolist(),
@@ -1320,48 +1342,97 @@ def _classifier_class_weight(choice: str) -> Any:
     return weights[choice]
 
 
-def _classifier_risk(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Legacy risk: 0.4 * false-alarm % + 0.6 * oversight % (oversights hurt more)."""
-    from sklearn.metrics import confusion_matrix
+def _classifier_f2(y_true: np.ndarray, probabilities: np.ndarray,
+                   threshold: float) -> float:
+    """Return F2 after applying ``threshold`` to failure probabilities."""
+    from sklearn.metrics import fbeta_score
 
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-    fa = (fp / (tn + fp) * 100.0) if (tn + fp) else 0.0
-    ovr = (fn / (tp + fn) * 100.0) if (tp + fn) else 0.0
-    return 0.4 * fa + 0.6 * ovr
+    predictions = (np.asarray(probabilities, dtype=float) >= float(threshold)).astype(int)
+    return float(fbeta_score(y_true, predictions, beta=2, zero_division=0))
+
+
+def _classifier_folds(
+    X: pd.DataFrame,
+    y: pd.Series,
+    groups: Optional[pd.Series],
+    *,
+    seed: int,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Build deterministic stratified folds, grouped by episode when possible."""
+    from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
+
+    min_class = int(y.value_counts().min())
+    n_splits = max(2, min(5, min_class))
+    if groups is not None and groups.nunique() >= n_splits:
+        return list(
+            StratifiedGroupKFold(
+                n_splits=n_splits, shuffle=True, random_state=seed
+            ).split(X, y, groups)
+        )
+    return list(
+        StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=seed
+        ).split(X, y)
+    )
+
+
+def _out_of_fold_probabilities(
+    X: pd.DataFrame,
+    y: pd.Series,
+    groups: Optional[pd.Series],
+    cat_indices: List[int],
+    params: Dict[str, Any],
+    *,
+    seed: int,
+) -> np.ndarray:
+    """Fit one classifier per fold and return predictions for held-out rows."""
+    from sklearn.ensemble import HistGradientBoostingClassifier
+
+    probabilities = np.full(len(X), np.nan, dtype=float)
+    for train_idx, validation_idx in _classifier_folds(X, y, groups, seed=seed):
+        model = HistGradientBoostingClassifier(
+            categorical_features=cat_indices, **params
+        )
+        model.fit(X.iloc[train_idx], y.iloc[train_idx])
+        probabilities[validation_idx] = _failure_probability(
+            model, X.iloc[validation_idx]
+        )
+    if np.isnan(probabilities).any():
+        raise RuntimeError("Out-of-fold classifier predictions are incomplete.")
+    return probabilities
+
+
+def _f2_optimal_threshold(y_true: np.ndarray,
+                          probabilities: np.ndarray) -> Tuple[float, float]:
+    """Select the exact best observed threshold, preferring recall on ties."""
+    probabilities = np.asarray(probabilities, dtype=float)
+    candidates = np.unique(np.concatenate(([0.0], probabilities)))
+    scored = [(_classifier_f2(y_true, probabilities, threshold), float(threshold))
+              for threshold in candidates]
+    best_f2 = max(score for score, _ in scored)
+    best_threshold = min(
+        threshold for score, threshold in scored
+        if np.isclose(score, best_f2, rtol=0.0, atol=1e-12)
+    )
+    return float(best_threshold), float(best_f2)
 
 
 def _optimize_classifier(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     groups_train: Optional[pd.Series],
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
     cat_indices: List[int],
     *,
     n_trials: int,
     seed: int,
     n_jobs: int,
 ) -> Tuple[Dict[str, Any], float, float]:
-    """Legacy Optuna search over HGB parameters, class weight and threshold.
-
-    Each trial is fitted on the five folds of the TRAINING split and scored on
-    the validation split with the legacy risk (the sampled threshold is tuned
-    but, as in the legacy code, not used by the risk).  Folds are built from
-    the training split only and grouped by episode when available.
-    """
+    """Maximize mean held-out-fold F2 over HGB parameters and threshold."""
     import optuna
     from sklearn.ensemble import HistGradientBoostingClassifier
-    from sklearn.model_selection import StratifiedGroupKFold, StratifiedKFold
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
-    min_class = int(y_train.value_counts().min())
-    n_splits = max(2, min(5, min_class))
-    if groups_train is not None and groups_train.nunique() >= n_splits:
-        folds = list(StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-                     .split(X_train, y_train, groups_train))
-    else:
-        folds = list(StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
-                     .split(X_train, y_train))
+    folds = _classifier_folds(X_train, y_train, groups_train, seed=seed)
 
     def objective(trial: Any) -> float:
         choice = trial.suggest_categorical(
@@ -1375,15 +1446,20 @@ def _optimize_classifier(
             "class_weight": _classifier_class_weight(choice),
             "random_state": seed,
         }
-        trial.suggest_float("threshold", 0.10, 0.90)
+        threshold = trial.suggest_float("threshold", 0.10, 0.90)
         scores = []
-        for train_idx, _ in folds:
+        for train_idx, validation_idx in folds:
             model = HistGradientBoostingClassifier(categorical_features=cat_indices, **params)
             model.fit(X_train.iloc[train_idx], y_train.iloc[train_idx])
-            scores.append(_classifier_risk(y_val.to_numpy(), model.predict(X_val)))
+            probabilities = _failure_probability(
+                model, X_train.iloc[validation_idx]
+            )
+            scores.append(_classifier_f2(
+                y_train.iloc[validation_idx].to_numpy(), probabilities, threshold
+            ))
         return float(np.mean(scores))
 
-    study = optuna.create_study(direction="minimize")
+    study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=int(n_trials), n_jobs=int(n_jobs))
     best = dict(study.best_params)
     optuna_threshold = float(best.pop("threshold"))
@@ -1396,19 +1472,13 @@ def train_failure_classifier(
     dataframe: pd.DataFrame,
     *,
     model_path: str | Path,
-    threshold: float = 0.5,
     seed: int = 42,
     env_name: str = "",
     agent_name: str = "",
     n_trials: int = DEFAULT_CLASSIFIER_TRIALS,
     n_jobs: int = -1,
 ) -> Tuple[Any, Dict[str, Any]]:
-    """Train the failure classifier with the legacy Optuna procedure.
-
-    ``n_trials <= 0`` skips the search and fits fixed balanced HGB parameters.
-    The final model is fitted on the training split only (as in the legacy
-    code) and evaluated on the test split with ``threshold``.
-    """
+    """Train the classifier and select its decision threshold by F2."""
     import joblib
     from sklearn.ensemble import HistGradientBoostingClassifier
 
@@ -1423,20 +1493,31 @@ def train_failure_classifier(
     (X_train, X_val, X_test, y_train, y_val, y_test,
      groups_train, split_info) = _split_classifier_rows(dataframe, seed=seed)
     cat_indices = [CLASSIFIER_FEATURES.index("line_id_encoded")]
-    optuna_threshold = None
-    optuna_best_risk = None
+    selected_threshold: float
+    best_f2: float
     if n_trials > 0:
-        params, optuna_threshold, optuna_best_risk = _optimize_classifier(
-            X_train, y_train, groups_train, X_val, y_val, cat_indices,
+        params, selected_threshold, best_f2 = _optimize_classifier(
+            X_train, y_train, groups_train, cat_indices,
             n_trials=int(n_trials), seed=int(seed), n_jobs=int(n_jobs))
     else:
         params = {"class_weight": "balanced", "learning_rate": 0.05,
                   "max_iter": 300, "random_state": int(seed)}
+        tuning_probabilities = _out_of_fold_probabilities(
+            X_train, y_train, groups_train, cat_indices, params, seed=int(seed)
+        )
+        selected_threshold, best_f2 = _f2_optimal_threshold(
+            y_train.to_numpy(), tuning_probabilities
+        )
+
+    X_fit = pd.concat([X_train, X_val], axis=0)
+    y_fit = pd.concat([y_train, y_val], axis=0)
     model = HistGradientBoostingClassifier(categorical_features=cat_indices, **params)
-    model.fit(X_train, y_train)
+    model.fit(X_fit, y_fit)
     probs = _failure_probability(model, X_test)
-    preds = (probs >= float(threshold)).astype(int)
+    preds = (probs >= selected_threshold).astype(int)
     metrics = _metrics(y_test.to_numpy(), preds, probs)
+    baseline_predictions = (probs >= 0.5).astype(int)
+    baseline_metrics = _metrics(y_test.to_numpy(), baseline_predictions, probs)
 
     model_path = Path(model_path)
     model_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1451,7 +1532,7 @@ def train_failure_classifier(
         "features": CLASSIFIER_FEATURES,
         "line_map": dataframe.attrs.get("line_map", {}),
         "failure_class": 1,
-        "decision_threshold": float(threshold),
+        "decision_threshold": float(selected_threshold),
         "forecast_horizon_steps": HORIZON_STEPS,
         "forecast_horizon_minutes": HORIZON_STEPS * STEP_MINUTES,
         "split": split_info,
@@ -1475,10 +1556,12 @@ def train_failure_classifier(
         "model_params": serializable,
         "optuna": {
             "n_trials": int(n_trials),
-            "best_risk": optuna_best_risk,
-            "best_threshold_unused": optuna_threshold,
+            "direction": "maximize",
+            "best_f2": float(best_f2),
+            "best_threshold": float(selected_threshold),
         },
         "metrics": metrics,
+        "baseline_threshold_0_5_metrics": baseline_metrics,
     }
     metadata_path = model_path.with_name("failure_classifier_metadata.json")
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")

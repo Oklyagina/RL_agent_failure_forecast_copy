@@ -1,4 +1,4 @@
-"""Train the t+12 failure classifier from collected rows (legacy Optuna search)."""
+"""Train the t+12 failure classifier and select its threshold by F2."""
 from __future__ import annotations
 
 import argparse
@@ -31,7 +31,6 @@ def main() -> None:
     parser.add_argument("--agent-name", default=AGENT_NAME)
     parser.add_argument("--input-csv", type=Path, default=None)
     parser.add_argument("--model-path", type=Path, default=None)
-    parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=SEED)
     parser.add_argument("--trials", type=int, default=FAILURE_CLASSIFIER_TRIALS,
                         help="Optuna trials (0 = fixed parameters, no search)")
@@ -44,7 +43,6 @@ def main() -> None:
     _, info = train_failure_classifier(
         df,
         model_path=model_path,
-        threshold=args.threshold,
         seed=args.seed,
         env_name=ENV_NAME,
         agent_name=args.agent_name,
@@ -56,9 +54,18 @@ def main() -> None:
     print(f"[labels] rows by reason: {info['label_reason_counts']}")
     print(f"[labels] rows by class: {info['label_counts']}")
     print(
-        f"[test] FA={metrics['false_alarm_pct']:.2f}% "
-        f"oversight={metrics['oversight_pct']:.2f}% "
-        f"AUC={metrics['roc_auc']:.3f}"
+        f"[test] threshold={info['decision_threshold']:.6f} "
+        f"F2={metrics['f2']:.3f} precision={metrics['precision']:.3f} "
+        f"recall={metrics['recall']:.3f} PR-AUC={metrics['pr_auc']:.3f} "
+        f"FA={metrics['false_alarms']} ({metrics['false_alarm_pct']:.2f}%) "
+        f"missed={metrics['missed_failures']} "
+        f"({metrics['missed_failure_pct']:.2f}%)"
+    )
+    baseline = info["baseline_threshold_0_5_metrics"]
+    print(
+        f"[baseline@0.5] F2={baseline['f2']:.3f} "
+        f"precision={baseline['precision']:.3f} recall={baseline['recall']:.3f} "
+        f"FA={baseline['false_alarms']} missed={baseline['missed_failures']}"
     )
 
 
