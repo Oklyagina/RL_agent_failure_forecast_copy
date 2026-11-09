@@ -5,6 +5,17 @@ forecast. The HGB probability and binary prediction remain authoritative.
 Distilled rules provide a short explanation and an explicitly labelled
 surrogate prediction.
 
+Rule targets use the HGB failure probability compared with `>= decision_threshold`
+from classifier metadata, matching runtime decisions. If the threshold is absent,
+the runtime default of 0.5 applies. Seeds, LLM feedback, candidate selection, and
+reported rule metrics all use these targets rather than the simulation labels.
+The metrics measure fidelity on the data used to select the rules; they are not
+held-out estimates of failure-prediction performance. Newly generated per-line
+`metrics.json` files and `summary.json` entries record `teacher_decision_threshold`.
+Existing saved rules retain their original targets until they are regenerated.
+Generator and critic guidance prioritize missed HGB failures and maximize F2.
+Both receive missed-failure examples first, followed by false alarms up to the example limit.
+
 ## Workflow
 
 Offline (run occasionally):

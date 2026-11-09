@@ -33,6 +33,8 @@ from src.explainability.rule_predictor import compile_rule, validate_rule
 from src.explainability.shap_cache import ShapSettings, validate_rankings_cache
 from src.failure_forecast import (
     CLASSIFIER_FEATURES,
+    FailureForecastPredictor,
+    _failure_probability,
     normalize_line_name,
     prepare_classifier_dataframe,
 )
@@ -102,7 +104,7 @@ def load_teacher_data(
     classifier_path: str | Path,
     metadata_path: str | Path,
 ) -> tuple[pd.DataFrame, Any, dict[str, int]]:
-    """Load current artifacts and label rows with the HGB teacher decision."""
+    """Label rows with the same probability threshold used by runtime HGB."""
     metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
     if list(metadata.get("features", [])) != FEATURES:
         raise ValueError("Classifier metadata feature order does not match current code.")
@@ -112,7 +114,10 @@ def load_teacher_data(
         normalize_line_name
     )
     model = joblib.load(classifier_path)
-    dataframe["target"] = model.predict(dataframe[FEATURES]).astype(int)
+    predictor = FailureForecastPredictor(model, metadata)
+    probabilities = _failure_probability(model, dataframe[FEATURES])
+    dataframe["target"] = (probabilities >= predictor.threshold).astype(int)
+    dataframe.attrs["teacher_decision_threshold"] = predictor.threshold
     return dataframe, model, line_map
 
 
@@ -313,7 +318,9 @@ def _wrong_examples(
     features: Sequence[str],
     limit: int,
 ) -> str:
-    wrong = rows.loc[predictions != rows["target"], ["target", *features]].head(limit)
+    """Show missed failures before false alarms, preserving order within each."""
+    wrong = rows.loc[predictions != rows["target"], ["target", *features]]
+    wrong = wrong.sort_values("target", ascending=False, kind="stable").head(limit)
     return "None" if wrong.empty else wrong.to_json(orient="records")
 
 
@@ -347,7 +354,10 @@ def distill_line(
     best_rule = seed.code
     best_predictions = seed.predictions
     best_metrics = seed.metrics
-    feedback = "Improve the baseline while keeping the rule compact."
+    feedback = (
+        "Maximize F2 agreement with HGB. Catch more failures, and focus on the "
+        "failures you missed. Keep the rule compact and avoid excessive false alarms."
+    )
     feature_summary = _feature_summary(rows, features)
 
     for iteration in range(1, config.iterations + 1):
@@ -411,6 +421,8 @@ def distill_line(
     line_dir.mkdir(parents=True, exist_ok=True)
     (line_dir / "best_rule.py").write_text(best_rule, encoding="utf-8")
     result = {"line": line_name, "features": features, **best_metrics}
+    if "teacher_decision_threshold" in rows.attrs:
+        result["teacher_decision_threshold"] = rows.attrs["teacher_decision_threshold"]
     (line_dir / "metrics.json").write_text(
         json.dumps(result, indent=2), encoding="utf-8"
     )

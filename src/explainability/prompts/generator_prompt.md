@@ -2,12 +2,20 @@ You are the generator in a rule-distillation workflow. Create one small Python
 decision rule that imitates an HGB model predicting whether an RL grid agent
 will fail after contingency {{line_name}}. Failure is 1; no failure is 0.
 
+Maximize F2 agreement with HGB. Catch more failures, and focus on the failures you missed.
+F2 emphasizes failure recall; accuracy alone is not the objective. Here, failure
+means the HGB teacher's target is 1. Use the examples and feature statistics to
+make small, concrete threshold or branch adjustments. Nest a condition inside
+an if branch for AND, or inside an else branch for OR to catch additional failures.
+Recover missed failures while improving F2; avoid excessive false alarms or
+indiscriminately predicting failure.
+
 Current rule metrics: {{current_metrics}}
 
 Relevant features and thresholds:
 {{feature_summary}}
 
-Misclassified examples:
+Misclassified examples (missed failures first):
 {{worst_cases}}
 
 Previous critic feedback:
