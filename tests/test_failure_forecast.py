@@ -576,11 +576,11 @@ class ClassifierTests(unittest.TestCase):
             self.assertEqual(info["label_counts"], {"1": 40, "0": 40})
             self.assertEqual(info["forecast_horizon_steps"], 12)
             self.assertEqual(info["optuna"]["n_trials"], 2)
-            self.assertEqual(info["optuna"]["direction"], "maximize")
-            self.assertEqual(
-                info["decision_threshold"], info["optuna"]["best_threshold"]
-            )
-            self.assertGreaterEqual(info["optuna"]["best_f2"], 0.0)
+            # Legacy objective: minimize 0.4*FA% + 0.6*OVR%, decide at 0.5.
+            self.assertEqual(info["optuna"]["direction"], "minimize")
+            self.assertEqual(info["decision_threshold"], 0.5)
+            self.assertGreaterEqual(info["optuna"]["best_risk"], 0.0)
+            self.assertIn("best_threshold_unused", info["optuna"])
             self.assertIn("class_weight", info["model_params"])
             self.assertEqual(info["split"]["strategy"], "episode_grouped")
             predictor = FailureForecastPredictor.load(path)

@@ -117,10 +117,8 @@ class LLMClient:
                 "max_tokens": self.config.max_tokens,
             }
             if self.config.enable_thinking is not None and not use_prompt_fallback:
-                payload["chat_template_kwargs"] = {
-                    "enable_thinking": self.config.enable_thinking,
-                }
-            started = time.perf_counter()
+                payload["chat_template_kwargs"] = {"enable_thinking": self.config.enable_thinking}
+
             try:
                 response = self.session.post(
                     self.config.api_url,
@@ -140,10 +138,7 @@ class LLMClient:
                         "reasoning_content_present="
                         f"{bool(message.get('reasoning_content'))})"
                     )
-                print(
-                    f"[explainability] Response received in "
-                    f"{time.perf_counter() - started:.2f}s"
-                )
+
                 return content
             except (
                 requests.RequestException,

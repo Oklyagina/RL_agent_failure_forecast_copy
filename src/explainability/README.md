@@ -13,8 +13,15 @@ The metrics measure fidelity on the data used to select the rules; they are not
 held-out estimates of failure-prediction performance. Newly generated per-line
 `metrics.json` files and `summary.json` entries record `teacher_decision_threshold`.
 Existing saved rules retain their original targets until they are regenerated.
-Generator and critic guidance prioritize missed HGB failures and maximize F2.
-Both receive missed-failure examples first, followed by false alarms up to the example limit.
+Generator and critic guidance maximize full-population F2, explicitly accounting
+for false positives and false negatives. Both receive population/confusion counts
+and examples of both error types when available, with missed failures shown first.
+The example budget is split evenly (an odd extra slot goes to missed failures),
+with unused slots filled from the other type. The critic also receives the best
+rule's metrics to distinguish rejected candidates from the retained baseline.
+Each run starts from a deterministic seed, not the previous run's saved rules.
+`prompts/llm_prompts.md` preserves the legacy prompts for reference; the active
+templates are `generator_prompt.md`, `critic_prompt.md`, and `repair_prompt.md`.
 
 ## Workflow
 

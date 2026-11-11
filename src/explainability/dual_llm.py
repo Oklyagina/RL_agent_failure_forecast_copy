@@ -21,6 +21,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from numpy import ndarray, dtype, bool_
+from tqdm import tqdm
 from sklearn.metrics import accuracy_score, confusion_matrix, fbeta_score
 
 from project_config import AGENT_NAME, ARTIFACTS_DIR, ENV_NAME
@@ -318,10 +319,30 @@ def _wrong_examples(
     features: Sequence[str],
     limit: int,
 ) -> str:
-    """Show missed failures before false alarms, preserving order within each."""
+    """Reserve examples for both error types, with missed failures first."""
     wrong = rows.loc[predictions != rows["target"], ["target", *features]]
-    wrong = wrong.sort_values("target", ascending=False, kind="stable").head(limit)
-    return "None" if wrong.empty else wrong.to_json(orient="records")
+    missed = wrong[wrong["target"] == 1]
+    alarms = wrong[wrong["target"] == 0]
+    missed_count = min(len(missed), (limit + 1) // 2)
+    alarm_count = min(len(alarms), limit - missed_count)
+    missed_count = min(len(missed), limit - alarm_count)
+    examples = pd.concat([missed.head(missed_count), alarms.head(alarm_count)])
+    return "None" if examples.empty else examples.to_json(orient="records")
+
+
+def _evaluation_context(rows: pd.DataFrame, predictions: np.ndarray) -> str:
+    """Expose full-population counts so sampled errors do not imply prevalence."""
+    target = rows["target"].to_numpy(dtype=int)
+    predicted = np.asarray(predictions, dtype=int)
+    return json.dumps({
+        "rows": len(target),
+        "teacher_failures": int(np.sum(target == 1)),
+        "teacher_no_failures": int(np.sum(target == 0)),
+        "tp": int(np.sum((target == 1) & (predicted == 1))),
+        "fn": int(np.sum((target == 1) & (predicted == 0))),
+        "fp": int(np.sum((target == 0) & (predicted == 1))),
+        "tn": int(np.sum((target == 0) & (predicted == 0))),
+    }, sort_keys=True)
 
 
 def _progress(step: int, total: int, message: str) -> None:
@@ -349,23 +370,25 @@ def distill_line(
 ) -> dict[str, Any]:
     """Generate, evaluate, and save one explanatory contingency rule."""
     features = _feature_order(rows, ranking)[: config.top_features]
-    _progress(1, 3, f"{line_name}: evaluating deterministic seed candidates")
+    # _progress(1, 3, f"{line_name}: evaluating deterministic seed candidates")
     seed = _seed_rule(rows, features)
     best_rule = seed.code
     best_predictions = seed.predictions
     best_metrics = seed.metrics
     feedback = (
-        "Maximize F2 agreement with HGB. Catch more failures, and focus on the "
-        "failures you missed. Keep the rule compact and avoid excessive false alarms."
+        "Maximize full-population F2 agreement with HGB. Start from the best rule, "
+        "consider both error types, and propose a localized improvement. "
+        "Keep the best rule unchanged if no improvement is supported."
     )
     feature_summary = _feature_summary(rows, features)
 
-    for iteration in range(1, config.iterations + 1):
+    for iteration in tqdm(range(1, config.iterations + 1), total=config.iterations + 1):
         prompt = _fill_template(
             PROMPTS_DIR / "generator_prompt.md",
             {
                 "line_name": line_name,
                 "current_metrics": json.dumps(best_metrics, sort_keys=True),
+                "evaluation_context": _evaluation_context(rows, best_predictions),
                 "feature_summary": feature_summary,
                 "worst_cases": _wrong_examples(
                     rows, best_predictions, features, config.max_error_examples
@@ -374,7 +397,7 @@ def distill_line(
                 "best_rule": best_rule,
             },
         )
-        _progress(2, 3, f"{line_name} iteration {iteration}/{config.iterations}: requesting a candidate rule; waiting")
+        # _progress(2, 3, f"{line_name} iteration {iteration}/{config.iterations}: requesting a candidate rule; waiting")
         try:
             raw = client.complete(prompt, temperature=config.temperature)
         except LLMUnavailableError as exc:
@@ -401,6 +424,8 @@ def distill_line(
             {
                 "current_rule": candidate,
                 "current_metrics": json.dumps(metrics, sort_keys=True),
+                "evaluation_context": _evaluation_context(rows, predictions),
+                "best_metrics": json.dumps(best_metrics, sort_keys=True),
                 "feature_summary": feature_summary,
                 "worst_cases": _wrong_examples(
                     rows, predictions, features, config.max_error_examples
@@ -408,7 +433,7 @@ def distill_line(
                 "best_rule": best_rule,
             },
         )
-        _progress(2, 3, f"{line_name} iteration {iteration}/{config.iterations}: Requesting rule feedback; waiting")
+        # _progress(2, 3, f"{line_name} iteration {iteration}/{config.iterations}: Requesting rule feedback; waiting")
         try:
             feedback = client.complete(
                 critic_prompt, temperature=config.temperature
