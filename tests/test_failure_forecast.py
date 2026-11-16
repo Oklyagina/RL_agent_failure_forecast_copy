@@ -554,6 +554,20 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(threshold, 0.0)
         self.assertAlmostEqual(f2, 5.0 / 6.0)
 
+    def test_vectorized_threshold_selection_matches_brute_force(self):
+        rng = np.random.default_rng(3)
+        for case in range(20):
+            labels = rng.integers(0, 2, 60)
+            probabilities = np.round(rng.random(60), 1 if case % 2 else 3)  # ties
+            candidates = np.unique(np.r_[0.0, probabilities])
+            scores = [_classifier_f2(labels, probabilities, t) for t in candidates]
+            best = max(scores)
+            expected = min(t for s, t in zip(scores, candidates)
+                           if np.isclose(s, best, rtol=0.0, atol=1e-12))
+            threshold, f2 = _f2_optimal_threshold(labels, probabilities)
+            self.assertEqual(threshold, expected)
+            self.assertAlmostEqual(f2, best)
+
     def test_metrics_report_rare_event_counts_and_scores(self):
         labels = np.array([0, 0, 0, 1, 1, 1])
         predictions = np.array([0, 1, 0, 1, 0, 1])
@@ -576,9 +590,20 @@ class ClassifierTests(unittest.TestCase):
             self.assertEqual(info["label_counts"], {"1": 40, "0": 40})
             self.assertEqual(info["forecast_horizon_steps"], 12)
             self.assertEqual(info["optuna"]["n_trials"], 2)
-            # Legacy objective: minimize 0.4*FA% + 0.6*OVR%, decide at 0.5.
+            # Legacy objective for the hyperparameters; threshold by OOF F2.
             self.assertEqual(info["optuna"]["direction"], "minimize")
-            self.assertEqual(info["decision_threshold"], 0.5)
+            self.assertEqual(info["threshold_selection"]["method"],
+                             "f2_on_train_val_episode_grouped_oof")
+            self.assertTrue(0.0 <= info["decision_threshold"] <= 1.0)
+            with np.load(path.with_name(info["teacher_oof"])) as cached:
+                oof = dict(cached)
+            fit_rows = info["split"]["train_rows"] + info["split"]["val_rows"]
+            self.assertEqual(len(oof["p_oof"]), fit_rows)
+            self.assertEqual(int(oof["n_rows"]), len(df))
+            self.assertEqual(
+                info["threshold_selection"]["oof_f2"],
+                _f2_optimal_threshold(df.loc[oof["index"], "label"], oof["p_oof"])[1],
+            )
             self.assertGreaterEqual(info["optuna"]["best_risk"], 0.0)
             self.assertIn("best_threshold_unused", info["optuna"])
             self.assertIn("class_weight", info["model_params"])
