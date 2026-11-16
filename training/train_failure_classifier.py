@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import sys
 from pathlib import Path
 
@@ -26,7 +28,49 @@ def default_dir(agent_name: str) -> Path:
     return ARTIFACTS_DIR / ENV_NAME / agent_name / "failure_forecast"
 
 
+def find_rows_csv(out_dir: Path) -> Path:
+    """Return ``out_dir``'s rows CSV, else the newest one in a sibling
+    ``failure_forecast*`` folder (for example a backup copy)."""
+    default = out_dir / "failure_forecast_rows.csv"
+    if default.exists():
+        return default
+    candidates = sorted(
+        out_dir.parent.glob("failure_forecast*/failure_forecast_rows.csv"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"No failure_forecast_rows.csv in {out_dir} or its sibling "
+            "failure_forecast* folders; pass --input-csv."
+        )
+    return candidates[0]
+
+
+def stop_immediately_on_ctrl_c() -> None:
+    """Exit at once on Ctrl-C, even while Optuna worker threads are fitting.
+
+    On Windows the main thread waits on those threads in a call Ctrl-C cannot
+    interrupt, so a console handler (run by Windows on its own thread) is used.
+    Nothing is saved: the model is only written after training finishes.
+    """
+    def stop(*_: object) -> int:
+        print("\n[abort] Ctrl-C: stopping now", flush=True)
+        os._exit(130)
+
+    signal.signal(signal.SIGINT, stop)
+    if sys.platform == "win32":
+        import ctypes
+
+        handler_type = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+        stop_immediately_on_ctrl_c.handler = handler_type(stop)  # keep a reference
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(
+            stop_immediately_on_ctrl_c.handler, True
+        )
+
+
 def main() -> None:
+    stop_immediately_on_ctrl_c()
     parser = argparse.ArgumentParser()
     parser.add_argument("--agent-name", default=AGENT_NAME)
     parser.add_argument("--input-csv", type=Path, default=None)
@@ -37,9 +81,13 @@ def main() -> None:
     args = parser.parse_args()
 
     out_dir = default_dir(args.agent_name)
-    input_csv = args.input_csv or (out_dir / "failure_forecast_rows.csv")
+    input_csv = args.input_csv or find_rows_csv(out_dir)
     model_path = args.model_path or (out_dir / "failure_classifier.pkl")
+    print(f"[data] rows CSV -> {input_csv}")
+    print(f"[data] model    -> {model_path}")
+    print("[data] loading rows ...", flush=True)
     df = prepare_classifier_dataframe(input_csv)
+    print(f"[data] {len(df)} rows loaded", flush=True)
     _, info = train_failure_classifier(
         df,
         model_path=model_path,

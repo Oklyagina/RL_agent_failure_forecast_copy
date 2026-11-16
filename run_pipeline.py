@@ -593,7 +593,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     if train_classifier:
         command = [
             sys.executable,
-            "training/train_faillure_classifyer.py",
+            "training/train_failure_classifier.py",
             "--agent-name", args.agent_name,
             "--input-csv", str(rows_csv),
             "--model-path", str(classifier),

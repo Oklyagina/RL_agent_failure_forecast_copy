@@ -242,7 +242,7 @@ collected rows under
 Train the classifier:
 
 ```bash
-python training/train_faillure_classifyer.py
+python training/train_failure_classifier.py
 ```
 
 Smoke-test one prediction:
