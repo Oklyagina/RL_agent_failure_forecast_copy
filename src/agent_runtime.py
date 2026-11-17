@@ -12,6 +12,8 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from src.pipeline_support import has_complete_policy
+
 
 AgentFactory = Callable[[Any], Any]
 
@@ -46,18 +48,6 @@ def import_agent_factory(spec: str) -> AgentFactory:
     return factory
 
 
-def _valid_curriculum_asset_dir(path: Path) -> bool:
-    model_dir = path / "model"
-    variables = model_dir / "variables"
-    required = (
-        path / "actions" / "actions.npy",
-        model_dir / "saved_model.pb",
-        variables / "variables.index",
-        variables / "variables.data-00000-of-00001",
-    )
-    return all(p.is_file() and p.stat().st_size > 0 for p in required)
-
-
 def build_agent(
     env: Any,
     *,
@@ -88,7 +78,7 @@ def build_agent(
                     "Set AGENT_FACTORY=module:function or pass an explicit factory."
                 )
             path = Path(agent_path)
-            if not _valid_curriculum_asset_dir(path):
+            if not has_complete_policy(path):
                 raise FileNotFoundError(
                     f"Agent assets at {path} are incomplete. Expected model/ and actions/ "
                     "with a valid SavedModel, or configure AGENT_FACTORY for another agent."

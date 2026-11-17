@@ -45,6 +45,7 @@ from project_config import (  # noqa: E402
     SEED,
 )
 from src.enn_models import EvidentialNetwork  # noqa: E402
+from src.pipeline_support import agent_artifact_dir, rollout_dir  # noqa: E402
 from training.train_enn import alpha_from_output, evidential_loss  # noqa: E402
 
 
@@ -84,11 +85,11 @@ class PreparedData:
 
 
 def default_rollout_dir(agent_name: str) -> Path:
-    return ARTIFACTS_DIR / ENV_NAME / agent_name / "rollouts"
+    return rollout_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
 
 
 def default_tuning_dir(agent_name: str) -> Path:
-    return ARTIFACTS_DIR / ENV_NAME / agent_name / "tuning"
+    return agent_artifact_dir(ARTIFACTS_DIR, ENV_NAME, agent_name) / "tuning"
 
 
 def parse_float_list(raw: str) -> list[float]:

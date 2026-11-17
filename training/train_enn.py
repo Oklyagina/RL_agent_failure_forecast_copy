@@ -32,24 +32,22 @@ from project_config import (AGENT_NAME, ARTIFACTS_DIR, ENN_ANNEAL_EPOCHS,
                             ENN_BATCH_SIZE, ENN_DROPOUT, ENN_EPOCHS,
                             ENN_HIDDEN_DIM, ENN_LR,
                             ENN_VAL_FRAC, ENV_NAME, SEED)
+from src.pipeline_support import display_path, model_dir, rollout_dir
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def default_rollout_dir(agent_name: str) -> Path:
-    return ARTIFACTS_DIR / ENV_NAME / agent_name / "rollouts"
+    return rollout_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
 
 
 def default_model_dir(agent_name: str) -> Path:
-    return ARTIFACTS_DIR / ENV_NAME / agent_name / "model"
+    return model_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
 
 
 def _display_path(path: Path) -> str:
-    try:
-        return path.resolve().relative_to(ROOT).as_posix()
-    except ValueError:
-        return str(path.resolve())
+    return display_path(path, ROOT)
 
 
 # --- evidential loss ---------------------------------------------------------
@@ -210,7 +208,7 @@ def main() -> None:
     calib_path = args.out_dir / "enn_pctile_calib.npz"
     save_calibration(calib_path, total_ref, action_ref)
     print(f"[ok] wrote {calib_path} (calibration on {n_cal} training states)")
-    print("Done -- run_example.py will pick these artifacts up "
+    print("Done -- `python main.py demo` will pick these artifacts up "
           "automatically.")
 
 

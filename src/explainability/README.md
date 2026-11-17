@@ -102,12 +102,12 @@ The modules implement this workflow as follows:
    invalid rules produce `explanation_status="unavailable"`; they do not replace
    or suppress the classifier result.
 
-Use the combined profile runner from the repository root:
+Train with explanations from one combined profile, from the repository root:
 
 ```powershell
-Copy-Item src/explainability/llm_config.example.json `
-  src/explainability/llm_config.json
-python run_llm_pipeline.py --config src/explainability/llm_config.json
+Copy-Item src/explainability/llm_config.example.json src/llm_config.json
+python main.py train --profile                      # uses src/llm_config.json
+python main.py train --profile path/to/profile.json
 ```
 
 Prefer `api_key_env` over storing a key in JSON. `project_config.py` already

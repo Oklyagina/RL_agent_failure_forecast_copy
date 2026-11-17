@@ -16,6 +16,7 @@ POST /api/v1/recommendation
   ->   [ {"title", "description", "use_case", "agent_type",
           "actions": [...], "kpis": {...}} ]
 GET  /health
+GET  /diagnostics
 ```
 
 ## Build and run
@@ -36,7 +37,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```bash
 curl -X POST http://localhost:8000/api/v1/recommendation \
      -H "Content-Type: application/json" \
-     --data @rte_recommendation.json
+     --data-raw '{"event":{},"context":{}}'
 ```
 
 Output — a list of recommendation dictionaries. ENN uncertainty is exposed as
@@ -77,5 +78,5 @@ Output — a list of recommendation dictionaries. ENN uncertainty is exposed as
    environment variables override `.env`, and `.env` overrides the defaults.
    Configure `ENV_NAME` and `ENV_LOCATION` so they resolve to the Grid2Op scenario directory:
    `<ENV_LOCATION>/<ENV_NAME>`. The container uses the same project-relative
-   layout as `run_example.py`; pass the existing `.env` at runtime with
+   layout as `python main.py demo`; pass the existing `.env` at runtime with
    `--env-file .env`, or provide equivalent environment variables another way.

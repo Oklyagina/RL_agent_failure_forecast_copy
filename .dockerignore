@@ -24,11 +24,9 @@ artifacts/**/failure_forecast/
 artifacts/**/rollouts/*
 !artifacts/**/rollouts/actions.npy
 artifacts/**/*.provenance.json
-artifacts/pipeline_smoke/
-artifacts/pipeline_smoke_scenario/
+artifacts_smoke/
 
 # Local-only repository files that are not referenced by the runtime image.
-export_artifacts.py
-run_pipeline.py
+main.py
 pytest.ini
 *.md

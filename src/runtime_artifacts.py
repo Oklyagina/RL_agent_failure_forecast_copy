@@ -2,7 +2,7 @@
 
 The example CLI, training collectors, and FastAPI service use the same
 implementation through this module.  Optional settings keep the historical
-``run_example.py`` override variables usable without coupling application code
+demo (``src/workflows/demo.py``) override variables usable without coupling application code
 to an executable script.
 """
 from __future__ import annotations
@@ -25,7 +25,12 @@ from project_config import (
     ENV_NAME,
     ROOT as PROJECT_ROOT,
 )
-from src.pipeline_support import has_valid_saved_model
+from src.pipeline_support import (
+    has_policy_layout,
+    has_valid_saved_model,
+    model_dir,
+    policy_candidates,
+)
 
 
 DEFAULT_SKIP_DIRS = frozenset(
@@ -56,15 +61,16 @@ def _settings(value: RuntimeArtifactSettings | None) -> RuntimeArtifactSettings:
 
 
 def _display(path: Path, settings: RuntimeArtifactSettings) -> str:
+    """Console form of ``path``: relative to the root, with OS separators."""
     try:
-        return path.resolve().relative_to(settings.root.resolve()).as_posix()
+        return str(path.relative_to(settings.root))
     except ValueError:
-        return str(path.resolve())
+        return str(path)
 
 
 def _relative_parts(path: Path, settings: RuntimeArtifactSettings) -> tuple[str, ...]:
     try:
-        return path.resolve().relative_to(settings.root.resolve()).parts
+        return path.relative_to(settings.root).parts
     except ValueError:
         return ()
 
@@ -73,7 +79,7 @@ def _artifact_rank(path: Path, settings: RuntimeArtifactSettings) -> int:
     parts = _relative_parts(path, settings)
     if parts and parts[0] == "artifacts":
         return 0
-    if path.resolve() == settings.root.resolve():
+    if path == settings.root:
         return 99
     return 1
 
@@ -107,11 +113,8 @@ def find_artifact_set(
         scaler_json = Path(settings.scaler_json)
         meta_json = Path(settings.enn_meta_json)
     else:
-        configured_dir = (
-            settings.artifacts_dir
-            / settings.env_name
-            / settings.agent_name
-            / "model"
+        configured_dir = model_dir(
+            settings.artifacts_dir, settings.env_name, settings.agent_name
         )
         candidates = []
         if (
@@ -155,7 +158,7 @@ def find_artifact_set(
     elif (meta_json.parent / "enn_pctile_calib.npz").is_file():
         calibration = meta_json.parent / "enn_pctile_calib.npz"
     elif (
-        meta_json.parent.resolve() == settings.root.resolve()
+        meta_json.parent == settings.root
         and (settings.root / "enn_pctile_calib.npz").is_file()
     ):
         calibration = settings.root / "enn_pctile_calib.npz"
@@ -286,15 +289,12 @@ def find_agent_dir(settings: RuntimeArtifactSettings | None = None) -> Path:
     settings = _settings(settings)
     if settings.agent_dir:
         return Path(settings.agent_dir)
-    preferred = [
-        settings.assets_dir / settings.env_name,
-        settings.assets_dir / "network36",
-    ]
+    preferred = policy_candidates(settings.assets_dir, settings.env_name)
     base = settings.root / "curriculumagent"
     invalid = []
     nested = sorted(path for path in base.rglob("*") if path.is_dir())
     for directory in [*preferred, base, *nested]:
-        if (directory / "model").is_dir() and (directory / "actions").is_dir():
+        if has_policy_layout(directory):
             if not has_valid_saved_model(directory):
                 invalid.append(directory)
                 continue

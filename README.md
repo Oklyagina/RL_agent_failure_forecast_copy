@@ -11,8 +11,9 @@ Compatible agents expose:
 agent.act(obs, reward, done)
 ```
 
-The active workflow is implemented by `run_pipeline.py`, `run_example.py`,
-`recommendation_uncertainty.py`, `training/`, and `app/`. The original workflow
+Everything is run through one entry point, `main.py` (workflows in
+`src/workflows/`), together with `recommendation_uncertainty.py`, `training/`,
+and `app/`. The original workflow
 is available only in Git history; see [Legacy Workflow](#legacy-workflow).
 
 ## Quick Links
@@ -53,18 +54,26 @@ artifacts/<ENV_NAME>/<AGENT_NAME>/
 environment/<ENV_NAME>
 ```
 
-### Main Scripts
-- `python smoke_test.py`: run every training stage with a tiny configuration
-  under `artifacts_smoke/`, leaving normal artifacts untouched. This verifies
-  integration, not model quality; if the tiny failure dataset contains only
-  one class, the test may add explicitly marked synthetic failure rows.
-- `python run_pipeline.py`: use `.env` settings to collect training data and
-  train all ENN and failure-forecast artifacts. Valid artifacts are reused, and
-  selected stages can be forced when needed.
-- `python run_example.py`: load pretrained artifacts and demonstrate live
+### Main Commands
+All commands go through `main.py`; `python main.py <command> --help` lists the
+options of each one.
+
+- `python main.py` (or `python main.py status`): show which artifacts exist,
+  which training stages would run, and whether the demo is ready. Read-only.
+- `python main.py demo`: load pretrained artifacts and demonstrate live
   recommendation uncertainty plus multi-line, one-hour-ahead failure
   forecasting. This command requires existing artifacts and does not train
   models.
+- `python main.py train`: use `.env` settings to collect training data and
+  train all ENN and failure-forecast artifacts. Valid artifacts are reused, and
+  selected stages can be forced when needed.
+- `python main.py train --profile [PATH]`: the same, plus SHAP ranking and LLM
+  rule distillation, with every option taken from one JSON profile (default
+  `src/llm_config.json`; see `src/explainability/README.md`).
+- `python main.py smoke`: run every training stage with a tiny configuration
+  under `artifacts_smoke/`, leaving normal artifacts untouched. This verifies
+  integration, not model quality; if the tiny failure dataset contains only
+  one class, the test may add explicitly marked synthetic failure rows.
 
 The workflow uses:
 
@@ -155,19 +164,20 @@ Grid2Op environment and returns an agent with an `act` method.
 Run the full training pipeline with the values configured in `.env`:
 
 ```bash
-python run_pipeline.py
+python main.py train
 ```
 
 Valid artifacts are reused automatically. Force individual stages when needed:
 
 ```bash
-python run_pipeline.py --force-stage enn
-python run_pipeline.py --force-stage forecast --force-stage classifier
-python run_pipeline.py --force-stage all
+python main.py train --force-stage enn
+python main.py train --force-stage forecast --force-stage classifier
+python main.py train --force-stage all
 ```
 
 Available stages are `enn-data`, `enn`, `forecast`, `failure-rows`, and
-`classifier`. Run `python run_pipeline.py --help` for all options.
+`classifier`. Run `python main.py train --help` for all options, or
+`python main.py status` to see what would run.
 
 ## ENN Training
 
@@ -247,12 +257,12 @@ environment.
 |-- curriculumagent/             CurriculumAgent implementation
 |-- environment/                 Local Grid2Op scenarios
 |-- src/                         Shared agent, data, and ENN modules
+|   `-- workflows/               demo, train, smoke, and status commands
 |-- tests/                       Synthetic unit and API tests
 |-- training/                    Data collection and training scripts
 |-- project_config.py            Shared environment configuration
-|-- recommendation_uncertainty.py
-|-- run_example.py
-`-- run_pipeline.py
+|-- main.py                      Single entry point (status/demo/train/smoke)
+`-- recommendation_uncertainty.py
 ```
 
 ## Legacy Workflow
@@ -273,5 +283,5 @@ result. See `src/explainability/README.md`.
 Run the disposable end-to-end smoke workflow with explanations using:
 
 ```powershell
-python smoke_test.py --llm-config path\to\llm_config.json
+python main.py smoke --llm-config path\to\llm_config.json
 ```
