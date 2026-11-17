@@ -21,6 +21,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from numpy import ndarray, dtype, bool_
+from tqdm import tqdm
 from sklearn.metrics import accuracy_score, confusion_matrix, fbeta_score
 
 from project_config import AGENT_NAME, ARTIFACTS_DIR, ENV_NAME
@@ -33,6 +34,9 @@ from src.explainability.rule_predictor import compile_rule, validate_rule
 from src.explainability.shap_cache import ShapSettings, validate_rankings_cache
 from src.failure_forecast import (
     CLASSIFIER_FEATURES,
+    FailureForecastPredictor,
+    _f2_optimal_threshold,
+    _failure_probability,
     normalize_line_name,
     prepare_classifier_dataframe,
 )
@@ -47,6 +51,9 @@ HGB_METADATA_PATH = FAILURE_FORECAST_DIR / "failure_classifier_metadata.json"
 SHAP_RANKINGS_FILE = FAILURE_FORECAST_DIR / "explainability" / "shap_rankings.json"
 OUTPUT_DIR = FAILURE_FORECAST_DIR / "explainability" / "rules"
 PROMPTS_DIR = HERE / "prompts"
+
+TREE_SEED_DEPTHS = (2, 3)
+TREE_SEED_MIN_LEAF = 50
 
 FEATURES = list(CLASSIFIER_FEATURES)
 FEATURES_FOR_LLM = [feature for feature in FEATURES if feature != "line_id_encoded"]
@@ -102,7 +109,15 @@ def load_teacher_data(
     classifier_path: str | Path,
     metadata_path: str | Path,
 ) -> tuple[pd.DataFrame, Any, dict[str, int]]:
-    """Load current artifacts and label rows with the HGB teacher decision."""
+    """Label rows with the same probability threshold used by runtime HGB.
+
+    When the classifier stage saved train+val out-of-fold probabilities
+    (metadata ``teacher_oof``), those rows are labelled from the OOF
+    probabilities and marked ``teacher_split == "fit"``; the remaining (test)
+    rows keep the runtime labels, which are out-of-sample there, and are marked
+    ``"holdout"``.  Without that file every row is ``"fit"`` with in-sample
+    runtime labels.
+    """
     metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
     if list(metadata.get("features", [])) != FEATURES:
         raise ValueError("Classifier metadata feature order does not match current code.")
@@ -112,7 +127,28 @@ def load_teacher_data(
         normalize_line_name
     )
     model = joblib.load(classifier_path)
-    dataframe["target"] = model.predict(dataframe[FEATURES]).astype(int)
+    predictor = FailureForecastPredictor(model, metadata)
+    probabilities = _failure_probability(model, dataframe[FEATURES])
+    dataframe["target"] = (probabilities >= predictor.threshold).astype(int)
+    dataframe["teacher_split"] = "fit"
+    dataframe.attrs["teacher_decision_threshold"] = predictor.threshold
+    dataframe.attrs["teacher_source"] = "in_sample_runtime"
+
+    oof_name = metadata.get("teacher_oof")
+    oof_path = Path(classifier_path).with_name(oof_name) if oof_name else None
+    if oof_path is not None and oof_path.is_file():
+        with np.load(oof_path) as stored:
+            cached = dict(stored)
+        index = cached["index"]
+        if int(cached["n_rows"]) == len(dataframe) and dataframe.index.isin(index).sum() == len(index):
+            fit = dataframe.index.isin(index)
+            dataframe.loc[index, "target"] = (cached["p_oof"] >= predictor.threshold).astype(int)
+            dataframe["teacher_split"] = np.where(fit, "fit", "holdout")
+            dataframe.attrs["teacher_source"] = "train_val_oof"
+        else:
+            LOGGER.warning("Ignoring %s: it does not match the classifier rows.", oof_path)
+    if dataframe.attrs["teacher_source"] != "train_val_oof":
+        LOGGER.warning("No out-of-fold teacher found; distilling against in-sample HGB labels.")
     return dataframe, model, line_map
 
 
@@ -265,8 +301,50 @@ def _constant_rule(value: int, rows: pd.DataFrame) -> _SeedResult:
     return _SeedResult(code, predictions, compute_metrics(rows["target"], predictions))
 
 
+def _tree_rule(rows: pd.DataFrame, features: Sequence[str], depth: int) -> str:
+    """Write a balanced decision tree with an F2-tuned leaf cut as a rule.
+
+    Missing values go to the ``else`` branch (``>`` is False for NaN), which
+    matches fitting on values filled with a large negative number.
+    """
+    from sklearn.tree import DecisionTreeClassifier
+
+    X = rows[list(features)].fillna(-1e9).to_numpy(dtype=float)
+    y = rows["target"].to_numpy(dtype=int)
+    tree = DecisionTreeClassifier(
+        max_depth=depth, class_weight="balanced",
+        min_samples_leaf=TREE_SEED_MIN_LEAF, random_state=0,
+    ).fit(X, y)
+    probabilities = tree.predict_proba(X)[:, 1]
+    cut, _ = _f2_optimal_threshold(y, probabilities)
+    leaf_label = dict(zip(tree.apply(X), (probabilities >= cut).astype(int)))
+    nodes = tree.tree_
+
+    def build(node: int) -> tuple:
+        if nodes.children_left[node] == -1:
+            return ("leaf", int(leaf_label.get(node, 0)))
+        left = build(nodes.children_left[node])
+        right = build(nodes.children_right[node])
+        if left[0] == right[0] == "leaf" and left[1] == right[1]:
+            return left
+        return ("split", features[nodes.feature[node]], float(nodes.threshold[node]), left, right)
+
+    def emit(node: tuple, indent: int) -> list[str]:
+        pad = "    " * indent
+        if node[0] == "leaf":
+            return [f"{pad}return {node[1]}"]
+        _, feature, threshold, left, right = node
+        return ([f"{pad}if x[{feature!r}] > {threshold!r}:"] + emit(right, indent + 1)
+                + [f"{pad}else:"] + emit(left, indent + 1))
+
+    return "\n".join(["def rule(x):"] + emit(build(0), 1)) + "\n"
+
+
 def _seed_rule(rows: pd.DataFrame, features: Sequence[str]) -> _SeedResult:
-    """Select the best one-split seed using vectorized candidate evaluation.
+    """Select the best deterministic seed: one split, or a depth-2/3 tree.
+
+    One-split candidates are evaluated vectorized; tree candidates (only when
+    the line has enough rows for a split) are evaluated as written rules.
 
     The returned predictions and metrics are reused by :func:`distill_line`, so
     the selected candidate is not evaluated a second time.
@@ -304,6 +382,14 @@ def _seed_rule(rows: pd.DataFrame, features: Sequence[str]) -> _SeedResult:
         if metrics["f2"] > best_f2:
             best = _SeedResult(code, predictions, metrics)
             best_f2 = metrics["f2"]
+    if len(rows) >= 2 * TREE_SEED_MIN_LEAF:
+        for depth in TREE_SEED_DEPTHS:
+            code = _tree_rule(rows, features, depth)
+            predictions = evaluate_rule(code, rows)
+            metrics = compute_metrics(targets, predictions)
+            if metrics["f2"] > best_f2:
+                best = _SeedResult(code, predictions, metrics)
+                best_f2 = metrics["f2"]
     return best
 
 
@@ -313,8 +399,30 @@ def _wrong_examples(
     features: Sequence[str],
     limit: int,
 ) -> str:
-    wrong = rows.loc[predictions != rows["target"], ["target", *features]].head(limit)
-    return "None" if wrong.empty else wrong.to_json(orient="records")
+    """Reserve examples for both error types, with missed failures first."""
+    wrong = rows.loc[predictions != rows["target"], ["target", *features]]
+    missed = wrong[wrong["target"] == 1]
+    alarms = wrong[wrong["target"] == 0]
+    missed_count = min(len(missed), (limit + 1) // 2)
+    alarm_count = min(len(alarms), limit - missed_count)
+    missed_count = min(len(missed), limit - alarm_count)
+    examples = pd.concat([missed.head(missed_count), alarms.head(alarm_count)])
+    return "None" if examples.empty else examples.to_json(orient="records")
+
+
+def _evaluation_context(rows: pd.DataFrame, predictions: np.ndarray) -> str:
+    """Expose full-population counts so sampled errors do not imply prevalence."""
+    target = rows["target"].to_numpy(dtype=int)
+    predicted = np.asarray(predictions, dtype=int)
+    return json.dumps({
+        "rows": len(target),
+        "teacher_failures": int(np.sum(target == 1)),
+        "teacher_no_failures": int(np.sum(target == 0)),
+        "tp": int(np.sum((target == 1) & (predicted == 1))),
+        "fn": int(np.sum((target == 1) & (predicted == 0))),
+        "fp": int(np.sum((target == 0) & (predicted == 1))),
+        "tn": int(np.sum((target == 0) & (predicted == 0))),
+    }, sort_keys=True)
 
 
 def _progress(step: int, total: int, message: str) -> None:
@@ -342,20 +450,25 @@ def distill_line(
 ) -> dict[str, Any]:
     """Generate, evaluate, and save one explanatory contingency rule."""
     features = _feature_order(rows, ranking)[: config.top_features]
-    _progress(1, 3, f"{line_name}: evaluating deterministic seed candidates")
+    # _progress(1, 3, f"{line_name}: evaluating deterministic seed candidates")
     seed = _seed_rule(rows, features)
     best_rule = seed.code
     best_predictions = seed.predictions
     best_metrics = seed.metrics
-    feedback = "Improve the baseline while keeping the rule compact."
+    feedback = (
+        "Maximize full-population F2 agreement with HGB. Start from the best rule, "
+        "consider both error types, and propose a localized improvement. "
+        "Keep the best rule unchanged if no improvement is supported."
+    )
     feature_summary = _feature_summary(rows, features)
 
-    for iteration in range(1, config.iterations + 1):
+    for iteration in tqdm(range(1, config.iterations + 1), total=config.iterations + 1):
         prompt = _fill_template(
             PROMPTS_DIR / "generator_prompt.md",
             {
                 "line_name": line_name,
                 "current_metrics": json.dumps(best_metrics, sort_keys=True),
+                "evaluation_context": _evaluation_context(rows, best_predictions),
                 "feature_summary": feature_summary,
                 "worst_cases": _wrong_examples(
                     rows, best_predictions, features, config.max_error_examples
@@ -364,7 +477,7 @@ def distill_line(
                 "best_rule": best_rule,
             },
         )
-        _progress(2, 3, f"{line_name} iteration {iteration}/{config.iterations}: requesting a candidate rule; waiting")
+        # _progress(2, 3, f"{line_name} iteration {iteration}/{config.iterations}: requesting a candidate rule; waiting")
         try:
             raw = client.complete(prompt, temperature=config.temperature)
         except LLMUnavailableError as exc:
@@ -391,6 +504,8 @@ def distill_line(
             {
                 "current_rule": candidate,
                 "current_metrics": json.dumps(metrics, sort_keys=True),
+                "evaluation_context": _evaluation_context(rows, predictions),
+                "best_metrics": json.dumps(best_metrics, sort_keys=True),
                 "feature_summary": feature_summary,
                 "worst_cases": _wrong_examples(
                     rows, predictions, features, config.max_error_examples
@@ -398,7 +513,7 @@ def distill_line(
                 "best_rule": best_rule,
             },
         )
-        _progress(2, 3, f"{line_name} iteration {iteration}/{config.iterations}: Requesting rule feedback; waiting")
+        # _progress(2, 3, f"{line_name} iteration {iteration}/{config.iterations}: Requesting rule feedback; waiting")
         try:
             feedback = client.complete(
                 critic_prompt, temperature=config.temperature
@@ -411,6 +526,8 @@ def distill_line(
     line_dir.mkdir(parents=True, exist_ok=True)
     (line_dir / "best_rule.py").write_text(best_rule, encoding="utf-8")
     result = {"line": line_name, "features": features, **best_metrics}
+    if "teacher_decision_threshold" in rows.attrs:
+        result["teacher_decision_threshold"] = rows.attrs["teacher_decision_threshold"]
     (line_dir / "metrics.json").write_text(
         json.dumps(result, indent=2), encoding="utf-8"
     )
@@ -452,18 +569,32 @@ def distill_classifier(
         if line_rows.empty:
             LOGGER.warning("No classifier rows for explainability line %s", line_name)
             continue
-        print(f"[explainability] {line_name}: {len(line_rows)} rows")
+        holdout = line_rows[line_rows["teacher_split"] == "holdout"]
+        fit_rows = line_rows[line_rows["teacher_split"] == "fit"].copy()
+        fit_rows.attrs = dict(dataframe.attrs)
+        print(f"[explainability] {line_name}: {len(fit_rows)} rows "
+              f"({len(holdout)} held out)")
         try:
-            results.append(
-                distill_line(
-                    line_rows,
-                    line_name,
-                    client,
-                    output_dir,
-                    ranking=rankings.get(line_name),
-                    config=config,
-                )
+            result = distill_line(
+                fit_rows,
+                line_name,
+                client,
+                output_dir,
+                ranking=rankings.get(line_name),
+                config=config,
             )
+            result["teacher_source"] = dataframe.attrs["teacher_source"]
+            line_dir = Path(output_dir) / f"line_{line_name}"
+            if not holdout.empty:
+                # Fidelity on held-out (test) episodes, against the runtime HGB.
+                rule = (line_dir / "best_rule.py").read_text(encoding="utf-8")
+                scores = compute_metrics(holdout["target"], evaluate_rule(rule, holdout))
+                result["holdout_rows"] = len(holdout)
+                result.update({f"holdout_{key}": value for key, value in scores.items()})
+            (line_dir / "metrics.json").write_text(
+                json.dumps(result, indent=2), encoding="utf-8"
+            )
+            results.append(result)
         except (OSError, UnicodeError, ValueError, TypeError, KeyError) as exc:
             LOGGER.warning("Could not distil rule for %s: %s", line_name, exc)
 

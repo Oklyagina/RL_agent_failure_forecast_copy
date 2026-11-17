@@ -168,7 +168,7 @@ def main() -> None:
     if not args.skip_classifier:
         cmd = [
             sys.executable,
-            "training/train_faillure_classifyer.py",
+            "training/train_failure_classifier.py",
             "--agent-name", args.agent_name,
             "--input-csv", str(rows_csv),
             "--model-path", str(classifier),
