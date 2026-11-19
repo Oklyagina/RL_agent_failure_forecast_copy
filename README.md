@@ -11,8 +11,9 @@ Compatible agents expose:
 agent.act(obs, reward, done)
 ```
 
-The active workflow is implemented by `run_pipeline.py`, `run_example.py`,
-`recommendation_uncertainty.py`, `training/`, and `app/`. The original workflow
+Everything is run through one entry point, `main.py` (workflows in
+`src/workflows/`), together with `recommendation_uncertainty.py`, `training/`,
+and `app/`. The original workflow
 is available only in Git history; see [Legacy Workflow](#legacy-workflow).
 
 ## Quick Links
@@ -53,18 +54,33 @@ artifacts/<ENV_NAME>/<AGENT_NAME>/
 environment/<ENV_NAME>
 ```
 
-### Main Scripts
-- `python smoke_test.py`: run every training stage with a tiny configuration
+### Main Commands
+All commands go through `main.py`; `python main.py <command> --help` lists the
+options of each one.
+
+- `python main.py` (or `python main.py status`): show which artifacts exist,
+  which training stages would run, and whether the demo is ready. Read-only.
+- `python main.py demo`: load pretrained artifacts and run the full
+  operating-mode chain live: ENN recommendation uncertainty KPIs ->
+  multi-line, one-hour-ahead failure forecasts -> per-line rule explanations.
+  Explanations are added automatically when
+  `failure_forecast/explainability/rules/` exists (`--rules-dir PATH` to use
+  another directory, `--no-explain` to turn them off). Missing or invalid rules
+  only produce a warning; the HGB probabilities and predictions are identical
+  with or without explanations. The demo does not train models and needs
+  neither `failure_forecast_rows.csv`, `failure_classifier_oof.npz`, nor an LLM
+  configuration or key. Per-line results (with explanation fields) are in
+  `kpis["failure_forecasts"]`.
+- `python main.py train`: use `.env` settings to collect training data and
+  train all ENN and failure-forecast artifacts. Valid artifacts are reused, and
+  selected stages can be forced when needed.
+- `python main.py train --profile [PATH]`: the same, plus SHAP ranking and LLM
+  rule distillation, with every option taken from one JSON profile (default
+  `src/llm_config.json`; see `src/explainability/README.md`).
+- `python main.py smoke`: run every training stage with a tiny configuration
   under `artifacts_smoke/`, leaving normal artifacts untouched. This verifies
   integration, not model quality; if the tiny failure dataset contains only
   one class, the test may add explicitly marked synthetic failure rows.
-- `python run_pipeline.py`: use `.env` settings to collect training data and
-  train all ENN and failure-forecast artifacts. Valid artifacts are reused, and
-  selected stages can be forced when needed.
-- `python run_example.py`: load pretrained artifacts and demonstrate live
-  recommendation uncertainty plus multi-line, one-hour-ahead failure
-  forecasting. This command requires existing artifacts and does not train
-  models.
 
 The workflow uses:
 
@@ -155,19 +171,39 @@ Grid2Op environment and returns an agent with an `act` method.
 Run the full training pipeline with the values configured in `.env`:
 
 ```bash
-python run_pipeline.py
+python main.py train
 ```
 
 Valid artifacts are reused automatically. Force individual stages when needed:
 
 ```bash
-python run_pipeline.py --force-stage enn
-python run_pipeline.py --force-stage forecast --force-stage classifier
-python run_pipeline.py --force-stage all
+python main.py train --force-stage enn
+python main.py train --force-stage forecast --force-stage classifier
+python main.py train --force-stage all
 ```
 
-Available stages are `enn-data`, `enn`, `forecast`, `failure-rows`, and
-`classifier`. Run `python run_pipeline.py --help` for all options.
+Available stages are `enn-data`, `enn`, `forecast`, `failure-rows`,
+`classifier`, `explainability`, and `all`. Run `python main.py train --help`
+for all options, or `python main.py status` to see what would run. The
+preflight table states why each stage runs, e.g.
+`train (rows will be re-collected)`.
+
+Supplied models are never replaced implicitly. In operating mode the trained
+models are present but their training inputs (`rollouts/observations.npy`,
+`labels.npy`, `failure_forecast_rows.csv`) may not be. If a valid ENN bundle or
+failure classifier would be retrained without an explicit `--force-stage`
+(for its own stage or an upstream one), `train` stops after the preflight
+table, before any stage runs or any `*.provenance.json` is written:
+
+```bash
+# rows missing, valid classifier present -> stops; to rebuild deliberately:
+python main.py train --force-stage failure-rows
+```
+
+Existing explanation rules (`failure_forecast/explainability/rules/`) are
+reused by `train --profile`; they are regenerated only with
+`--force-stage explainability` (or `all`), or when the same run retrains the
+classifier they were distilled from.
 
 ## ENN Training
 
@@ -247,12 +283,12 @@ environment.
 |-- curriculumagent/             CurriculumAgent implementation
 |-- environment/                 Local Grid2Op scenarios
 |-- src/                         Shared agent, data, and ENN modules
+|   `-- workflows/               demo, train, smoke, and status commands
 |-- tests/                       Synthetic unit and API tests
 |-- training/                    Data collection and training scripts
 |-- project_config.py            Shared environment configuration
-|-- recommendation_uncertainty.py
-|-- run_example.py
-`-- run_pipeline.py
+|-- main.py                      Single entry point (status/demo/train/smoke)
+`-- recommendation_uncertainty.py
 ```
 
 ## Legacy Workflow
@@ -273,5 +309,5 @@ result. See `src/explainability/README.md`.
 Run the disposable end-to-end smoke workflow with explanations using:
 
 ```powershell
-python smoke_test.py --llm-config path\to\llm_config.json
+python main.py smoke --llm-config path\to\llm_config.json
 ```

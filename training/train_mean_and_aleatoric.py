@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from pathlib import Path
 
@@ -35,6 +34,12 @@ from src.failure_forecast import (  # noqa: E402
     load_or_train_forecasters,
     save_forecaster_training_data,
 )
+from src.pipeline_support import (  # noqa: E402
+    agent_artifact_dir as _agent_artifact_dir,
+    configure_quiet_logging,
+    has_policy_entrypoints,
+    resolve_policy_dir,
+)
 
 
 def print_stage(number: int, total: int, title: str) -> None:
@@ -44,40 +49,17 @@ def print_stage(number: int, total: int, title: str) -> None:
 
 def default_agent_artifact_dir(agent_name: str) -> Path:
     """Return the configured artifact root for one agent/environment pair."""
-    return ARTIFACTS_DIR / ENV_NAME / agent_name
-
-
-def default_forecast_dir(agent_name: str) -> Path:
-    """Return where forecast data and trained forecasters are stored."""
-    return default_agent_artifact_dir(agent_name) / "failure_forecast"
-
-
-def valid_policy_dir(path: Path) -> bool:
-    """Check whether a directory can be loaded as a CurriculumAgent package."""
-    return (
-        (path / "model" / "saved_model.pb").is_file()
-        and (path / "actions" / "actions.npy").is_file()
-    )
+    return _agent_artifact_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
 
 
 def default_policy_dir(agent_artifact_dir: Path) -> Path:
     """Prefer an explicit agent package, then fall back to active asset paths."""
-    candidates = [
-        agent_artifact_dir,
-        ASSETS_DIR / ENV_NAME,
-        ASSETS_DIR / "network36",
-    ]
-    for path in candidates:
-        if valid_policy_dir(path):
-            return path
-    return ASSETS_DIR / ENV_NAME
-
-
-def configure_quiet_logging() -> None:
-    """Suppress verbose policy INFO logs while preserving warnings/errors."""
-    logging.basicConfig(level=logging.WARNING, force=True)
-    logging.getLogger().setLevel(logging.WARNING)
-    logging.getLogger("curriculumagent").setLevel(logging.WARNING)
+    return resolve_policy_dir(
+        ASSETS_DIR,
+        ENV_NAME,
+        extra=[agent_artifact_dir],
+        validator=has_policy_entrypoints,
+    )
 
 
 def main() -> None:
@@ -166,7 +148,7 @@ def main() -> None:
             if spec:
                 agent = build_agent(env, factory_spec=spec, agent_path=None)
             else:
-                if not valid_policy_dir(policy_dir):
+                if not has_policy_entrypoints(policy_dir):
                     raise FileNotFoundError(
                         f"Policy agent directory is incomplete: {policy_dir}. "
                         "Expected model/saved_model.pb and actions/actions.npy. "

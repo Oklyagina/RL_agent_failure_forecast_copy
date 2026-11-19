@@ -1,15 +1,11 @@
-"""Training-data sources for the Evidential Neural Network (ENN).
+"""Training data for the Evidential Neural Network (ENN).
 
-The original project assumed CurriculumAgent tutor splits were always present.
-This module makes the source explicit and generic:
+The configured policy is run in Grid2Op and its observation/action pairs are
+behavior-cloned (``collect_policy_rollouts``); ``save_rollout_bundle`` persists
+them for ``training/train_enn.py``.
 
-* ``tutor``: use existing train/validation/test NPZ files when available;
-* ``rollout``: run the configured policy in Grid2Op and behavior-clone its
-  observation/action pairs;
-* ``auto`` (default): prefer tutor data, otherwise collect policy rollouts.
-
-Only the ``act`` interface is required from the agent.  A custom agent can be
-provided via an injected factory or ``AGENT_FACTORY=module:function``.
+Only the ``act`` interface is required from the agent (see
+``src.agent_runtime.build_agent`` for ``AGENT_FACTORY=module:function``).
 """
 from __future__ import annotations
 
@@ -20,9 +16,9 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import numpy as np
 
 try:
-    from .agent_runtime import build_agent, call_agent
+    from .agent_runtime import call_agent
 except ImportError:  # pragma: no cover - script execution via src/ on PYTHONPATH
-    from agent_runtime import build_agent, call_agent
+    from agent_runtime import call_agent
 
 
 @dataclass
@@ -33,60 +29,6 @@ class ENNDataBundle:
     source: str
     action_set: Optional[np.ndarray] = None
     action_set_path: Optional[Path] = None
-
-
-def load_npz_split(path: Path) -> Tuple[np.ndarray, np.ndarray]:
-    """Load a tutor-style NPZ split using tolerant state/action key matching."""
-    if not path.is_file():
-        raise FileNotFoundError(path)
-    with np.load(str(path), allow_pickle=False) as data:
-        keys = list(data.files)
-        state_key = next((k for k in keys if k.startswith("s_") or k in {"obs", "observations"}), None)
-        action_key = next((k for k in keys if k.startswith("a_") or k in {"act", "actions", "labels"}), None)
-        if state_key is None or action_key is None:
-            raise ValueError(
-                f"Invalid ENN split {path}: expected state/action arrays, found keys {keys}."
-            )
-        obs = np.asarray(data[state_key], dtype=np.float32)
-        actions = np.asarray(data[action_key], dtype=np.int64).reshape(-1)
-    if obs.ndim != 2 or actions.ndim != 1 or len(obs) == 0 or len(obs) != len(actions):
-        raise ValueError(
-            f"Invalid ENN split {path}: obs shape={obs.shape}, action shape={actions.shape}."
-        )
-    return obs, actions
-
-
-def tutor_bundle_if_available(cfg: Any) -> Optional[ENNDataBundle]:
-    """Return valid tutor data, or ``None`` when any required split is absent."""
-    paths = [Path(cfg.TRAIN_FILE), Path(cfg.VAL_FILE), Path(cfg.TEST_FILE)]
-    if not all(path.is_file() for path in paths):
-        return None
-    train, validation, test = (load_npz_split(path) for path in paths)
-
-    tutor_dir = Path(getattr(cfg, "TUTOR_DIR", paths[0].parent))
-    action_candidates = [
-        Path(cfg.AGENT_PATH) / "actions" / "actions.npy",
-        tutor_dir / "actions.npy",
-        tutor_dir.parent / "actions.npy",
-        tutor_dir.parent / "actions" / "actions.npy",
-    ]
-    action_path = next((path for path in action_candidates if path.is_file()), None)
-    action_set = None
-    if action_path is not None:
-        arr = np.load(action_path, allow_pickle=False)
-        if arr.ndim == 2:
-            action_set = np.asarray(arr, dtype=np.float32)
-        else:
-            action_path = None
-
-    return ENNDataBundle(
-        train=train,
-        validation=validation,
-        test=test,
-        source="tutor",
-        action_set=action_set,
-        action_set_path=action_path,
-    )
 
 
 def _stable_unique_rows(rows: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -235,71 +177,3 @@ def save_rollout_bundle(
         action_set_path=out_dir / "actions.npy",
     )
 
-
-def load_or_collect_enn_data(
-    cfg: Any,
-    *,
-    source: str = "auto",
-    rollout_dir: Optional[Path] = None,
-    episodes: int = 50,
-    seed: int = 0,
-    max_steps: Optional[int] = None,
-    env_factory: Optional[Callable[[], Any]] = None,
-    agent_factory: Optional[Callable[[Any], Any]] = None,
-    agent_factory_spec: Optional[str] = None,
-) -> ENNDataBundle:
-    """Resolve ENN data from tutor files or by executing the configured policy."""
-    source = source.lower().strip()
-    if source not in {"auto", "tutor", "rollout"}:
-        raise ValueError("source must be one of: auto, tutor, rollout")
-
-    if source in {"auto", "tutor"}:
-        tutor = tutor_bundle_if_available(cfg)
-        if tutor is not None and tutor.action_set is not None:
-            return tutor
-        if source == "tutor":
-            if tutor is None:
-                raise FileNotFoundError(
-                    "Tutor data was explicitly requested but one or more ENN tutor splits are missing."
-                )
-            raise FileNotFoundError(
-                "Tutor splits exist, but no compatible 2-D policy action set was found. "
-                "The action vectors are required to preserve the ENN class/action contract."
-            )
-
-    if rollout_dir is None:
-        configured = getattr(cfg, "ENN_ROLLOUT_DIR", None)
-        rollout_dir = Path(configured) if configured else Path(cfg.MODEL_ENN_PATH).parent / "enn_rollouts"
-
-    if env_factory is None:
-        import grid2op
-        try:
-            from lightsim2grid import LightSimBackend
-            env_factory = lambda: grid2op.make(cfg.ENV_NAME, backend=LightSimBackend())
-        except ImportError:  # pragma: no cover
-            env_factory = lambda: grid2op.make(cfg.ENV_NAME)
-
-    env = env_factory()
-    try:
-        agent = build_agent(
-            env,
-            factory=agent_factory,
-            factory_spec=agent_factory_spec,
-            agent_path=getattr(cfg, "AGENT_PATH", None),
-        )
-        observations, labels, actions = collect_policy_rollouts(
-            env, agent, episodes=episodes, seed=seed, max_steps=max_steps
-        )
-    finally:
-        try:
-            env.close()
-        except Exception:
-            pass
-
-    return save_rollout_bundle(
-        rollout_dir,
-        observations,
-        labels,
-        actions,
-        seed=seed,
-    )

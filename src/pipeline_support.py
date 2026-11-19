@@ -122,8 +122,21 @@ def parse_lines(raw: str | None, env: Any | None = None) -> list[Any]:
     return list(names)
 
 
-def configure_quiet_logging() -> None:
-    """Keep long-running stages focused on warnings and progress output."""
+def configure_quiet_logging(include_curriculumagent: bool = True) -> None:
+    """Keep long-running stages focused on warnings and progress output.
+
+    ``include_curriculumagent=False`` leaves the ``curriculumagent`` logger
+    level untouched (historical rollout-collector behavior).
+    """
     logging.basicConfig(level=logging.WARNING, force=True)
     logging.getLogger().setLevel(logging.WARNING)
-    logging.getLogger("curriculumagent").setLevel(logging.WARNING)
+    if include_curriculumagent:
+        logging.getLogger("curriculumagent").setLevel(logging.WARNING)
+
+
+def display_path(path: Path, root: Path) -> str:
+    """Return ``path`` relative to ``root`` (POSIX style), else absolute."""
+    try:
+        return Path(path).resolve().relative_to(root).as_posix()
+    except ValueError:
+        return str(Path(path).resolve())

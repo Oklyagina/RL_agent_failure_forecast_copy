@@ -8,7 +8,6 @@ an object exposing ``act``.
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from pathlib import Path
 
@@ -27,30 +26,24 @@ from project_config import (
 )
 from src.agent_runtime import build_agent
 from src.enn_data import collect_policy_rollouts, save_rollout_bundle
+from src.pipeline_support import (
+    configure_quiet_logging,
+    resolve_policy_dir,
+    rollout_dir,
+)
 
 
 def default_rollout_dir(agent_name: str) -> Path:
-    return ARTIFACTS_DIR / ENV_NAME / agent_name / "rollouts"
-
-
-def _candidate_agent_dirs() -> list[Path]:
-    return [
-        ASSETS_DIR / ENV_NAME,
-        ASSETS_DIR / "network36",
-    ]
+    return rollout_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
 
 
 def _default_agent_path() -> Path:
-    for path in _candidate_agent_dirs():
-        if (path / "model").is_dir() and (path / "actions").is_dir():
-            return path
-    return ASSETS_DIR / ENV_NAME
+    return resolve_policy_dir(ASSETS_DIR, ENV_NAME)
 
 
 def configure_logging() -> None:
     """Keep rollout collection output focused on warnings and progress."""
-    logging.basicConfig(level=logging.WARNING, force=True)
-    logging.getLogger().setLevel(logging.WARNING)
+    configure_quiet_logging(include_curriculumagent=False)
 
 
 def collect(

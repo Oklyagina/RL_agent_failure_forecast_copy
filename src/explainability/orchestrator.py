@@ -10,11 +10,8 @@ import numpy as np
 from src.failure_forecast import (
     FailureForecastConfig,
     FailureForecastPredictor,
-    build_feature_row,
-    eligible_lines,
-    forecast_injections,
+    iter_contingency_feature_rows,
     normalize_line_name,
-    simulate_forecast_state,
 )
 from src.explainability.rule_predictor import RuleExplainer
 
@@ -89,28 +86,13 @@ class ExplainabilityOrchestrator:
         get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
     ) -> list[dict[str, Any]]:
         """Build the common forecast once, then score/explain every contingency."""
-        if not observations or observations[-1] is not obs:
-            raise ValueError("observations must end with the current observation")
-        forecast = forecast_injections(
-            observations,
-            mean_model,
-            aleatoric_model,
-            cfg,
-            model_enn=model_enn,
-            get_uncertainty_fn=get_uncertainty_fn,
-        )
-        forecast.update(
-            simulate_forecast_state(
-                obs,
-                forecast,
-                env,
-                model_enn=model_enn,
+        return [
+            self.explain_from_features(row)
+            for _, row in iter_contingency_feature_rows(
+                obs, observations, lines, mean_model, aleatoric_model, cfg,
+                env=env, model_enn=model_enn,
                 get_uncertainty_fn=get_uncertainty_fn,
             )
-        )
-        return [
-            self.explain_from_features(build_feature_row(obs, line, forecast, cfg))
-            for line in eligible_lines(cfg, obs, lines)
         ]
 
     def model_descriptions(self) -> dict[str, str]:

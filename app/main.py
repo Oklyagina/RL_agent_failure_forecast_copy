@@ -47,6 +47,8 @@ from project_config import (
     ENV_NAME,
     ROOT as PROJECT_ROOT,
 )
+from src import runtime_artifacts
+from src.pipeline_support import display_path, model_dir as _model_dir
 
 
 # --------------------------------------------------------------------------- #
@@ -138,10 +140,7 @@ class ApiRuntimeError(Exception):
 
 
 def _display_path(path: Path) -> str:
-    try:
-        return path.resolve().relative_to(PROJECT_ROOT).as_posix()
-    except ValueError:
-        return str(path.resolve())
+    return display_path(path, PROJECT_ROOT)
 
 
 def _file_info(path: Path) -> Dict[str, Any]:
@@ -168,10 +167,8 @@ def _read_json(path: Path, stage: str) -> Dict[str, Any]:
 
 
 def _find_agent_dir() -> Path:
-    import run_example as rx
-
     try:
-        return rx.find_agent_dir()
+        return runtime_artifacts.find_agent_dir()
     except SystemExit as exc:
         checked = [
             _display_path(ASSETS_DIR / ENV_NAME),
@@ -190,16 +187,14 @@ def _find_agent_dir() -> Path:
 
 
 def _api_artifact_paths() -> Dict[str, Path]:
-    """Select artifacts with the same discovery path used by run_example.py."""
-    import run_example as rx
-
+    """Select artifacts with the same discovery path used by ``main.py demo``."""
     try:
-        scaler_json, meta_json, npz = rx.find_artifact_set()
+        scaler_json, meta_json, npz = runtime_artifacts.find_artifact_set()
         meta = _read_json(meta_json, "read_metadata")
-        weights = rx.find_enn_weights(prefer_dir=meta_json.parent)
-        actions = rx.find_actions_npy(meta)
+        weights = runtime_artifacts.find_enn_weights(prefer_dir=meta_json.parent)
+        actions = runtime_artifacts.find_actions_npy(meta)
     except SystemExit as exc:
-        model_dir = ARTIFACTS_DIR / ENV_NAME / AGENT_NAME / "model"
+        model_dir = _model_dir(ARTIFACTS_DIR, ENV_NAME, AGENT_NAME)
         raise ApiConfigurationError(
             error="artifact_missing",
             stage="select_artifacts",
@@ -211,7 +206,7 @@ def _api_artifact_paths() -> Dict[str, Path]:
                 "calibration": _file_info(model_dir / "enn_pctile_calib.npz"),
             },
             hint="Use the same refactored ENN artifacts discovered by "
-                 "run_example.py, or configure the shared .env/project_config.py "
+                 "`python main.py demo`, or configure the shared .env/project_config.py "
                  "paths so artifacts/<ENV_NAME>/<AGENT_NAME>/ is available.",
         ) from exc
 
@@ -320,7 +315,6 @@ def get_services():
 
     import grid2op
     from lightsim2grid import LightSimBackend
-    import run_example as rx
     from recommendation_uncertainty import load_calibration
 
     env = grid2op.make(str(ENV_DIR), backend=LightSimBackend())
@@ -334,9 +328,9 @@ def get_services():
     actions_path = paths["actions"]
     agent_dir = None if AGENT_FACTORY else _find_agent_dir()
 
-    agent = rx.load_agent(env, agent_dir)
+    agent = runtime_artifacts.load_agent(env, agent_dir)
     try:
-        enn = rx.load_enn(weights, meta)
+        enn = runtime_artifacts.load_enn(weights, meta)
     except RuntimeError as exc:
         raise ApiConfigurationError(
             error="artifact_compatibility_error",
@@ -352,7 +346,7 @@ def get_services():
                  "from the same refactored training run.",
         ) from exc
     calibration = load_calibration(
-        str(npz), scaler=rx.scaler_from_json(scaler_json),
+        str(npz), scaler=runtime_artifacts.scaler_from_json(scaler_json),
         action_set=str(actions_path), class_mapping=str(meta_json))
     return env, agent, enn, calibration
 
