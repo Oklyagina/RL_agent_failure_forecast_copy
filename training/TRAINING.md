@@ -33,11 +33,17 @@ Train and export the ENN bundle:
 python training/train_enn.py
 ```
 
-Run the local demo:
+Run the local demo (ENN KPIs -> t+12 failure forecasts -> per-line rule
+explanations when `failure_forecast/explainability/rules/` exists):
 
 ```bash
 python main.py demo
+python main.py demo --no-explain
+python main.py demo --rules-dir path/to/rules
 ```
+
+The demo uses only the supplied runtime artifacts; it does not need
+`failure_forecast_rows.csv`, `failure_classifier_oof.npz`, or an LLM config.
 
 To run all active ENN and failure-forecast training stages from `.env`, use:
 
@@ -45,7 +51,13 @@ To run all active ENN and failure-forecast training stages from `.env`, use:
 python main.py train
 ```
 
-`python main.py status` shows which stages would run without running them.
+`python main.py status` shows which stages would run without running them,
+and whether explanation rules are present. A valid supplied ENN bundle,
+classifier, or rule set is never replaced without an explicit
+`--force-stage` (`enn-data`/`enn`, `failure-rows`/`classifier`,
+`explainability`, or `all`); if training inputs such as
+`failure_forecast_rows.csv` are missing, `train` stops in preflight without
+writing anything and says which file to restore or which flag to pass.
 The original pipeline implementation is available only in Git history at
 commit `08781bf` (14 August 2026).
 

@@ -8,6 +8,8 @@ from __future__ import annotations
 from project_config import AGENT_FACTORY, AGENT_NAME
 from src.workflows import train
 
+_IDLE_ACTIONS = ("reuse", "keep", "skip")
+
 
 def _missing_demo_files(agent_name: str) -> list[str]:
     """Files ``demo`` loads; empty when the demo can run."""
@@ -34,17 +36,29 @@ def run(agent_name: str = AGENT_NAME) -> None:
     train.print_preflight(plan.preflight_rows(), agent_name)
 
     pending = [stage for stage, _, action in plan.preflight_rows()
-               if action not in ("reuse", "keep")]
+               if not action.startswith(_IDLE_ACTIONS)]
     missing_demo = _missing_demo_files(agent_name)
+    n_rules = train.count_rules(plan.rules_dir)
     print()
-    if pending:
+    if plan.blocked:
+        print("  'python main.py train' would stop before running anything:")
+        for reason in plan.blocked:
+            print(f"    - {reason}")
+    elif pending:
         print(f"  Training needed for: {', '.join(pending)}")
         print("  Next: python main.py train")
     else:
         print("  All training stages are up to date.")
+    if n_rules:
+        print(f"  Explanation rules: {n_rules} lines in {plan.rules_dir}")
+    else:
+        print(f"  Explanation rules: none in {plan.rules_dir} "
+              "(demo runs without explanations; generate with "
+              "python main.py train --profile)")
     if missing_demo:
         print("  Demo not ready; missing:")
         for item in missing_demo:
             print(f"    - {item}")
     else:
-        print("  Demo ready: python main.py demo")
+        suffix = " (with rule explanations)" if n_rules else ""
+        print(f"  Demo ready{suffix}: python main.py demo")

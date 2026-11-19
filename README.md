@@ -60,10 +60,17 @@ options of each one.
 
 - `python main.py` (or `python main.py status`): show which artifacts exist,
   which training stages would run, and whether the demo is ready. Read-only.
-- `python main.py demo`: load pretrained artifacts and demonstrate live
-  recommendation uncertainty plus multi-line, one-hour-ahead failure
-  forecasting. This command requires existing artifacts and does not train
-  models.
+- `python main.py demo`: load pretrained artifacts and run the full
+  operating-mode chain live: ENN recommendation uncertainty KPIs ->
+  multi-line, one-hour-ahead failure forecasts -> per-line rule explanations.
+  Explanations are added automatically when
+  `failure_forecast/explainability/rules/` exists (`--rules-dir PATH` to use
+  another directory, `--no-explain` to turn them off). Missing or invalid rules
+  only produce a warning; the HGB probabilities and predictions are identical
+  with or without explanations. The demo does not train models and needs
+  neither `failure_forecast_rows.csv`, `failure_classifier_oof.npz`, nor an LLM
+  configuration or key. Per-line results (with explanation fields) are in
+  `kpis["failure_forecasts"]`.
 - `python main.py train`: use `.env` settings to collect training data and
   train all ENN and failure-forecast artifacts. Valid artifacts are reused, and
   selected stages can be forced when needed.
@@ -175,9 +182,28 @@ python main.py train --force-stage forecast --force-stage classifier
 python main.py train --force-stage all
 ```
 
-Available stages are `enn-data`, `enn`, `forecast`, `failure-rows`, and
-`classifier`. Run `python main.py train --help` for all options, or
-`python main.py status` to see what would run.
+Available stages are `enn-data`, `enn`, `forecast`, `failure-rows`,
+`classifier`, `explainability`, and `all`. Run `python main.py train --help`
+for all options, or `python main.py status` to see what would run. The
+preflight table states why each stage runs, e.g.
+`train (rows will be re-collected)`.
+
+Supplied models are never replaced implicitly. In operating mode the trained
+models are present but their training inputs (`rollouts/observations.npy`,
+`labels.npy`, `failure_forecast_rows.csv`) may not be. If a valid ENN bundle or
+failure classifier would be retrained without an explicit `--force-stage`
+(for its own stage or an upstream one), `train` stops after the preflight
+table, before any stage runs or any `*.provenance.json` is written:
+
+```bash
+# rows missing, valid classifier present -> stops; to rebuild deliberately:
+python main.py train --force-stage failure-rows
+```
+
+Existing explanation rules (`failure_forecast/explainability/rules/`) are
+reused by `train --profile`; they are regenerated only with
+`--force-stage explainability` (or `all`), or when the same run retrains the
+classifier they were distilled from.
 
 ## ENN Training
 

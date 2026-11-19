@@ -2,8 +2,13 @@
 
     python main.py                    show what is trained and what to run next
     python main.py status             same as above
-    python main.py demo               run the trained models live on Grid2Op
-    python main.py train [options]    train every model (stages are reused when valid)
+    python main.py demo [--no-explain] [--rules-dir PATH]
+                                      run the trained models live on Grid2Op:
+                                      ENN KPIs, t+12 failure forecasts, and
+                                      per-line rule explanations
+    python main.py train [options]    train every model (stages are reused when valid;
+                                      a valid ENN/classifier/rule set is replaced only
+                                      with an explicit --force-stage)
     python main.py train --profile [PATH]
                                       train with LLM explanations, all options from
                                       one JSON profile (default: src/llm_config.json)
@@ -36,7 +41,25 @@ def build_parser(command: str | None = None) -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     commands.add_parser("status", help="show trained artifacts and the next step")
-    commands.add_parser("demo", help="run the trained models live on Grid2Op")
+    demo_parser = commands.add_parser(
+        "demo",
+        help="run the trained models live on Grid2Op",
+        description="ENN uncertainty -> t+12 failure forecast -> per-line rule "
+                    "explanations (when failure_forecast/explainability/rules/ "
+                    "exists). Needs no training rows, OOF file, or LLM config.",
+    )
+    demo_parser.add_argument(
+        "--no-explain",
+        action="store_true",
+        help="skip rule explanations (HGB forecasts are identical either way)",
+    )
+    demo_parser.add_argument(
+        "--rules-dir",
+        type=Path,
+        default=None,
+        help="distilled-rule directory (default: "
+             "<artifacts>/failure_forecast/explainability/rules)",
+    )
 
     train_parser = commands.add_parser(
         "train",
@@ -102,7 +125,7 @@ def main(argv: list[str] | None = None) -> None:
     elif command == "demo":
         from src.workflows import demo
 
-        demo.run()
+        demo.run(explain=not args.no_explain, rules_dir=args.rules_dir)
     elif command == "train":
         _run_train(args, parser)
     elif command == "smoke":

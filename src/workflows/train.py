@@ -70,7 +70,21 @@ from src.failure_forecast import (  # noqa: E402
 )
 from src import pipeline_support  # noqa: E402
 
-FORCE_STAGES = ("enn-data", "enn", "forecast", "failure-rows", "classifier", "all")
+FORCE_STAGES = (
+    "enn-data", "enn", "forecast", "failure-rows", "classifier",
+    "explainability", "all",
+)
+# Forced stages that explicitly allow a valid, existing model to be replaced.
+# Forcing an upstream stage consents to the downstream cascade it causes.
+ENN_REBUILD_STAGES = frozenset({"all", "enn-data", "enn"})
+CLASSIFIER_REBUILD_STAGES = frozenset(
+    {"all", "enn-data", "enn", "forecast", "failure-rows", "classifier"}
+)
+RULES_REBUILD_STAGES = frozenset({"all", "explainability"})
+
+
+class PreflightStop(SystemExit):
+    """Raised before any stage runs or any file is written."""
 
 
 def agent_artifact_dir(agent_name: str) -> Path:
@@ -87,6 +101,17 @@ def model_dir(agent_name: str) -> Path:
 
 def failure_dir(agent_name: str) -> Path:
     return pipeline_support.failure_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
+
+
+def default_rules_dir(agent_name: str) -> Path:
+    return failure_dir(agent_name) / "explainability" / "rules"
+
+
+def count_rules(rules_dir: Path | None) -> int:
+    """Number of distilled ``line_*/best_rule.py`` files in ``rules_dir``."""
+    if rules_dir is None or not Path(rules_dir).is_dir():
+        return 0
+    return sum(1 for _ in Path(rules_dir).glob("line_*/best_rule.py"))
 
 
 def run_explainability_stage(
@@ -384,28 +409,69 @@ class StagePlan:
     train_forecasters: bool
     collect_rows: bool
     train_classifier: bool
+    rules_dir: Path
+    rules_check: StageCheck
+    regenerate_rules: bool
+    reasons: dict[str, str]
+    blocked: list[str]
+
+    def _action(self, verb: str, key: str, runs: bool) -> str:
+        return f"{verb} ({self.reasons[key]})" if runs else "reuse"
 
     def preflight_rows(self) -> list[tuple[str, StageCheck, str]]:
+        if self.regenerate_rules:
+            rules_action = f"regenerate ({self.reasons['rules']})"
+        elif self.rules_check.reusable:
+            rules_action = "keep"
+        else:
+            rules_action = "skip (generated only with --profile)"
         return [
             ("ENN rollouts", self.rollout_check,
-             "collect" if self.collect_rollouts else "reuse"),
-            ("ENN bundle", self.enn_check, "train" if self.train_enn else "reuse"),
+             self._action("collect", "rollouts", self.collect_rollouts)),
+            ("ENN bundle", self.enn_check,
+             self._action("train", "enn", self.train_enn)),
             ("Forecasters", self.forecast_check,
-             "train" if self.train_forecasters else "reuse"),
+             self._action("train", "forecasters", self.train_forecasters)),
             (
                 "Mean tuning",
                 self.tuning_check,
                 "resume full fit" if self.train_forecasters and self.tuning_check.reusable
                 else ("tune" if self.train_forecasters else "keep"),
             ),
-            ("Failure rows", self.rows_check, "collect" if self.collect_rows else "reuse"),
+            ("Failure rows", self.rows_check,
+             self._action("collect", "rows", self.collect_rows)),
             ("Classifier", self.classifier_check,
-             "train" if self.train_classifier else "reuse"),
+             self._action("train", "classifier", self.train_classifier)),
+            ("Explanation rules", self.rules_check, rules_action),
         ]
 
 
-def plan_stages(agent_name: str, force_stage: Iterable[str] = ()) -> StagePlan:
-    """Inspect existing artifacts (read-only) and decide which stages to run."""
+def _loads(validator: Callable[[], object]) -> bool:
+    """True when the artifact files are present and pass their validator.
+
+    Provenance is ignored on purpose: a supplied model, or one whose sidecar
+    was marked stale by an interrupted run, is still a usable model.
+    """
+    try:
+        validator()
+    except Exception:
+        return False
+    return True
+
+
+def plan_stages(
+    agent_name: str,
+    force_stage: Iterable[str] = (),
+    *,
+    with_explainability: bool = False,
+    rules_dir: Path | None = None,
+) -> StagePlan:
+    """Inspect existing artifacts (read-only) and decide which stages to run.
+
+    ``plan.blocked`` lists reasons why the run must stop before anything is
+    written: a valid existing ENN bundle or classifier would otherwise be
+    replaced without an explicit ``--force-stage``.
+    """
     rollouts = rollout_dir(agent_name)
     models = model_dir(agent_name)
     failures = failure_dir(agent_name)
@@ -483,6 +549,83 @@ def plan_stages(agent_name: str, force_stage: Iterable[str] = ()) -> StagePlan:
         or collect_rows
         or not classifier_check.reusable
     )
+
+    def _forced(*stages: str) -> bool:
+        return force_all or bool(forced & set(stages))
+
+    def _status(label: str, check: StageCheck) -> str:
+        return f"{label} {check.status.value}"
+
+    reasons = {
+        "rollouts": "forced" if _forced("enn-data")
+        else _status("rollouts", rollout_check),
+        "enn": "forced" if _forced("enn")
+        else ("rollouts will be re-collected" if collect_rollouts
+              else _status("bundle", enn_check)),
+        "forecasters": "forced" if _forced("forecast")
+        else _status("forecasters", forecast_check),
+        "rows": "forced" if _forced("failure-rows")
+        else ("forecasters will be retrained" if train_forecasters
+              else "ENN will be retrained" if train_enn
+              else _status("rows", rows_check)),
+        "classifier": "forced" if _forced("classifier")
+        else ("rows will be re-collected" if collect_rows
+              else _status("classifier", classifier_check)),
+    }
+
+    rules_dir = Path(rules_dir) if rules_dir else failures / "explainability" / "rules"
+    n_rules = count_rules(rules_dir)
+    rules_check = StageCheck(
+        ArtifactStatus.REUSABLE if n_rules else ArtifactStatus.MISSING,
+        f"{n_rules} rules in {rules_dir}" if n_rules else f"no rules in {rules_dir}",
+    )
+    # Existing rules are reused unless explicitly forced, or unless this run
+    # retrains the classifier they were distilled from (which itself requires
+    # an explicit --force-stage when a valid classifier exists).
+    rules_forced = bool(forced & RULES_REBUILD_STAGES)
+    regenerate_rules = with_explainability and (
+        not n_rules or rules_forced or train_classifier
+    )
+    reasons["rules"] = (
+        "forced" if rules_forced
+        else "classifier will be retrained" if train_classifier
+        else "rules missing"
+    )
+
+    blocked: list[str] = []
+    if (train_enn and not (forced & ENN_REBUILD_STAGES)
+            and _loads(lambda: validate_enn_bundle(models, agent_name))):
+        if rollout_check.status == ArtifactStatus.MISSING:
+            blocked.append(
+                f"ENN rollouts are missing ({rollouts}) but a valid ENN bundle "
+                f"exists in {models}. Restore observations.npy and labels.npy, "
+                "or pass --force-stage enn-data to re-collect rollouts and "
+                "retrain the ENN."
+            )
+        else:
+            blocked.append(
+                f"a valid ENN bundle exists in {models} but would be retrained "
+                f"({reasons['enn']}). Pass --force-stage enn to allow it."
+            )
+    if (train_classifier and not (forced & CLASSIFIER_REBUILD_STAGES)
+            and classifier.is_file()
+            and _loads(lambda: validate_classifier_metadata(classifier_meta))):
+        if rows_check.status == ArtifactStatus.MISSING and not (
+                train_forecasters or train_enn):
+            blocked.append(
+                f"failure rows are missing ({rows_csv}) but a valid classifier "
+                f"exists ({classifier}). Restore failure_forecast_rows.csv, or "
+                "pass --force-stage failure-rows to rebuild the rows and "
+                "retrain the classifier."
+            )
+        else:
+            blocked.append(
+                f"a valid classifier exists ({classifier}) but would be "
+                f"retrained ({reasons['classifier']}: {reasons['rows']}). "
+                "Pass --force-stage failure-rows (or classifier) to allow it, "
+                "or restore the missing inputs."
+            )
+
     return StagePlan(
         rollouts=rollouts,
         models=models,
@@ -504,7 +647,18 @@ def plan_stages(agent_name: str, force_stage: Iterable[str] = ()) -> StagePlan:
         train_forecasters=train_forecasters,
         collect_rows=collect_rows,
         train_classifier=train_classifier,
+        rules_dir=rules_dir,
+        rules_check=rules_check,
+        regenerate_rules=regenerate_rules,
+        reasons=reasons,
+        blocked=blocked,
     )
+
+
+def print_blocked(blocked: list[str]) -> None:
+    print("\n[stop] Nothing was run or written:")
+    for reason in blocked:
+        print(f"  - {reason}")
 
 
 def run_pipeline(args: argparse.Namespace) -> None:
@@ -513,10 +667,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     policy_dir = default_policy_dir()
     forced = set(args.force_stage)
     force_all = "all" in forced
-    generated_rules_dir = (
-        args.explain_rules_dir
-        or failures / "explainability" / "rules"
-    )
+    generated_rules_dir = args.explain_rules_dir or default_rules_dir(args.agent_name)
     if args.with_explainability:
         if args.llm_config is None:
             raise ValueError("--with-explainability requires --llm-config PATH")
@@ -525,7 +676,12 @@ def run_pipeline(args: argparse.Namespace) -> None:
         if args.llm_iterations < 1:
             raise ValueError("--llm-iterations must be at least 1")
 
-    plan = plan_stages(args.agent_name, args.force_stage)
+    plan = plan_stages(
+        args.agent_name,
+        args.force_stage,
+        with_explainability=args.with_explainability,
+        rules_dir=generated_rules_dir,
+    )
     rollouts, models = plan.rollouts, plan.models
     rollout_outputs, enn_outputs = plan.rollout_outputs, plan.enn_outputs
     forecast_outputs = plan.forecast_outputs
@@ -540,6 +696,9 @@ def run_pipeline(args: argparse.Namespace) -> None:
     train_classifier = plan.train_classifier
 
     print_preflight(plan.preflight_rows(), args.agent_name)
+    if plan.blocked:
+        print_blocked(plan.blocked)
+        raise PreflightStop(1)
 
     scheduled = [
         ("enn_rollouts", rollouts / "observations.npy", collect_rollouts),
@@ -686,7 +845,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
             args.agent_name,
         )
 
-    if args.with_explainability:
+    if args.with_explainability and not plan.regenerate_rules:
+        print(
+            f"\n[reuse] explanation rules: {plan.rules_check.reason}; "
+            "pass --force-stage explainability to regenerate them"
+        )
+    elif train_classifier and plan.rules_check.reusable:
+        print(
+            f"\n[warn] the classifier was retrained but the rules in "
+            f"{plan.rules_dir} were distilled for the previous classifier; "
+            "regenerate them with --profile"
+        )
+    if plan.regenerate_rules:
         try:
             run_explainability_stage(
                 rows_csv,
@@ -753,7 +923,9 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         choices=FORCE_STAGES,
-        help="rerun a stage; may be supplied more than once",
+        help="rerun a stage; may be supplied more than once. A valid existing "
+             "ENN bundle, classifier, or explanation rules are replaced only "
+             "when their stage (or an upstream one) is forced",
     )
     parser.add_argument(
         "--reuse-forecast-data",

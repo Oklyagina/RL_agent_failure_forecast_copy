@@ -8,11 +8,13 @@ below.
 
 Pipeline: Grid2Op environment -> configured policy ->
 trained ENN + training scaler (rebuilt from artifacts/, plain JSON) ->
-percentile calibration -> assess_recommendation -> t+12 failure prediction -> output,
-including the recommendations list in the InteractiveAI format ("kpis").
+percentile calibration -> assess_recommendation -> t+12 failure prediction
+-> per-line rule explanations (when failure_forecast/explainability/rules/
+exists) -> output, including the recommendations list in the InteractiveAI
+format ("kpis"; per-line results in kpis["failure_forecasts"]).
 
 Requirements: Python 3.9/3.10 + requirements.txt (see README).
-Run:  python main.py demo
+Run:  python main.py demo [--no-explain] [--rules-dir PATH]
 """
 
 import json
@@ -132,7 +134,63 @@ def to_interactiveai(action, info: dict) -> dict:
     }
 
 
-def run() -> None:
+def default_rules_dir(failure_dir: Path) -> Path:
+    return failure_dir / "explainability" / "rules"
+
+
+def build_failure_scorer(predictor, failure_dir: Path, *, explain: bool = True,
+                         rules_dir: Path | None = None):
+    """Return ``(score_many, rules_dir_or_None)`` for the t+12 forecast.
+
+    ``score_many`` has the signature of ``FailureForecastPredictor.predict_many``.
+    With usable rules it is ``ExplainabilityOrchestrator.predict_and_explain_many``,
+    which adds per-line explanation fields; the HGB probability and binary
+    prediction are identical either way. Missing or unloadable rules only
+    produce a warning. No rows CSV, OOF file, or LLM configuration is needed.
+    """
+    if not explain:
+        print("       explanations: disabled (--no-explain)")
+        return predictor.predict_many, None
+    rules_dir = Path(rules_dir) if rules_dir else default_rules_dir(failure_dir)
+    if not rules_dir.is_dir():
+        print(f"[warn] explanations unavailable: no rules directory at {rules_dir}; "
+              "continuing with HGB predictions only")
+        return predictor.predict_many, None
+    try:
+        from src.explainability.orchestrator import ExplainabilityOrchestrator
+
+        orchestrator = ExplainabilityOrchestrator(predictor, rules_dir=rules_dir)
+    except Exception as exc:  # explanations are optional; HGB must still run
+        print(f"[warn] explanations unavailable ({type(exc).__name__}: {exc}); "
+              "continuing with HGB predictions only")
+        return predictor.predict_many, None
+    explainer = orchestrator.rule_explainer
+    if explainer is None or not explainer.available_lines:
+        print(f"[warn] explanations unavailable: no valid rules in {rules_dir}; "
+              "continuing with HGB predictions only")
+        return predictor.predict_many, None
+    print(f"       explanations: {len(explainer.available_lines)} rules "
+          f"from {rules_dir}")
+    return orchestrator.predict_and_explain_many, rules_dir
+
+
+def print_failure_forecasts(failures: list[dict]) -> None:
+    """Readable per-line summary of the t+12 forecasts (and explanations)."""
+    print("\n  t+12 failure forecasts (one per contingency):")
+    for item in failures:
+        label = "FAILURE" if item.get("failure_prediction") else "no failure"
+        print(f"    line {item.get('line')}: p={item.get('failure_probability'):.3f} "
+              f"-> {label}")
+        if "explanation_status" not in item:
+            continue
+        if item["explanation_status"] == "available":
+            agrees = "agrees" if item.get("surrogate_agrees") else "DISAGREES"
+            print(f"      rule ({agrees} with HGB): {item['explanation']}")
+        else:
+            print(f"      no explanation: {item.get('explanation_error')}")
+
+
+def run(explain: bool = True, rules_dir: Path | None = None) -> None:
     configure_grid2op_warnings()
 
     import grid2op
@@ -185,6 +243,8 @@ def run() -> None:
         artifact_dir=failure_dir, lines_to_test=lines)
     print(f"[3/4] ENN ({meta['num_classes']} classes), scaler and "
           f"calibration loaded; failure models loaded")
+    score_many, used_rules_dir = build_failure_scorer(
+        predictor, failure_dir, explain=explain, rules_dir=rules_dir)
 
     # 4. Assess live recommendations -------------------------------------------
     print(f"[4/4] running {N_STEPS} steps:\n")
@@ -200,7 +260,7 @@ def run() -> None:
               f"action_pctile={info['epistemic_uncertainty_action_pctile']}")
         recommendations.append(to_interactiveai(action, info))
         if t == N_STEPS - 1:
-            failures = predictor.predict_many(
+            failures = score_many(
                 obs, observations, lines,
                 mean_model, aleatoric_model, failure_cfg,
                 env=env,
@@ -211,7 +271,9 @@ def run() -> None:
                 kpis["failure_prediction"] = worst["failure_prediction"]
                 kpis["failure_probability"] = worst["failure_probability"]
             kpis["failure_forecasts"] = failures
-            print(f"  t+12 failure forecasts: {failures}")
+            kpis["failure_explanation_rules"] = (
+                str(used_rules_dir) if used_rules_dir else None)
+            print_failure_forecasts(failures)
             break
         obs, reward, done, _ = env.step(action)
         if done:
