@@ -1,7 +1,6 @@
 """Collect labeled forced-disconnection failure rows (legacy procedure, t+12)."""
 from __future__ import annotations
 
-import logging
 import sys
 from pathlib import Path
 
@@ -15,7 +14,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import project_config as config  # noqa: E402
-from run_example import load_enn_uncertainty  # noqa: E402
 from src.agent_runtime import build_agent  # noqa: E402
 from src.failure_forecast import (  # noqa: E402
     LEGACY_PHASES,
@@ -23,11 +21,18 @@ from src.failure_forecast import (  # noqa: E402
     collect_failure_forecast_phases,
     write_rows_csv,
 )
+from src.pipeline_support import (  # noqa: E402
+    configure_quiet_logging,
+    failure_dir,
+    parse_lines,
+    resolve_policy_dir,
+)
+from src.runtime_artifacts import load_enn_uncertainty  # noqa: E402
 
 
 def default_output_dir(agent_name: str) -> Path:
     """Return the standard artifact folder for collected failure rows."""
-    return config.ARTIFACTS_DIR / config.ENV_NAME / agent_name / "failure_forecast"
+    return failure_dir(config.ARTIFACTS_DIR, config.ENV_NAME, agent_name)
 
 
 def configured_output_dir() -> Path:
@@ -37,32 +42,7 @@ def configured_output_dir() -> Path:
 
 def _default_agent_path() -> Path:
     """Find the runnable CurriculumAgent package used when no factory is set."""
-    for path in (
-        config.ASSETS_DIR / config.ENV_NAME,
-        config.ASSETS_DIR / "network36",
-    ):
-        if (path / "model").is_dir() and (path / "actions").is_dir():
-            return path
-    return config.ASSETS_DIR / config.ENV_NAME
-
-
-def _parse_lines(raw: str | None, env) -> list:
-    """Parse configured line ids/names, defaulting to all Grid2Op lines."""
-    if raw:
-        return [part.strip() for part in raw.split(",") if part.strip()]
-    names = getattr(env, "name_line", None)
-    if names is None:
-        raise ValueError(
-            "FAILURE_LINES must be set when env.name_line is unavailable."
-        )
-    return list(names)
-
-
-def configure_quiet_logging() -> None:
-    """Suppress verbose policy INFO logs while keeping warnings visible."""
-    logging.basicConfig(level=logging.WARNING, force=True)
-    logging.getLogger().setLevel(logging.WARNING)
-    logging.getLogger("curriculumagent").setLevel(logging.WARNING)
+    return resolve_policy_dir(config.ASSETS_DIR, config.ENV_NAME)
 
 
 def main() -> None:
@@ -81,7 +61,7 @@ def main() -> None:
             factory_spec=spec,
             agent_path=None if spec else _default_agent_path(),
         )
-        lines = _parse_lines(config.FAILURE_LINES or None, env)
+        lines = parse_lines(config.FAILURE_LINES or None, env)
         out_dir = configured_output_dir()
         cfg = FailureForecastConfig.from_env(
             env,

@@ -1,9 +1,13 @@
-"""Orchestrate the active failure-forecast and ENN training pipeline.
+"""Train every model (``python main.py train``).
 
-This restores the root-level pipeline entrypoint from the archived workflow,
-but keeps ENN training on the current rollout-based implementation:
+Runs the ``training/*.py`` stages as subprocesses, in order:
 
-    training/collect_rollouts.py -> training/train_enn.py
+    collect_rollouts -> train_enn -> train_mean_and_aleatoric
+    -> collect_failure_forecast -> train_failure_classifier
+    -> (optional) explainability -> predict_failure_forecast (smoke check)
+
+A stage is skipped when its outputs exist, validate, and carry matching
+provenance; ``--force-stage`` reruns it.
 
 The ENN stage is policy-agnostic.  A policy is selected by AGENT_FACTORY when
 configured, otherwise the default bundled policy assets are used by the rollout
@@ -16,12 +20,13 @@ import json
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable
 
 import numpy as np
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -63,22 +68,50 @@ from src.pipeline_artifacts import (  # noqa: E402
 from src.failure_forecast import (  # noqa: E402
     MEAN_BEST_PARAMS_FILENAME,
 )
+from src import pipeline_support  # noqa: E402
+
+FORCE_STAGES = (
+    "enn-data", "enn", "forecast", "failure-rows", "classifier",
+    "explainability", "all",
+)
+# Forced stages that explicitly allow a valid, existing model to be replaced.
+# Forcing an upstream stage consents to the downstream cascade it causes.
+ENN_REBUILD_STAGES = frozenset({"all", "enn-data", "enn"})
+CLASSIFIER_REBUILD_STAGES = frozenset(
+    {"all", "enn-data", "enn", "forecast", "failure-rows", "classifier"}
+)
+RULES_REBUILD_STAGES = frozenset({"all", "explainability"})
+
+
+class PreflightStop(SystemExit):
+    """Raised before any stage runs or any file is written."""
 
 
 def agent_artifact_dir(agent_name: str) -> Path:
-    return ARTIFACTS_DIR / ENV_NAME / agent_name
+    return pipeline_support.agent_artifact_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
 
 
 def rollout_dir(agent_name: str) -> Path:
-    return agent_artifact_dir(agent_name) / "rollouts"
+    return pipeline_support.rollout_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
 
 
 def model_dir(agent_name: str) -> Path:
-    return agent_artifact_dir(agent_name) / "model"
+    return pipeline_support.model_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
 
 
 def failure_dir(agent_name: str) -> Path:
-    return agent_artifact_dir(agent_name) / "failure_forecast"
+    return pipeline_support.failure_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
+
+
+def default_rules_dir(agent_name: str) -> Path:
+    return failure_dir(agent_name) / "explainability" / "rules"
+
+
+def count_rules(rules_dir: Path | None) -> int:
+    """Number of distilled ``line_*/best_rule.py`` files in ``rules_dir``."""
+    if rules_dir is None or not Path(rules_dir).is_dir():
+        return 0
+    return sum(1 for _ in Path(rules_dir).glob("line_*/best_rule.py"))
 
 
 def run_explainability_stage(
@@ -182,10 +215,7 @@ def run_explainability_stage(
 
 
 def default_policy_dir() -> Path:
-    for path in (ASSETS_DIR / ENV_NAME, ASSETS_DIR / "network36"):
-        if (path / "model").is_dir() and (path / "actions").is_dir():
-            return path
-    return ASSETS_DIR / ENV_NAME
+    return pipeline_support.resolve_policy_dir(ASSETS_DIR, ENV_NAME)
 
 
 def execute(
@@ -355,13 +385,97 @@ def _write_stage(stage: str, primary: Path, outputs: Iterable[Path],
     )
 
 
-def run_pipeline(args: argparse.Namespace) -> None:
-    agent_root = agent_artifact_dir(args.agent_name)
-    rollouts = rollout_dir(args.agent_name)
-    models = model_dir(args.agent_name)
-    failures = failure_dir(args.agent_name)
-    policy_dir = default_policy_dir()
-    forced = set(args.force_stage)
+@dataclass
+class StagePlan:
+    """Artifact checks and the resulting run/reuse decision for each stage."""
+
+    rollouts: Path
+    models: Path
+    failures: Path
+    rollout_outputs: list[Path]
+    enn_outputs: list[Path]
+    forecast_outputs: list[Path]
+    rows_csv: Path
+    classifier: Path
+    classifier_meta: Path
+    rollout_check: StageCheck
+    enn_check: StageCheck
+    forecast_check: StageCheck
+    tuning_check: StageCheck
+    rows_check: StageCheck
+    classifier_check: StageCheck
+    collect_rollouts: bool
+    train_enn: bool
+    train_forecasters: bool
+    collect_rows: bool
+    train_classifier: bool
+    rules_dir: Path
+    rules_check: StageCheck
+    regenerate_rules: bool
+    reasons: dict[str, str]
+    blocked: list[str]
+
+    def _action(self, verb: str, key: str, runs: bool) -> str:
+        return f"{verb} ({self.reasons[key]})" if runs else "reuse"
+
+    def preflight_rows(self) -> list[tuple[str, StageCheck, str]]:
+        if self.regenerate_rules:
+            rules_action = f"regenerate ({self.reasons['rules']})"
+        elif self.rules_check.reusable:
+            rules_action = "keep"
+        else:
+            rules_action = "skip (generated only with --profile)"
+        return [
+            ("ENN rollouts", self.rollout_check,
+             self._action("collect", "rollouts", self.collect_rollouts)),
+            ("ENN bundle", self.enn_check,
+             self._action("train", "enn", self.train_enn)),
+            ("Forecasters", self.forecast_check,
+             self._action("train", "forecasters", self.train_forecasters)),
+            (
+                "Mean tuning",
+                self.tuning_check,
+                "resume full fit" if self.train_forecasters and self.tuning_check.reusable
+                else ("tune" if self.train_forecasters else "keep"),
+            ),
+            ("Failure rows", self.rows_check,
+             self._action("collect", "rows", self.collect_rows)),
+            ("Classifier", self.classifier_check,
+             self._action("train", "classifier", self.train_classifier)),
+            ("Explanation rules", self.rules_check, rules_action),
+        ]
+
+
+def _loads(validator: Callable[[], object]) -> bool:
+    """True when the artifact files are present and pass their validator.
+
+    Provenance is ignored on purpose: a supplied model, or one whose sidecar
+    was marked stale by an interrupted run, is still a usable model.
+    """
+    try:
+        validator()
+    except Exception:
+        return False
+    return True
+
+
+def plan_stages(
+    agent_name: str,
+    force_stage: Iterable[str] = (),
+    *,
+    with_explainability: bool = False,
+    rules_dir: Path | None = None,
+) -> StagePlan:
+    """Inspect existing artifacts (read-only) and decide which stages to run.
+
+    ``plan.blocked`` lists reasons why the run must stop before anything is
+    written: a valid existing ENN bundle or classifier would otherwise be
+    replaced without an explicit ``--force-stage``.
+    """
+    rollouts = rollout_dir(agent_name)
+    models = model_dir(agent_name)
+    failures = failure_dir(agent_name)
+    forced = set(force_stage)
     force_all = "all" in forced
 
     rollout_outputs = [
@@ -370,7 +484,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
         rollouts / "actions.npy",
     ]
     enn_outputs = [
-        models / f"enn_{args.agent_name}.pth",
+        models / f"enn_{agent_name}.pth",
         models / "scaler_params.json",
         models / "enn_meta.json",
         models / "enn_pctile_calib.npz",
@@ -383,35 +497,24 @@ def run_pipeline(args: argparse.Namespace) -> None:
     rows_csv = failures / "failure_forecast_rows.csv"
     classifier = failures / "failure_classifier.pkl"
     classifier_meta = failures / "failure_classifier_metadata.json"
-    generated_rules_dir = (
-        args.explain_rules_dir
-        or failures / "explainability" / "rules"
-    )
-    if args.with_explainability:
-        if args.llm_config is None:
-            raise ValueError("--with-explainability requires --llm-config PATH")
-        if not args.llm_config.is_file():
-            raise FileNotFoundError(f"LLM configuration not found: {args.llm_config}")
-        if args.llm_iterations < 1:
-            raise ValueError("--llm-iterations must be at least 1")
 
     rollout_check = _check_with_validator(
         rollout_outputs,
         rollouts / "observations.npy",
         lambda: validate_rollouts(rollouts),
-        args.agent_name,
+        agent_name,
     )
     enn_check = _check_with_validator(
         enn_outputs,
-        models / f"enn_{args.agent_name}.pth",
-        lambda: validate_enn_bundle(models, args.agent_name),
-        args.agent_name,
+        models / f"enn_{agent_name}.pth",
+        lambda: validate_enn_bundle(models, agent_name),
+        agent_name,
     )
     forecast_check = classify_outputs(
         forecast_outputs,
         provenance_path(failures / "mean_forecaster.pkl"),
         ENV_NAME,
-        args.agent_name,
+        agent_name,
     )
     tuning_check = StageCheck(
         ArtifactStatus.REUSABLE if mean_params.is_file() else ArtifactStatus.MISSING,
@@ -421,13 +524,13 @@ def run_pipeline(args: argparse.Namespace) -> None:
         [rows_csv],
         rows_csv,
         lambda: validate_failure_rows(rows_csv),
-        args.agent_name,
+        agent_name,
     )
     classifier_check = _check_with_validator(
         [classifier, classifier_meta],
         classifier,
         lambda: validate_classifier_metadata(classifier_meta),
-        args.agent_name,
+        agent_name,
     )
 
     collect_rollouts = force_all or "enn-data" in forced or not rollout_check.reusable
@@ -447,22 +550,155 @@ def run_pipeline(args: argparse.Namespace) -> None:
         or not classifier_check.reusable
     )
 
-    print_preflight(
-        [
-            ("ENN rollouts", rollout_check, "collect" if collect_rollouts else "reuse"),
-            ("ENN bundle", enn_check, "train" if train_enn else "reuse"),
-            ("Forecasters", forecast_check, "train" if train_forecasters else "reuse"),
-            (
-                "Mean tuning",
-                tuning_check,
-                "resume full fit" if train_forecasters and tuning_check.reusable
-                else ("tune" if train_forecasters else "keep"),
-            ),
-            ("Failure rows", rows_check, "collect" if collect_rows else "reuse"),
-            ("Classifier", classifier_check, "train" if train_classifier else "reuse"),
-        ],
-        args.agent_name,
+    def _forced(*stages: str) -> bool:
+        return force_all or bool(forced & set(stages))
+
+    def _status(label: str, check: StageCheck) -> str:
+        return f"{label} {check.status.value}"
+
+    reasons = {
+        "rollouts": "forced" if _forced("enn-data")
+        else _status("rollouts", rollout_check),
+        "enn": "forced" if _forced("enn")
+        else ("rollouts will be re-collected" if collect_rollouts
+              else _status("bundle", enn_check)),
+        "forecasters": "forced" if _forced("forecast")
+        else _status("forecasters", forecast_check),
+        "rows": "forced" if _forced("failure-rows")
+        else ("forecasters will be retrained" if train_forecasters
+              else "ENN will be retrained" if train_enn
+              else _status("rows", rows_check)),
+        "classifier": "forced" if _forced("classifier")
+        else ("rows will be re-collected" if collect_rows
+              else _status("classifier", classifier_check)),
+    }
+
+    rules_dir = Path(rules_dir) if rules_dir else failures / "explainability" / "rules"
+    n_rules = count_rules(rules_dir)
+    rules_check = StageCheck(
+        ArtifactStatus.REUSABLE if n_rules else ArtifactStatus.MISSING,
+        f"{n_rules} rules in {rules_dir}" if n_rules else f"no rules in {rules_dir}",
     )
+    # Existing rules are reused unless explicitly forced, or unless this run
+    # retrains the classifier they were distilled from (which itself requires
+    # an explicit --force-stage when a valid classifier exists).
+    rules_forced = bool(forced & RULES_REBUILD_STAGES)
+    regenerate_rules = with_explainability and (
+        not n_rules or rules_forced or train_classifier
+    )
+    reasons["rules"] = (
+        "forced" if rules_forced
+        else "classifier will be retrained" if train_classifier
+        else "rules missing"
+    )
+
+    blocked: list[str] = []
+    if (train_enn and not (forced & ENN_REBUILD_STAGES)
+            and _loads(lambda: validate_enn_bundle(models, agent_name))):
+        if rollout_check.status == ArtifactStatus.MISSING:
+            blocked.append(
+                f"ENN rollouts are missing ({rollouts}) but a valid ENN bundle "
+                f"exists in {models}. Restore observations.npy and labels.npy, "
+                "or pass --force-stage enn-data to re-collect rollouts and "
+                "retrain the ENN."
+            )
+        else:
+            blocked.append(
+                f"a valid ENN bundle exists in {models} but would be retrained "
+                f"({reasons['enn']}). Pass --force-stage enn to allow it."
+            )
+    if (train_classifier and not (forced & CLASSIFIER_REBUILD_STAGES)
+            and classifier.is_file()
+            and _loads(lambda: validate_classifier_metadata(classifier_meta))):
+        if rows_check.status == ArtifactStatus.MISSING and not (
+                train_forecasters or train_enn):
+            blocked.append(
+                f"failure rows are missing ({rows_csv}) but a valid classifier "
+                f"exists ({classifier}). Restore failure_forecast_rows.csv, or "
+                "pass --force-stage failure-rows to rebuild the rows and "
+                "retrain the classifier."
+            )
+        else:
+            blocked.append(
+                f"a valid classifier exists ({classifier}) but would be "
+                f"retrained ({reasons['classifier']}: {reasons['rows']}). "
+                "Pass --force-stage failure-rows (or classifier) to allow it, "
+                "or restore the missing inputs."
+            )
+
+    return StagePlan(
+        rollouts=rollouts,
+        models=models,
+        failures=failures,
+        rollout_outputs=rollout_outputs,
+        enn_outputs=enn_outputs,
+        forecast_outputs=forecast_outputs,
+        rows_csv=rows_csv,
+        classifier=classifier,
+        classifier_meta=classifier_meta,
+        rollout_check=rollout_check,
+        enn_check=enn_check,
+        forecast_check=forecast_check,
+        tuning_check=tuning_check,
+        rows_check=rows_check,
+        classifier_check=classifier_check,
+        collect_rollouts=collect_rollouts,
+        train_enn=train_enn,
+        train_forecasters=train_forecasters,
+        collect_rows=collect_rows,
+        train_classifier=train_classifier,
+        rules_dir=rules_dir,
+        rules_check=rules_check,
+        regenerate_rules=regenerate_rules,
+        reasons=reasons,
+        blocked=blocked,
+    )
+
+
+def print_blocked(blocked: list[str]) -> None:
+    print("\n[stop] Nothing was run or written:")
+    for reason in blocked:
+        print(f"  - {reason}")
+
+
+def run_pipeline(args: argparse.Namespace) -> None:
+    agent_root = agent_artifact_dir(args.agent_name)
+    failures = failure_dir(args.agent_name)
+    policy_dir = default_policy_dir()
+    forced = set(args.force_stage)
+    force_all = "all" in forced
+    generated_rules_dir = args.explain_rules_dir or default_rules_dir(args.agent_name)
+    if args.with_explainability:
+        if args.llm_config is None:
+            raise ValueError("--with-explainability requires --llm-config PATH")
+        if not args.llm_config.is_file():
+            raise FileNotFoundError(f"LLM configuration not found: {args.llm_config}")
+        if args.llm_iterations < 1:
+            raise ValueError("--llm-iterations must be at least 1")
+
+    plan = plan_stages(
+        args.agent_name,
+        args.force_stage,
+        with_explainability=args.with_explainability,
+        rules_dir=generated_rules_dir,
+    )
+    rollouts, models = plan.rollouts, plan.models
+    rollout_outputs, enn_outputs = plan.rollout_outputs, plan.enn_outputs
+    forecast_outputs = plan.forecast_outputs
+    rows_csv, classifier, classifier_meta = (
+        plan.rows_csv, plan.classifier, plan.classifier_meta
+    )
+    rollout_check, enn_check = plan.rollout_check, plan.enn_check
+    forecast_check, rows_check = plan.forecast_check, plan.rows_check
+    classifier_check = plan.classifier_check
+    collect_rollouts, train_enn = plan.collect_rollouts, plan.train_enn
+    train_forecasters, collect_rows = plan.train_forecasters, plan.collect_rows
+    train_classifier = plan.train_classifier
+
+    print_preflight(plan.preflight_rows(), args.agent_name)
+    if plan.blocked:
+        print_blocked(plan.blocked)
+        raise PreflightStop(1)
 
     scheduled = [
         ("enn_rollouts", rollouts / "observations.npy", collect_rollouts),
@@ -609,7 +845,18 @@ def run_pipeline(args: argparse.Namespace) -> None:
             args.agent_name,
         )
 
-    if args.with_explainability:
+    if args.with_explainability and not plan.regenerate_rules:
+        print(
+            f"\n[reuse] explanation rules: {plan.rules_check.reason}; "
+            "pass --force-stage explainability to regenerate them"
+        )
+    elif train_classifier and plan.rules_check.reusable:
+        print(
+            f"\n[warn] the classifier was retrained but the rules in "
+            f"{plan.rules_dir} were distilled for the previous classifier; "
+            "regenerate them with --profile"
+        )
+    if plan.regenerate_rules:
         try:
             run_explainability_stage(
                 rows_csv,
@@ -656,9 +903,16 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Standalone parser with the ``train`` options (used by tests)."""
     parser = argparse.ArgumentParser(
         description="Run the configured ENN and failure-forecast pipeline.",
     )
+    add_arguments(parser)
+    return parser
+
+
+def add_arguments(parser: argparse.ArgumentParser) -> None:
+    """Attach the ``train`` options to ``parser``."""
     parser.add_argument(
         "--agent-name",
         default=AGENT_NAME,
@@ -668,8 +922,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--force-stage",
         action="append",
         default=[],
-        choices=("enn-data", "enn", "forecast", "failure-rows", "classifier", "all"),
-        help="rerun a stage; may be supplied more than once",
+        choices=FORCE_STAGES,
+        help="rerun a stage; may be supplied more than once. A valid existing "
+             "ENN bundle, classifier, or explanation rules are replaced only "
+             "when their stage (or an upstream one) is forced",
     )
     parser.add_argument(
         "--reuse-forecast-data",
@@ -707,12 +963,3 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip-smoke", action="store_true")
     parser.add_argument("--verbose", action="store_true")
-    return parser
-
-
-def main() -> None:
-    run_pipeline(build_parser().parse_args())
-
-
-if __name__ == "__main__":
-    main()

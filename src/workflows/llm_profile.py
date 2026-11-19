@@ -1,9 +1,9 @@
-"""Run the full explained pipeline from one local JSON profile.
+"""Load a combined LLM + pipeline JSON profile (``python main.py train --profile``).
 
 The profile combines two kinds of settings:
 
 * Top-level fields configure the OpenAI-compatible HTTP client.
-* The nested ``pipeline`` object configures the existing ``run_pipeline`` flow.
+* The nested ``pipeline`` object configures the ``train`` workflow.
 
 Keeping the connection fields at the top level preserves compatibility with
 ``LLMConfig.from_json`` and the legacy ``dual_llm.py --llm-config`` command.
@@ -17,20 +17,13 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from project_config import get_optional_config
-from run_pipeline import run_pipeline
 from src.explainability.llm_client import LLMConfig
+from src.workflows.train import FORCE_STAGES
 
 
-ROOT = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = ROOT / "src" / "explainability" / "llm_config.json"
-VALID_FORCE_STAGES = {
-    "enn-data",
-    "enn",
-    "forecast",
-    "failure-rows",
-    "classifier",
-    "all",
-}
+ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH = ROOT / "src" / "llm_config.json"
+VALID_FORCE_STAGES = frozenset(FORCE_STAGES)
 
 
 class ProfileError(ValueError):
@@ -39,7 +32,7 @@ class ProfileError(ValueError):
 
 @dataclass(frozen=True)
 class PipelineProfile:
-    """Validated settings needed to call :func:`run_pipeline`."""
+    """Validated settings for the ``train`` workflow."""
 
     config_path: Path
     agent_name: str = "curriculum"
@@ -252,7 +245,7 @@ def load_profile(path: str | Path = DEFAULT_CONFIG_PATH) -> PipelineProfile:
 
 
 def profile_to_pipeline_args(profile: PipelineProfile) -> argparse.Namespace:
-    """Translate profile names to the argument names expected by ``run_pipeline``."""
+    """Translate profile names to the ``train`` argument names."""
     return argparse.Namespace(
         agent_name=profile.agent_name,
         force_stage=list(profile.force_stages),
@@ -267,30 +260,3 @@ def profile_to_pipeline_args(profile: PipelineProfile) -> argparse.Namespace:
         verbose=profile.verbose,
     )
 
-
-def build_parser() -> argparse.ArgumentParser:
-    """Create the CLI parser used to select a profile file."""
-    parser = argparse.ArgumentParser(
-        description="Run the full explained pipeline from one local JSON profile."
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=DEFAULT_CONFIG_PATH,
-        help=f"combined LLM/pipeline profile (default: {DEFAULT_CONFIG_PATH})",
-    )
-    return parser
-
-
-def main() -> None:
-    """Validate the selected profile and start the existing production pipeline."""
-    args = build_parser().parse_args()
-    try:
-        profile = load_profile(args.config)
-    except ProfileError as exc:
-        raise SystemExit(f"Configuration error: {exc}") from None
-    run_pipeline(profile_to_pipeline_args(profile))
-
-
-if __name__ == "__main__":
-    main()

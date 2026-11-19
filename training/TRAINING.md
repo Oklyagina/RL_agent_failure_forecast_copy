@@ -33,21 +33,33 @@ Train and export the ENN bundle:
 python training/train_enn.py
 ```
 
-Run the local example:
+Run the local demo (ENN KPIs -> t+12 failure forecasts -> per-line rule
+explanations when `failure_forecast/explainability/rules/` exists):
 
 ```bash
-python run_example.py
+python main.py demo
+python main.py demo --no-explain
+python main.py demo --rules-dir path/to/rules
 ```
+
+The demo uses only the supplied runtime artifacts; it does not need
+`failure_forecast_rows.csv`, `failure_classifier_oof.npz`, or an LLM config.
 
 To run all active ENN and failure-forecast training stages from `.env`, use:
 
 ```bash
-python run_pipeline.py
+python main.py train
 ```
 
+`python main.py status` shows which stages would run without running them,
+and whether explanation rules are present. A valid supplied ENN bundle,
+classifier, or rule set is never replaced without an explicit
+`--force-stage` (`enn-data`/`enn`, `failure-rows`/`classifier`,
+`explainability`, or `all`); if training inputs such as
+`failure_forecast_rows.csv` are missing, `train` stops in preflight without
+writing anything and says which file to restore or which flag to pass.
 The original pipeline implementation is available only in Git history at
-commit `08781bf` (14 August 2026); the root `run_pipeline.py` is the active
-orchestrator.
+commit `08781bf` (14 August 2026).
 
 ## Rollout Collection
 
@@ -162,7 +174,7 @@ For a small end-to-end pipeline check that writes only to `artifacts_smoke/`,
 run:
 
 ```bash
-python smoke_test.py
+python main.py smoke
 ```
 
 The smoke test uses short runs and adds clearly marked synthetic positive rows
@@ -197,16 +209,14 @@ forecasts the injections, runs one do-nothing power flow with them (hence the
 `env` argument of the predictor) and builds the same features for each
 requested, currently connected line represented in the classifier metadata.
 
-Run the full pipeline:
+Run the full pipeline (ENN and failure-forecast stages, with preflight
+checks and provenance) from the repository root:
 
 ```bash
-python training/run_failure_forecast_pipeline.py \
-  --agent-artifact-dir artifacts/<ENV_NAME>/<AGENT_NAME> \
-  --policy-agent-dir assets/<ENV_NAME> \
-  --episodes 50 \
-  --lines line_a,line_b \
-  --smoke-line line_a
+python main.py train --smoke-line line_a
 ```
+
+Each stage can also be run on its own, as shown below.
 
 Train the mean and aleatoric forecast models:
 
@@ -258,17 +268,6 @@ python training/predict_failure_forecast.py \
 the classifier metadata. Each returned item contains the line name, failure
 probability, and thresholded binary prediction.
 
-For the production failure-forecast bundle, configure `.env` and run the
-in-process trainer:
-
-```bash
-python forecaster_full_training_pipeline.py
-```
-
-This script collects and validates genuine `t -> t+12` pairs, trains both
-forecasters and the classifier, reopens the saved bundle, and checks per-line
-inference.
-
 Artifacts are written under:
 
 ```text
@@ -281,5 +280,6 @@ artifacts/<ENV_NAME>/<AGENT_NAME>/failure_forecast/
 |-- aleatoric_forecaster.pkl
 |-- failure_forecast_rows.csv
 |-- failure_classifier.pkl
+|-- failure_classifier_oof.npz
 `-- failure_classifier_metadata.json
 ```

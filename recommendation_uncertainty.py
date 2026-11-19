@@ -25,6 +25,8 @@ from typing import Any, Optional
 import numpy as np
 import torch
 
+from src.agent_runtime import call_agent
+
 
 # =========================================================================== #
 # Calibration
@@ -140,16 +142,6 @@ def confidence_level(percentile: float) -> str:
     return {"low": "high", "medium": "medium", "high": "low"}[uncertainty_level(percentile)]
 
 
-def _call_agent(agent: Any, obs: Any):
-    try:
-        return agent.act(obs, reward=0.0, done=False)
-    except TypeError:
-        try:
-            return agent.act(obs, 0.0, False)
-        except TypeError:
-            return agent.act(obs)
-
-
 @torch.no_grad()
 def assess_observation(obs, enn, calibration: Calibration, action: Optional[Any] = None):
     """Assess one observation and, optionally, one already-selected action.
@@ -214,5 +206,5 @@ def assess_recommendation(obs, agent, enn, calibration, action=None):
     pass the recommendation they already obtained from the policy.
     """
     if action is None:
-        action = _call_agent(agent, obs)
+        action = call_agent(agent, obs)
     return assess_observation(obs, enn, calibration, action=action)

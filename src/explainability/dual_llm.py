@@ -20,7 +20,6 @@ from typing import Any, Mapping, Sequence
 import joblib
 import numpy as np
 import pandas as pd
-from numpy import ndarray, dtype, bool_
 from tqdm import tqdm
 from sklearn.metrics import accuracy_score, confusion_matrix, fbeta_score
 

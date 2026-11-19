@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from pathlib import Path
 
@@ -24,30 +23,25 @@ from project_config import (  # noqa: E402
     SEED,
     configure_grid2op_warnings,
 )
-from run_example import load_enn_uncertainty  # noqa: E402
 from src.agent_runtime import build_agent, call_agent  # noqa: E402
 from src.failure_forecast import (FailureForecastConfig,
                                   FailureForecastPredictor)  # noqa: E402
+from src.pipeline_support import (  # noqa: E402
+    configure_quiet_logging,
+    failure_dir,
+    resolve_policy_dir,
+)
+from src.runtime_artifacts import load_enn_uncertainty  # noqa: E402
 
 
 def default_dir(agent_name: str) -> Path:
     """Return the default failure-forecast artifact directory."""
-    return ARTIFACTS_DIR / ENV_NAME / agent_name / "failure_forecast"
+    return failure_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
 
 
 def _default_agent_path() -> Path:
     """Find the runnable CurriculumAgent package for smoke predictions."""
-    for path in (ASSETS_DIR / ENV_NAME, ASSETS_DIR / "network36"):
-        if (path / "model").is_dir() and (path / "actions").is_dir():
-            return path
-    return ASSETS_DIR / ENV_NAME
-
-
-def configure_quiet_logging() -> None:
-    """Suppress verbose policy INFO logs during the smoke rollout."""
-    logging.basicConfig(level=logging.WARNING, force=True)
-    logging.getLogger().setLevel(logging.WARNING)
-    logging.getLogger("curriculumagent").setLevel(logging.WARNING)
+    return resolve_policy_dir(ASSETS_DIR, ENV_NAME)
 
 
 def main() -> None:

@@ -48,7 +48,6 @@ DEFAULTS = {
     "FAILURE_LINES": "62_58_180,62_63_160,48_50_136,48_53_141,41_48_131,39_41_121,43_44_125,44_45_126,34_35_110,54_58_154",
     "FAILURE_FORECAST_DIR": "",
 
-    "EXAMPLE_N_STEPS": "5",
     "SEED": "0",
 }
 
@@ -84,15 +83,6 @@ def get_int(name: str) -> int:
 
 def get_float(name: str) -> float:
     return float(get_config(name))
-
-
-def get_bool(name: str) -> bool:
-    value = get_config(name).strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{name} must be a boolean value, got {value!r}")
 
 
 def get_path(name: str) -> Path:
@@ -185,5 +175,4 @@ FAILURE_CLASSIFIER_TRIALS = get_int("FAILURE_CLASSIFIER_TRIALS")
 FAILURE_LINES = get_config("FAILURE_LINES")
 FAILURE_FORECAST_DIR = get_optional_path("FAILURE_FORECAST_DIR")
 
-EXAMPLE_N_STEPS = get_int("EXAMPLE_N_STEPS")
 SEED = get_int("SEED")

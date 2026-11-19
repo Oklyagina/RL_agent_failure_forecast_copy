@@ -21,7 +21,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Runtime Python modules only. Training scripts, tests, documentation, and
 # local development files are not needed by the recommendation service.
-COPY project_config.py recommendation_uncertainty.py run_example.py ./
+COPY project_config.py recommendation_uncertainty.py ./
 COPY app ./app
 COPY src ./src
 COPY curriculumagent ./curriculumagent

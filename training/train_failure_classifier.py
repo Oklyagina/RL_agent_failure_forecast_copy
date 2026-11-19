@@ -22,10 +22,11 @@ from src.failure_forecast import (  # noqa: E402
     prepare_classifier_dataframe,
     train_failure_classifier,
 )
+from src.pipeline_support import failure_dir  # noqa: E402
 
 
 def default_dir(agent_name: str) -> Path:
-    return ARTIFACTS_DIR / ENV_NAME / agent_name / "failure_forecast"
+    return failure_dir(ARTIFACTS_DIR, ENV_NAME, agent_name)
 
 
 def find_rows_csv(out_dir: Path) -> Path:

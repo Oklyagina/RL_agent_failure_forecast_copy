@@ -27,7 +27,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -45,6 +45,8 @@ MIN_GROUPED_EPISODES = 6
 LABEL_DISCONNECTION_TEST = "forced_disconnection_at_t12"
 LABEL_EPISODE_ENDED = "episode_ended_before_t12"
 MEAN_BEST_PARAMS_FILENAME = "mean_forecaster_best_params.json"
+# Train+val out-of-fold probabilities saved next to the classifier.
+OOF_TEACHER_FILENAME = "failure_classifier_oof.npz"
 
 # Legacy simulation phases: (name, opponent attack cooldown or None = env default).
 LEGACY_PHASES: Tuple[Tuple[str, Optional[int]], ...] = (
@@ -533,7 +535,6 @@ def analyze_disconnection_effect(
             "gen_p": np.zeros(cfg.no_gens),
             "aleatoric_load_p_mean": 0.0, "aleatoric_load_q_mean": 0.0,
             "aleatoric_gen_p_mean": 0.0,
-            "epistemic_before": float("nan"),
         }
         forecast["epistemic_before"] = _get_uncertainty_safe(model_enn, obs, get_uncertainty_fn)
     else:
@@ -1007,8 +1008,6 @@ def train_mean_forecaster(
         finally:
             bar.close()
         params = dict(study.best_params)
-        params["early_stopping"] = True
-        params["random_state"] = seed
         best_value = float(study.best_value)
         completed_trials = len(study.trials)
     elif params is None:
@@ -1163,8 +1162,6 @@ def _line_map_from_series(values: Any) -> Dict[str, int]:
 def prepare_classifier_dataframe(data: str | Path | pd.DataFrame,
                                  line_map: Optional[Dict[str, int]] = None) -> pd.DataFrame:
     """Validate raw rows and derive classifier-only numeric columns."""
-    import pandas as pd
-
     df = pd.read_csv(data) if not isinstance(data, pd.DataFrame) else data.copy()
     missing = sorted(REQUIRED_DATA_COLUMNS - set(df.columns))
     if missing:
@@ -1402,10 +1399,6 @@ def _out_of_fold_probabilities(
     return probabilities
 
 
-# Train+val out-of-fold probabilities saved next to the classifier.
-OOF_TEACHER_FILENAME = "failure_classifier_oof.npz"
-
-
 def _f2_optimal_threshold(y_true: np.ndarray,
                           probabilities: np.ndarray) -> Tuple[float, float]:
     """Select the exact best observed threshold, preferring recall on ties.
@@ -1638,6 +1631,39 @@ def train_failure_classifier(
 
 
 
+def iter_contingency_feature_rows(
+    obs: Any,
+    observations: Sequence[Any],
+    lines: Sequence[Any],
+    mean_model: Any,
+    aleatoric_model: Any,
+    cfg: FailureForecastConfig,
+    *,
+    env: Any,
+    model_enn: Any = None,
+    get_uncertainty_fn: Optional[Callable[[Any, np.ndarray], float]] = None,
+) -> Iterator[Tuple[Any, Dict[str, Any]]]:
+    """Yield ``(line, feature_row)`` for each eligible contingency at t+12.
+
+    Builds the common forecast state once (forecast injections followed by a
+    do-nothing powerflow) and then one classifier feature row per requested,
+    currently connected line.  Shared by ``FailureForecastPredictor`` and the
+    explainability orchestrator so both score identical scenarios.
+    """
+    if not observations or observations[-1] is not obs:
+        raise ValueError("observations must end with the current observation")
+    forecast = forecast_injections(
+        observations, mean_model, aleatoric_model, cfg,
+        model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
+    )
+    forecast.update(simulate_forecast_state(
+        obs, forecast, env,
+        model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
+    ))
+    for line in eligible_lines(cfg, obs, lines):
+        yield line, build_feature_row(obs, line, forecast, cfg)
+
+
 class FailureForecastPredictor:
     """Runtime predictor returning a binary failure class and probability.
 
@@ -1679,8 +1705,6 @@ class FailureForecastPredictor:
         Raises if a feature is missing (NaN is only a valid *value*, e.g. when
         no ENN is used, never a stand-in for a missing column).
         """
-        import pandas as pd
-
         row_dict = dict(row)
         line_name = normalize_line_name(row_dict.get("line_disconnected", ""))
         if "line_id_encoded" not in row_dict:
@@ -1748,21 +1772,11 @@ class FailureForecastPredictor:
         forecast-injection powerflow (``simulate_forecast_state``).  Lines the
         classifier never saw during training raise an error.
         """
-        if not observations or observations[-1] is not obs:
-            raise ValueError("observations must end with the current observation")
-        forecast = forecast_injections(
-            observations, mean_model, aleatoric_model, cfg,
-            model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
-        )
-        forecast.update(simulate_forecast_state(
-            obs, forecast, env,
-            model_enn=model_enn, get_uncertainty_fn=get_uncertainty_fn,
-        ))
-        predictions: List[Dict[str, Any]] = []
-        for line in eligible_lines(cfg, obs, lines):
-            row = build_feature_row(obs, line, forecast, cfg)
-            predictions.append({
-                "line": cfg.line_name(line),
-                **self.predict_from_features(row),
-            })
-        return predictions
+        return [
+            {"line": cfg.line_name(line), **self.predict_from_features(row)}
+            for line, row in iter_contingency_feature_rows(
+                obs, observations, lines, mean_model, aleatoric_model, cfg,
+                env=env, model_enn=model_enn,
+                get_uncertainty_fn=get_uncertainty_fn,
+            )
+        ]
