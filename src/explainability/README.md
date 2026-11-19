@@ -131,6 +131,10 @@ artifacts/<environment>/<agent>/failure_forecast/explainability/
         `-- metrics.json
 ```
 
+The deployed `rules/` folder holds the rules from the 20-iteration run
+(formerly `rules_it20`). It is the only rule set and the default for every
+command. PowerGrid deploys the same folder.
+
 Run the focused checks and manual performance comparison with:
 
 ```powershell
